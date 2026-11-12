@@ -9,6 +9,7 @@ import {
   Landmark,
   Plus,
   Settings,
+  Table2,
   TrendingUp,
 } from "lucide-react";
 
@@ -19,6 +20,7 @@ function navItems(t: TFunc) {
     { href: "/overview", label: t("mobileNav.overview"), icon: Home },
     { href: "/accounts", label: t("nav.accounts"), icon: Landmark },
     { href: "/investments", label: t("nav.investments"), icon: TrendingUp },
+    { href: "/reports", label: t("nav.reports"), icon: Table2 },
     { href: "/settings", label: t("mobileNav.profile"), icon: Settings },
   ] as const;
 }
@@ -62,6 +64,7 @@ export function MobileNavigation() {
   const isActive = (href: string) => {
     if (href === "/investments") return isRootInvestmentView || pathname.startsWith("/invest") || pathname.startsWith("/funds") || pathname.startsWith("/regular-invest");
     if (href === "/accounts") return pathname.startsWith("/accounts") || pathname.startsWith("/insurance") || pathname.startsWith("/liabilities");
+    if (href === "/reports") return pathname.startsWith("/reports") || pathname.startsWith("/statistics");
     return pathname === href || pathname.startsWith(`${href}/`);
   };
 
@@ -77,23 +80,25 @@ export function MobileNavigation() {
   return (
     <>
       <nav className="fixed inset-x-0 bottom-0 z-50 h-[calc(5.75rem+env(safe-area-inset-bottom))] pb-[env(safe-area-inset-bottom)]">
-        <div className="absolute inset-x-0 bottom-0 grid h-[calc(4.5rem+env(safe-area-inset-bottom))] grid-cols-[1fr_1fr_0.72fr_1fr_1fr] border-t border-slate-200 bg-white/97 px-1 pb-[env(safe-area-inset-bottom)] backdrop-blur">
+        <div className="absolute inset-x-0 bottom-0 grid h-[calc(4.5rem+env(safe-area-inset-bottom))] grid-cols-[1fr_1fr_0.72fr_1fr_1fr_1fr] border-t border-slate-200 bg-white/97 px-1 pb-[env(safe-area-inset-bottom)] backdrop-blur">
           <MobileNavLink item={navItemsList[0]} active={isActive(navItemsList[0].href)} />
           <MobileNavLink item={navItemsList[1]} active={isActive(navItemsList[1].href) || (pathname === "/" && !isRootInvestmentView)} />
-          <span aria-hidden="true" />
+          <span aria-hidden="true" className="relative">
+            <button
+              type="button"
+              onClick={handleQuickEntry}
+              className="absolute left-1/2 -top-4 flex h-14 w-14 -translate-x-1/2 touch-manipulation items-center justify-center rounded-2xl bg-white shadow-[0_4px_18px_rgba(15,23,42,0.16)]"
+              aria-label={t("txForm.addEntry")}
+            >
+              <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-[0_8px_20px_rgba(79,70,229,0.28)]">
+                <Plus size={25} />
+              </span>
+            </button>
+          </span>
           <MobileNavLink item={navItemsList[2]} active={isActive(navItemsList[2].href)} />
           <MobileNavLink item={navItemsList[3]} active={isActive(navItemsList[3].href)} />
+          <MobileNavLink item={navItemsList[4]} active={isActive(navItemsList[4].href)} />
         </div>
-        <button
-          type="button"
-          onClick={handleQuickEntry}
-          className="absolute left-1/2 top-1 flex h-14 w-14 -translate-x-1/2 touch-manipulation items-center justify-center rounded-2xl bg-white shadow-[0_4px_18px_rgba(15,23,42,0.16)]"
-          aria-label={t("txForm.addEntry")}
-        >
-          <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-[0_8px_20px_rgba(79,70,229,0.28)]">
-            <Plus size={25} />
-          </span>
-        </button>
       </nav>
     </>
   );

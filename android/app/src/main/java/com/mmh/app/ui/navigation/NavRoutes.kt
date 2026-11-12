@@ -10,6 +10,7 @@ import android.net.Uri
  * - accounts: money accounts, including cash, debit cards, third-party wallets, credit cards, loans
  * - statistics: yearly financial statistics (income/expense breakdowns, PnL)
  * - invest: investment overview and holdings
+ * - reports: web report page rendered in a WebView (账目报表)
  * - settings: profile/settings
  */
 object NavRoutes {
@@ -19,6 +20,7 @@ object NavRoutes {
     const val ACCOUNTS = "accounts"
     const val STATISTICS = "statistics"
     const val INVEST = "invest"
+    const val REPORTS = "reports"
     const val SETTINGS = "settings"
 
     const val ACCOUNT_DETAIL = "account_detail/{accountId}/{accountName}"

@@ -3,6 +3,7 @@ package com.mmh.app.ui.main
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -17,6 +18,7 @@ import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.TableChart
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.Icon
@@ -52,6 +54,7 @@ import com.mmh.app.ui.statistics.StatisticsScreen
 import com.mmh.app.ui.overview.OverviewScreen
 import com.mmh.app.ui.regularinvest.RegularInvestListScreen
 import com.mmh.app.ui.property.PropertyAssetsScreen
+import com.mmh.app.ui.reports.ReportsScreen
 import com.mmh.app.ui.settings.ServerSettingsScreen
 import com.mmh.app.ui.settings.SettingsScreen
 import com.mmh.app.ui.stocks.StockHoldingsScreen
@@ -142,6 +145,10 @@ fun MainScreen(
                         navController.navigate(NavRoutes.propertyAssets(accountId))
                     }
                 )
+            }
+
+            composable(NavRoutes.REPORTS) {
+                ReportsScreen()
             }
 
             composable(NavRoutes.SETTINGS) {
@@ -374,6 +381,7 @@ private val TAB_ITEMS = listOf(
     TabItem("总览", Icons.Default.Home, NavRoutes.OVERVIEW),
     TabItem("账户", Icons.Default.AccountBalanceWallet, NavRoutes.ACCOUNTS),
     TabItem("投资", Icons.AutoMirrored.Filled.TrendingUp, NavRoutes.INVEST),
+    TabItem("报表", Icons.Default.TableChart, NavRoutes.REPORTS),
     TabItem("我的", Icons.Default.Person, NavRoutes.SETTINGS),
 )
 
@@ -382,6 +390,7 @@ private val TAB_ROUTES = setOf(
     NavRoutes.ACCOUNTS,
     NavRoutes.STATISTICS,
     NavRoutes.INVEST,
+    NavRoutes.REPORTS,
     NavRoutes.SETTINGS,
 )
 
@@ -398,12 +407,14 @@ private fun MainBottomBar(
     onRecordClick: () -> Unit,
     onTabClick: (String) -> Unit
 ) {
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxWidth()
-            .height(92.dp),
-        contentAlignment = Alignment.TopCenter
+            .height(92.dp)
     ) {
+        // 底栏 6 格权重 1 + 1 + 0.72 + 1 + 1 + 1 = 5.72，中间占位格的格心在 2.36 / 5.72 处。
+        // 多了「报表」tab 后左右不再对称，悬浮按钮必须跟着占位格走，否则会压在「投资」tab 上。
+        val fabCenterX = maxWidth * (2.36f / 5.72f)
         NavigationBar(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -422,7 +433,10 @@ private fun MainBottomBar(
         }
 
         Surface(
-            modifier = Modifier.size(76.dp),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .offset(x = fabCenterX - 38.dp)
+                .size(76.dp),
             shape = CircleShape,
             color = MaterialTheme.colorScheme.surface,
             tonalElevation = 3.dp,
@@ -432,8 +446,9 @@ private fun MainBottomBar(
         FloatingActionButton(
             onClick = onRecordClick,
             modifier = Modifier
-                .size(60.dp)
-                .offset(y = 3.dp),
+                .align(Alignment.TopStart)
+                .offset(x = fabCenterX - 30.dp, y = 3.dp)
+                .size(60.dp),
             shape = CircleShape,
             containerColor = MaterialTheme.colorScheme.primary,
             elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 8.dp)
