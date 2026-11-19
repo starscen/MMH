@@ -1,6 +1,6 @@
 import { prisma } from "@/lib/db/prisma";
 import { todayDateBusinessYmd } from "@/lib/date-utils";
-import { queryFundNav } from "@/lib/fund/queryApi";
+import { queryFundNav, type FundNavQueryDiagnostics } from "@/lib/fund/queryApi";
 import {
   fundTradingCalendarForProfile,
   getFundProfile,
@@ -252,8 +252,11 @@ export async function getFundNav(
   fundCode: string,
   navDate: Date,
   accountId?: string,
-  /** `network: false` → 只读缓存，未命中直接返回 null（导入预览要秒出明细时用）。 */
-  options?: { network?: boolean },
+  /**
+   * `network: false` → 只读缓存，未命中直接返回 null（导入预览要秒出明细时用）。
+   * `diagnostics` → 传空对象进来，取数失败时会被填成可读的失败路径（哪个源、什么状态）。
+   */
+  options?: { network?: boolean; diagnostics?: FundNavQueryDiagnostics },
 ): Promise<{ nav: number; cumNav: number | null; dateMatch: boolean; actualDate?: string } | null> {
   // 1. Query the cache table first
   const cached = await getFundNavFromCacheOnly(fundCode, navDate);
@@ -265,7 +268,7 @@ export async function getFundNav(
 
   // 2. Cache miss: fetch from the external API (trying configured priorities)
   const dateStr = navDate.toISOString().slice(0, 10);
-  const apiData = await queryFundNav(fundCode, dateStr, accountId);
+  const apiData = await queryFundNav(fundCode, dateStr, accountId, options?.diagnostics);
 
   if (!apiData) return null;
 
@@ -359,6 +362,7 @@ async function fetchPurchaseLimit(fundCode: string): Promise<number | null> {
  * @param nav Unit NAV
  * @param cumNav Cumulative NAV (optional)
  * @param sgzt Purchase status from the external provider.
+ * @param purchaseLimit Daily purchase cap in yuan (optional; parsed from the provider page).
  */
 export async function setFundNav(
   fundCode: string,
@@ -374,18 +378,6 @@ export async function setFundNav(
     update: { nav, cumNav, sgzt, purchaseLimit },
   });
 }
-
-/**
- * Update a fund NAV inside a transaction.
- *
- * @param tx Prisma transaction client
- * @param fundCode Fund code
- * @param navDate NAV date (must be built with utcDate, ensuring T00:00:00Z)
- * @param nav Unit NAV
- * @param cumNav Cumulative NAV (optional)
- * @param name Fund name (optional)
- * @param sgzt Purchase status (optional)
- */
 
 /**
  * Query a fund's latest NAV.
@@ -572,13 +564,14 @@ async function resolveEffectiveLatestNavTarget(fundCode: string, accountId?: str
 export async function refreshLatestFundNav(
   fundCode: string,
   accountId?: string,
+  diagnostics?: FundNavQueryDiagnostics,
 ): Promise<{ id: string; nav: number; cumNav: number | null; navDate: Date } | null> {
   const targetDate = await resolveEffectiveLatestNavTarget(fundCode, accountId);
   const targetNavDate = utcDate(targetDate);
   const cached = await getFundNavFromCacheOnly(fundCode, targetNavDate);
   if (cached) return getLatestFundNavOnOrBefore(fundCode, targetNavDate);
 
-  const apiData = await queryFundNav(fundCode, targetDate, accountId);
+  const apiData = await queryFundNav(fundCode, targetDate, accountId, diagnostics);
   if (!apiData?.date || !Number.isFinite(apiData.nav)) {
     return getLatestFundNavOnOrBefore(fundCode, targetNavDate);
   }
@@ -633,13 +626,16 @@ export async function refreshHeldFundLatestNavs(options: {
         isPlaceholder: false,
         OR: [
           { investProductType: null },
-          { investProductType: { in: [FundProductType.fund, FundProductType.money] } },
+          // 货基不刷净值：它的「净值」恒为 1，东财返回的是每万份收益，
+          // 写进 FundNavCache 会被下游当成净值乘份额。收益数据走 MoneyFundYield。
+          { investProductType: FundProductType.fund },
         ],
       },
     },
     select: {
       accountId: true,
       fundCode: true,
+      Account: { select: { investProductType: true } },
     },
     orderBy: [
       { accountId: "asc" },
@@ -657,6 +653,8 @@ export async function refreshHeldFundLatestNavs(options: {
       const fundCode = holding.fundCode.trim();
       if (!fundCode) return;
       fundCodes.add(fundCode);
+      // 兜底：即使查询条件被改动，也不给货基写净值缓存。
+      if (holding.Account?.investProductType === FundProductType.money) return;
       try {
         // 只刷净值。基金名不在这里维护：名字只由 FundProfile 持有，
         // 且只允许在基金资料页写入。

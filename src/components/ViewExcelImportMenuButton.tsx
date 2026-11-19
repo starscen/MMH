@@ -9,6 +9,7 @@ import { DateStepper } from "@/components/DateStepper";
 import { FundImportPreviewDialog, type FundImportDialogContext } from "@/components/FundImportPreviewDialog";
 import { StatementImportPreviewDialog, type StatementImportPreviewItem } from "@/components/StatementImportPreviewDialog";
 import { ImportPreviewTabs } from "@/components/ImportPreviewTabs";
+import { SimpleModal } from "@/components/SimpleModal";
 import { StockImportPreviewDialog, type StockImportDialogContext, type StockImportUploadItem } from "@/components/StockImportPreviewDialog";
 import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
 import { parseFlexibleDateToYmd } from "@/lib/date-utils";
@@ -39,7 +40,6 @@ import { convertCaizhiFundImportFile } from "@/lib/statement/caizhi-template";
 import { readStatementSheetRows } from "@/lib/statement/statement-sheet-reader";
 import { routeAlipayFundBill } from "@/lib/statement/alipay-fund-bill";
 import { excludeFundTradeRows } from "@/lib/statement/fund-trade-split";
-import { guardStatementDuplicateImport } from "@/lib/client/statement-import-duplicates";
 
 /**
  * 手持设备上隐藏导入导出入口的类名（唯一写入点，四处入口共用）。
@@ -253,6 +253,7 @@ function templateFor(props: ViewExcelImportMenuButtonProps, t: TranslateFn): Tem
             { value: t("stockPanel.action.merge_share") },
             { value: t("stockPanel.action.fee_adjustment") },
             { value: t("stockPanel.action.tax_adjustment") },
+            { value: t("stockPanel.action.tax_refund") },
             { value: t("viewImport.stockActionBankTransfer") },
           ],
         },
@@ -1039,6 +1040,7 @@ function normalizeStockImportAction(raw: string, t: TranslateFn) {
     ["merge_share", ["merge_share", "merge", t("stockPanel.action.merge_share"), ...splitImportAliases(t("viewImport.stockActionAlias.merge_share"))]],
     ["fee_adjustment", ["fee_adjustment", "fee adjustment", t("stockPanel.action.fee_adjustment"), ...splitImportAliases(t("viewImport.stockActionAlias.fee_adjustment"))]],
     ["tax_adjustment", ["tax_adjustment", "tax adjustment", t("stockPanel.action.tax_adjustment"), ...splitImportAliases(t("viewImport.stockActionAlias.tax_adjustment"))]],
+    ["tax_refund", ["tax_refund", "tax refund", t("stockPanel.action.tax_refund"), ...splitImportAliases(t("viewImport.stockActionAlias.tax_refund"))]],
     ["bank_transfer", ["bank_transfer", t("viewImport.stockActionBankTransfer"), ...splitImportAliases(t("viewImport.stockActionAlias.bank_transfer"))]],
   ];
   for (const [action, labels] of candidates) {
@@ -1137,6 +1139,11 @@ function waitForBrowserPaint() {
       });
     });
   });
+}
+
+/** 上传的文件是不是 PDF 账单：扩展名优先（部分系统给不出 MIME）。 */
+function isPdfStatementFile(file: File) {
+  return file.type === "application/pdf" || /\.pdf$/i.test(file.name);
 }
 
 function statementDefaultAccountName(props: ViewExcelImportMenuButtonProps) {
@@ -1274,6 +1281,25 @@ export function ViewExcelImportMenuButton(props: ViewExcelImportMenuButtonProps)
     await waitForBrowserPaint();
     try {
       setPreviewSourceFileName(file.name);
+      // PDF 账单（信用卡电子账单等）：服务端抽文字 → 与 Excel 完全相同的识别/预览链路。
+      // 邮件附件通道与本通道共用 extractPdfContent，只是文字来源不同。
+      if (isPdfStatementFile(file)) {
+        const text = await extractPdfTextOnServer(file);
+        const latestRecognitionSamples = await refreshRecognitionSamples().catch(() => recognitionSamples);
+        const categories = await loadImportCategories();
+        const serverItems = await parseByServer(text);
+        const items = alignStatementRecognitionToLedger(
+          serverItems,
+          categories,
+          latestRecognitionSamples,
+        ).filter((item) => item.date && Number(item.amount) > 0);
+        if (items.length === 0) throw new Error(t("viewImport.noRows"));
+        setPreviewItems(items);
+        setPreviewOpen(true);
+        setPreviewTab("statement");
+        setStatus(t("viewImport.recognizedCount", { count: items.length }));
+        return;
+      }
       const billSheets = await readStatementSheetRows(file);
       const detectedKind = await detectImportFileKind(billSheets, t);
 
@@ -1411,6 +1437,21 @@ export function ViewExcelImportMenuButton(props: ViewExcelImportMenuButtonProps)
     }
   }
 
+  /**
+   * PDF 账单的文字抽取必须放服务端：pdf-parse 会连带 pdfjs 与原生 canvas，
+   * 一旦进了 client bundle，页面直接编译失败。抽完的文字再走同一条识别链路。
+   */
+  async function extractPdfTextOnServer(file: File) {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/v1/statement/parse-pdf", { method: "POST", body: form });
+    const data = await res.json().catch(() => null) as { ok?: boolean; error?: string; text?: string } | null;
+    if (!res.ok || !data?.ok || !data.text) {
+      throw new Error(data?.error || t("viewImport.recognitionFailed"));
+    }
+    return data.text;
+  }
+
   async function parseByServer(text: string) {
     const res = await fetch("/api/v1/statement/parse", {
       method: "POST",
@@ -1445,13 +1486,8 @@ export function ViewExcelImportMenuButton(props: ViewExcelImportMenuButtonProps)
     options?: { createLiabilityAccounts?: boolean; forceCreateOwnedMoneyAccounts?: boolean },
   ) {
     if (items.length === 0) return;
-    // 同一份账单重复导入：同一天已有记录的笔数与金额完全一致时先问用户是否覆盖。
-    // 必须在这里（分批之前）问：每批只有 1/10 的行，逐批判断会漏掉别的批次里的重复。
-    const duplicateChoice = await guardStatementDuplicateImport(
-      items as unknown as Array<Record<string, unknown>>,
-      t,
-    );
-    if (duplicateChoice === "cancel") return;
+    // 重复检测统一在预览弹窗确认时做（StatementImportPreviewDialog.confirmSelected），
+    // 那里拿到的是全量勾选行，不会被下面的 10 批拆分切碎。
     setBusy(true);
     setStatus(t("viewImport.importingBills"));
     setImportProgress({ imported: 0, total: items.length });
@@ -1713,7 +1749,12 @@ export function ViewExcelImportMenuButton(props: ViewExcelImportMenuButtonProps)
       <input
         ref={inputRef}
         type="file"
-        accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+        accept={
+          // PDF 只能进流水通道（基金/股票页签的文件仍然是 Excel 模板）。
+          props.kind === "normal"
+            ? ".pdf,application/pdf,.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+            : ".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+        }
         className="hidden"
         onChange={(event) => {
           const file = event.target.files?.[0];
@@ -1778,35 +1819,30 @@ export function ViewExcelImportMenuButton(props: ViewExcelImportMenuButtonProps)
         }}
       />
       {props.excelExport && excelExportOpen ? (
-        <ModalLayer className="fixed inset-0 flex items-center justify-center bg-slate-900/25 px-4">
-          <div className="w-full max-w-md overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
-            <div className="border-b border-slate-100 px-4 py-3">
-              <div className="text-sm font-semibold text-slate-800">{props.excelExport.title ?? t("viewImport.exportExcel")}</div>
-              <div className="mt-1 text-xs text-slate-500">
-                {props.excelExport.description ?? t("viewImport.exportDescription")}
-              </div>
-            </div>
-            <div className="space-y-3 px-4 py-4">
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-slate-600">{t("viewImport.exportStartDate")}</span>
-                <DateStepper value={excelExportStart} onChange={setExcelExportStart} />
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-slate-600">{t("viewImport.exportEndDate")}</span>
-                <DateStepper value={excelExportEnd} onChange={setExcelExportEnd} />
-              </label>
-              {excelExportError ? <div className="rounded bg-red-50 px-3 py-2 text-xs text-red-700">{excelExportError}</div> : null}
-            </div>
-            <div className="flex justify-end gap-2 border-t border-slate-100 px-4 py-3">
-              <button type="button" onClick={() => setExcelExportOpen(false)} className="secondary-button h-8 px-3 text-xs" disabled={busy}>
-                {t("common.cancel")}
-              </button>
-              <button type="button" onClick={() => void handleExcelExport()} className="primary-button h-8 px-3 text-xs" disabled={busy}>
-                {busy ? t("viewImport.exporting") : t("viewImport.export")}
-              </button>
-            </div>
+        <SimpleModal
+          open={excelExportOpen}
+          onClose={() => setExcelExportOpen(false)}
+          closeDisabled={busy}
+          title={props.excelExport.title ?? t("viewImport.exportExcel")}
+          description={props.excelExport.description ?? t("viewImport.exportDescription")}
+          footer={
+            <button type="button" onClick={() => void handleExcelExport()} className="primary-button h-8 px-3 text-xs" disabled={busy}>
+              {busy ? t("viewImport.exporting") : t("viewImport.export")}
+            </button>
+          }
+        >
+          <div className="space-y-3">
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">{t("viewImport.exportStartDate")}</span>
+              <DateStepper value={excelExportStart} onChange={setExcelExportStart} />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">{t("viewImport.exportEndDate")}</span>
+              <DateStepper value={excelExportEnd} onChange={setExcelExportEnd} />
+            </label>
+            {excelExportError ? <div className="rounded bg-red-50 px-3 py-2 text-xs text-red-700">{excelExportError}</div> : null}
           </div>
-        </ModalLayer>
+        </SimpleModal>
       ) : null}
       {status ? <span className="ml-2 max-w-64 truncate text-xs text-slate-500" title={status}>{status}</span> : null}
     </div>

@@ -2,7 +2,7 @@
 import { ModalLayer } from "@/components/ModalLayer";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, Download, Shield, Upload, RefreshCw } from "lucide-react";
+import { ChevronDown, Download, Shield, Upload, RefreshCw, X } from "lucide-react";
 import { withBasePath } from "@/lib/base-path";
 import {
   SettingsActionButton,
@@ -212,9 +212,12 @@ type AutoBackupResponse = {
       systemBackup?: boolean;
       defaultDir?: string;
       defaultDisk?: AutoBackupDiskInfo | null;
+      /** Docker / Podman: only mounted volumes survive a container recreate */
+      containerized?: boolean;
+      persistentRoot?: string;
     };
     disk?: AutoBackupDiskInfo | null;
-    result?: { files?: string[] };
+    result?: { files?: string[]; location?: string };
   };
 };
 
@@ -763,6 +766,8 @@ export default function DatabaseSettingsPage() {
   const [autoBackupStatus, setAutoBackupStatus] = useState<AutoBackupStatus | null>(null);
   const [autoBackupSystemSupported, setAutoBackupSystemSupported] = useState(true);
   const [autoBackupDefaultDir, setAutoBackupDefaultDir] = useState("");
+  const [autoBackupContainerized, setAutoBackupContainerized] = useState(false);
+  const [autoBackupPersistentRoot, setAutoBackupPersistentRoot] = useState("");
   const [autoBackupDisk, setAutoBackupDisk] = useState<AutoBackupDiskInfo | null>(null);
   const [autoBackupLoading, setAutoBackupLoading] = useState(true);
   const [autoBackupSaving, setAutoBackupSaving] = useState(false);
@@ -852,6 +857,13 @@ export default function DatabaseSettingsPage() {
     fallbackKey: string,
     pathFallback: string,
   ): string {
+    if (data?.code === "BACKUP_PATH_NOT_PERSISTENT") {
+      return t("settings.autoBackup.pathNotPersistent", {
+        path: data.data?.dir || pathFallback || "…",
+        dir: autoBackupDefaultDir || "…",
+        error: data.error ?? "",
+      });
+    }
     if (data?.code === "BACKUP_PATH_NOT_WRITABLE") {
       const remote = autoBackup?.destination && autoBackup.destination !== "local";
       return t(remote ? "settings.autoBackup.remoteNotWritable" : "settings.autoBackup.pathNotWritable", {
@@ -876,6 +888,8 @@ export default function DatabaseSettingsPage() {
       const systemSupported = capabilities?.systemBackup !== false;
       setAutoBackupSystemSupported(systemSupported);
       setAutoBackupDefaultDir(capabilities?.defaultDir ?? "");
+      setAutoBackupContainerized(capabilities?.containerized === true);
+      setAutoBackupPersistentRoot(capabilities?.persistentRoot ?? "");
       setAutoBackupDisk(capabilities?.defaultDisk ?? null);
       const config = data.data.config;
       if (config) {
@@ -956,11 +970,13 @@ export default function DatabaseSettingsPage() {
       }
       setAutoBackupStatus(data.data?.status ?? null);
       const files = data.data?.result?.files;
-      if (files && files.length > 0) {
-        setAutoBackupMessage(t("settings.autoBackup.runNowResult", { files: files.join(", ") }));
-      } else {
-        setAutoBackupMessage(t("settings.autoBackup.runNowResult", { files: t("settings.autoBackup.lastRunNone") }));
-      }
+      const location = data.data?.result?.location || autoBackupDefaultDir;
+      setAutoBackupMessage(
+        t("settings.autoBackup.runNowResult", {
+          files: files && files.length > 0 ? files.join(", ") : t("settings.autoBackup.lastRunNone"),
+          location: location || "…",
+        }),
+      );
     } catch (error) {
       setAutoBackupError(error instanceof Error ? error.message : t("settings.autoBackup.runNowFailed", { error: "" }));
     } finally {
@@ -1857,6 +1873,13 @@ export default function DatabaseSettingsPage() {
                 <div className="mt-1 truncate text-[11px] text-slate-400" title={autoBackupDefaultDir}>
                   {t("settings.autoBackup.defaultDir", { path: autoBackupDefaultDir || "…" })}
                 </div>
+                {autoBackupContainerized ? (
+                  <div className="mt-1 rounded-md border border-sky-100 bg-sky-50 px-2 py-1 text-[11px] leading-relaxed text-sky-900">
+                    {t("settings.autoBackup.containerHint", {
+                      root: autoBackupPersistentRoot || autoBackupDefaultDir || "…",
+                    })}
+                  </div>
+                ) : null}
                 {autoBackupDisk?.free ? (
                   <div className="mt-1 text-[11px] text-slate-500">
                     {t("settings.autoBackup.diskSpace", { free: autoBackupDisk.free })}
@@ -2079,9 +2102,31 @@ export default function DatabaseSettingsPage() {
       {backupOptionsDialogOpen ? (
         <ModalLayer className="fixed inset-0 flex items-center justify-center bg-slate-900/35 px-4">
           <div className="w-full max-w-sm rounded-lg border border-slate-200 bg-white p-4 shadow-xl">
-            <div className="text-sm font-semibold text-slate-800">{t("settings.database.backupOptionsTitle")}</div>
-            <div className="mt-1 text-xs text-slate-500">
-              {t("settings.database.backupOptionsDesc")}
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-slate-800">{t("settings.database.backupOptionsTitle")}</div>
+                <div className="mt-1 text-xs text-slate-500">
+                  {t("settings.database.backupOptionsDesc")}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (backuping) return;
+                  setBackupOptionsDialogOpen(false);
+                  setBackupUserPassword("");
+                  setBackupPassphrase("");
+                  setBackupEncrypt(false);
+                  setBackupScope("household");
+                  setBackupError("");
+                }}
+                disabled={backuping}
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40"
+                title={t("table.close")}
+                aria-label={t("table.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <div className="mt-3 grid grid-cols-2 gap-2">
               <button
@@ -2176,22 +2221,6 @@ export default function DatabaseSettingsPage() {
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  if (backuping) return;
-                  setBackupOptionsDialogOpen(false);
-                  setBackupUserPassword("");
-                  setBackupPassphrase("");
-                  setBackupEncrypt(false);
-                  setBackupScope("household");
-                  setBackupError("");
-                }}
-                disabled={backuping}
-                className="h-9 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-              >
-                {t("common.cancel")}
-              </button>
-              <button
-                type="button"
                 onClick={() => void handleBackup()}
                 disabled={backuping || (backupEncrypt && backupPassphrase.trim().length === 0)}
                 className="h-9 rounded-md bg-blue-600 px-3 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
@@ -2206,9 +2235,30 @@ export default function DatabaseSettingsPage() {
       {restoreOptionsDialogOpen ? (
         <ModalLayer className="fixed inset-0 flex items-center justify-center bg-slate-900/35 px-4">
           <div className="w-full max-w-sm rounded-lg border border-slate-200 bg-white p-4 shadow-xl">
-            <div className="text-sm font-semibold text-slate-800">{t("settings.database.restoreTitle")}</div>
-            <div className="mt-1 text-xs text-slate-500">
-              {t("settings.database.restoreDesc")}
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-slate-800">{t("settings.database.restoreTitle")}</div>
+                <div className="mt-1 text-xs text-slate-500">
+                  {t("settings.database.restoreDesc")}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (restoring) return;
+                  setRestoreOptionsDialogOpen(false);
+                  setRestoreUserPassword("");
+                  setRestorePassphrase("");
+                  setRestoreConfirmSystemOverwrite(false);
+                  setRestoreError("");
+                }}
+                disabled={restoring}
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40"
+                title={t("table.close")}
+                aria-label={t("table.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <div className="mt-3 rounded-md bg-slate-50 px-2 py-1 text-[11px] text-slate-500">
               {restoreBackupScope === "system"
@@ -2299,21 +2349,6 @@ export default function DatabaseSettingsPage() {
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  if (restoring) return;
-                  setRestoreOptionsDialogOpen(false);
-                  setRestoreUserPassword("");
-                  setRestorePassphrase("");
-                  setRestoreConfirmSystemOverwrite(false);
-                  setRestoreError("");
-                }}
-                disabled={restoring}
-                className="h-9 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-              >
-                {t("common.cancel")}
-              </button>
-              <button
-                type="button"
                 onClick={() => void handleRestore()}
                 disabled={
                   restoring ||
@@ -2332,12 +2367,31 @@ export default function DatabaseSettingsPage() {
       {resetPasswordDialogOpen ? (
         <ModalLayer className="fixed inset-0 flex items-center justify-center bg-slate-900/35 px-4">
           <div className="w-full max-w-sm rounded-lg border border-red-100 bg-white p-4 shadow-xl">
-            <div className="flex items-center gap-2 text-sm font-semibold text-red-800">
-              <Shield className="h-4 w-4 shrink-0 text-amber-500" />
-              {resetScope === "system" ? t("settings.database.resetTitle") : t("settings.database.householdResetTitle")}
-            </div>
-            <div className="mt-1 text-xs text-slate-500">
-              {resetScope === "system" ? t("settings.database.resetDesc") : t("settings.database.householdResetDesc")}
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-red-800">
+                  <Shield className="h-4 w-4 shrink-0 text-amber-500" />
+                  {resetScope === "system" ? t("settings.database.resetTitle") : t("settings.database.householdResetTitle")}
+                </div>
+                <div className="mt-1 text-xs text-slate-500">
+                  {resetScope === "system" ? t("settings.database.resetDesc") : t("settings.database.householdResetDesc")}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (resetting) return;
+                  setResetPasswordDialogOpen(false);
+                  setResetDbPassword("");
+                  setResetError("");
+                }}
+                disabled={resetting}
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40"
+                title={t("table.close")}
+                aria-label={t("table.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <div className="mt-3">
               <CredentialPasswordField
@@ -2353,19 +2407,6 @@ export default function DatabaseSettingsPage() {
             </div>
             {resetError ? <div className="mt-2 text-xs text-red-600">{resetError}</div> : null}
             <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  if (resetting) return;
-                  setResetPasswordDialogOpen(false);
-                  setResetDbPassword("");
-                  setResetError("");
-                }}
-                disabled={resetting}
-                className="h-9 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-              >
-                {t("common.cancel")}
-              </button>
               <button
                 type="button"
                 onClick={() => void handleFactoryReset()}

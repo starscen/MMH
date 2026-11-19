@@ -5,6 +5,8 @@ import { createPortal } from "react-dom";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useI18n } from "@/lib/i18n";
 import { MMH_BASE_PATH, withBasePath } from "@/lib/base-path";
+import { openMetalExtract } from "@/lib/client/metal-extract-event";
+import { selectedStockForAccount } from "@/lib/client/stock-selection";
 import type { LoanTypeValue } from "@/lib/loan-type";
 
 type EntryKind =
@@ -22,7 +24,11 @@ type EntryKind =
   | "stock-dividend"
   | "stock-repo"
   | "property"
+  | "property-improvement"
+  | "property-sell"
+  | "property-expense"
   | "metal"
+  | "metal-extract"
   | "wealth"
   | "bond"
   | "deposit"
@@ -42,6 +48,8 @@ type EntryAction = {
   disabled?: boolean;
   loanType?: LoanType;
   mode?: LoanMode;
+  /** 基金二级菜单（开放式基金 / 货币基金）用它锁定弹窗的产品类型。 */
+  productType?: "fund" | "money";
   children?: EntryAction[];
 };
 
@@ -56,6 +64,8 @@ type Props = {
     defaultTransferFromAccountId?: string;
     defaultTransferToAccountId?: string;
     defaultInvestmentAccountId?: string;
+    /** 当前投资账户的产品类型（fund / money）。货基账户点「记一笔」必须带着 money 打开。 */
+    defaultInvestmentProductType?: string;
     defaultStockAccountId?: string;
     defaultStockCashAccountId?: string;
     defaultStockTransferFromAccountId?: string;
@@ -120,7 +130,13 @@ function getCurrentFundContext(context?: Props["context"]) {
   }
 }
 
-function dispatchEntryAction(kind: EntryKind, context?: Props["context"], loanType?: LoanType, loanMode?: LoanMode) {
+function dispatchEntryAction(
+  kind: EntryKind,
+  context?: Props["context"],
+  loanType?: LoanType,
+  loanMode?: LoanMode,
+  productTypeOverride?: "fund" | "money",
+) {
   if (typeof window === "undefined") return;
   const requestId = makeRequestId(kind);
   switch (kind) {
@@ -215,35 +231,79 @@ function dispatchEntryAction(kind: EntryKind, context?: Props["context"], loanTy
         }),
       );
       return;
-    case "investment":
+    case "investment": {
       const currentFund = getCurrentFundContext(context);
+      // 产品类型不能写死成开放式基金：货基账户点「记一笔」会带着 fund 打开，
+      // 副标题显示「开放式基金」，后续净值与份额也按基金口径算。
+      // 账户类型优先；拿不到时按当前视图兜底（investmoney 是货基专属视图）。
+      // 「基金 ▸ 开放式基金 / 货币基金」二级菜单显式点选时以菜单为准。
+      const accountProductType = context?.defaultInvestmentProductType ?? "";
+      const onMoneyView =
+        typeof window !== "undefined" &&
+        new URLSearchParams(window.location.search).get("view") === "investmoney";
+      const productType =
+        productTypeOverride ?? (accountProductType === "money" || onMoneyView ? "money" : "fund");
       window.dispatchEvent(
         new CustomEvent("mmh:investment:create", {
           detail: {
             requestId,
             defaultAccountId: context?.defaultInvestmentAccountId ?? "",
             defaultCashAccountId: context?.defaultCashAccountId ?? context?.defaultAccountId ?? "",
-            defaultProductType: "fund",
+            defaultProductType: productType,
             defaultFundCode: currentFund.fundCode,
             defaultFundName: currentFund.fundName,
           },
         }),
       );
       return;
-    case "stock":
-    case "stock-sell":
-    case "stock-dividend":
+    }
+    // 「股票」按**当前页签**决定默认动作：已经停在逆回购页签（URL `stockTab=repo`，由
+    // StockHoldingsPanel 维持）时，点它直接弹出**逆回购记账窗**，而不是买入
+    // （2026-11-12 用户：「如果在股票逆回购，点击胶囊按钮，就出现逆回购记一笔的界面」）。
+    // 其他情况仍是原来的买入。
+    case "stock": {
+      const onRepoLots = new URLSearchParams(window.location.search).get("stockTab") === "repo";
+      const stockAccountId = context?.defaultStockAccountId ?? context?.defaultInvestmentAccountId ?? "";
+      // 持仓页已经选中某只股票时直接带上它。买入页签（stock 入口默认落这里）先显示这只，
+      // 用户切到卖出/分红时下拉里也已经是它，不必再点一次。逆回购与股票无关，不带。
+      const pickedStock = onRepoLots ? null : selectedStockForAccount(stockAccountId);
       window.dispatchEvent(
         new CustomEvent("mmh:stock:create", {
           detail: {
             requestId,
-            defaultAction: kind === "stock-sell" ? "sell" : kind === "stock-dividend" ? "dividend" : "buy",
-            defaultStockAccountId: context?.defaultStockAccountId ?? context?.defaultInvestmentAccountId ?? "",
+            defaultAction: onRepoLots ? "repo" : "buy",
+            defaultStockAccountId: stockAccountId,
             defaultCashAccountId: context?.defaultStockCashAccountId ?? context?.defaultCashAccountId ?? "",
+            defaultSecurityId: pickedStock?.securityId || undefined,
+            defaultStockCode: pickedStock?.stockCode || undefined,
+            defaultStockName: pickedStock?.stockName || undefined,
+            defaultMarket: pickedStock?.market || undefined,
           },
         }),
       );
       return;
+    }
+    case "stock-sell":
+    case "stock-dividend": {
+      const stockAccountId = context?.defaultStockAccountId ?? context?.defaultInvestmentAccountId ?? "";
+      // 账号对不上（不在股票视图 / 已离开持仓页）时拿不到，退回让用户在弹窗里选。
+      const pickedStock = selectedStockForAccount(stockAccountId);
+      window.dispatchEvent(
+        new CustomEvent("mmh:stock:create", {
+          detail: {
+            requestId,
+            defaultAction: kind === "stock-sell" ? "sell" : "dividend",
+            defaultStockAccountId: stockAccountId,
+            defaultCashAccountId: context?.defaultStockCashAccountId ?? context?.defaultCashAccountId ?? "",
+            defaultSecurityId: pickedStock?.securityId || undefined,
+            defaultStockCode: pickedStock?.stockCode || undefined,
+            defaultStockName: pickedStock?.stockName || undefined,
+            defaultMarket: pickedStock?.market || undefined,
+          },
+        }),
+      );
+      return;
+    }
     case "stock-transfer":
       window.dispatchEvent(
         new CustomEvent("mmh:create-transaction:open", {
@@ -259,6 +319,24 @@ function dispatchEntryAction(kind: EntryKind, context?: Props["context"], loanTy
       );
       return;
     case "property":
+    case "property-improvement":
+    case "property-sell": {
+      // 固定资产记账一张弹窗、三个页签：资产变动（含新购入）/ 资产售出 / 资产处置（遗弃、赠送等无回款）。
+      // 「出售」入口直接落到售出页签；原来这里派发的是通用支出表单，卖不了资产。
+      window.dispatchEvent(
+        new CustomEvent("mmh:property:create", {
+          detail: {
+            requestId,
+            defaultAction: kind === "property-sell" ? "sale" : undefined,
+            defaultPropertyAccountId: context?.defaultPropertyAccountId ?? context?.defaultInvestmentAccountId ?? "",
+            defaultCashAccountId: context?.defaultCashAccountId ?? context?.defaultAccountId ?? "",
+          },
+        }),
+      );
+      return;
+    }
+    case "property-expense": {
+      // 挂在固定资产上的费用化支出（物业费、税费…）仍走通用支出表单。
       const fixedAssetAccountId = context?.defaultPropertyAccountId ?? context?.defaultInvestmentAccountId ?? "";
       window.dispatchEvent(
         new CustomEvent("mmh:create-transaction:open", {
@@ -275,6 +353,7 @@ function dispatchEntryAction(kind: EntryKind, context?: Props["context"], loanTy
         }),
       );
       return;
+    }
     case "metal":
       window.dispatchEvent(
         new CustomEvent("mmh:investment:create", {
@@ -287,6 +366,13 @@ function dispatchEntryAction(kind: EntryKind, context?: Props["context"], loanTy
         }),
       );
       return;
+    case "metal-extract": {
+      // 提取实物（贵金属 → 固定资产）：打开贵金属投资记账窗的「提取实物」页签。
+      const metalAccountId = context?.defaultMetalAccountId ?? "";
+      if (!metalAccountId) return;
+      openMetalExtract({ requestId, accountId: metalAccountId });
+      return;
+    }
     case "wealth":
       window.dispatchEvent(
         new CustomEvent("mmh:wealth:create", {
@@ -559,7 +645,15 @@ export function UnifiedEntryLauncher({ defaultAction, actions, className, hideDe
           data-entry-launcher-primary-action={defaultItem?.key ?? ""}
           onClick={() => {
             setMenuOpen(false);
-            if (defaultItem) dispatchEntryAction(defaultItem.key, context, defaultItem.loanType, defaultItem.mode);
+            if (defaultItem) {
+              dispatchEntryAction(
+                defaultItem.key,
+                context,
+                defaultItem.loanType,
+                defaultItem.mode,
+                defaultItem.productType,
+              );
+            }
           }}
           disabled={!defaultItem}
           className="inline-flex items-center gap-1.5 bg-transparent px-3 text-sm font-medium hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
@@ -610,7 +704,15 @@ export function UnifiedEntryLauncher({ defaultAction, actions, className, hideDe
                           disabled={item.disabled}
                           onClick={() => {
                             setMenuOpen(false);
-                            if (!item.disabled) dispatchEntryAction(item.key, context, item.loanType, item.mode);
+                            if (!item.disabled) {
+                              dispatchEntryAction(
+                                item.key,
+                                context,
+                                item.loanType,
+                                item.mode,
+                                item.productType,
+                              );
+                            }
                           }}
                           className="flex-1 px-3 py-2 text-left text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-white"
                         >
@@ -646,7 +748,9 @@ export function UnifiedEntryLauncher({ defaultAction, actions, className, hideDe
                     }}
                     onClick={() => {
                       setMenuOpen(false);
-                      if (!item.disabled) dispatchEntryAction(item.key, context, item.loanType, item.mode);
+                      if (!item.disabled) {
+                        dispatchEntryAction(item.key, context, item.loanType, item.mode, item.productType);
+                      }
                     }}
                     className="flex w-full items-center px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-white"
                   >
@@ -670,12 +774,20 @@ export function UnifiedEntryLauncher({ defaultAction, actions, className, hideDe
             >
               {openSubmenuAction.children?.map((child) => (
                 <button
-                  key={`${openSubmenuAction.key}:${child.key}:${child.loanType ?? child.mode ?? "default"}`}
+                  key={`${openSubmenuAction.key}:${child.key}:${child.loanType ?? child.mode ?? child.productType ?? "default"}`}
                   type="button"
                   disabled={child.disabled}
                   onClick={() => {
                     setMenuOpen(false);
-                    if (!child.disabled) dispatchEntryAction(child.key, context, child.loanType, child.mode);
+                    if (!child.disabled) {
+                      dispatchEntryAction(
+                        child.key,
+                        context,
+                        child.loanType,
+                        child.mode,
+                        child.productType,
+                      );
+                    }
                   }}
                   className="flex w-full items-center whitespace-nowrap px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-white"
                 >

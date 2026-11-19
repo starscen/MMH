@@ -89,14 +89,10 @@ export function BasicDataSubmenuHeader({ children }: { children?: ReactNode }) {
   const tabLabels = BASIC_DATA_TABS.map((item) => t(item.labelKey));
 
   return (
-    // 「页签带」= 卡片底色（2026-11-04 用户：「页签颜色要延伸到卡片」）：横向铺满内容板宽度
-    // （页签组是 `shrink`，所以底色必须挂在这层整行上），纵向从条顶一路压到卡片上缘**再往下 12px**
-    // ——`pb-3` 让盒子多长 12px、`-mb-3` 把外边距还回去，排版位置一像素不动。多出的 12px 被卡片
-    // （z-20，实体米色）整块盖住，只会从卡片两个上圆角外侧的「死角」露出来；不补的话那里是页面
-    // 灰底，米色带子与米色卡片之间会插进两块灰色小三角。
-    // ⚠️ padding 必须挂在这层块级容器上，不能挂在下面那行 `items-end` 的 flex 上：flex 的
-    // padding-bottom 会把页签整体上顶 12px，页签与卡片的 −1px 接缝当场断开。
-    <div className="@container shrink-0 bg-[var(--ft-card-bg)] pb-3 -mb-3">
+    // 页签条**不刷底色**（2026-11-12 用户：「页签背景有一个与卡片同宽的长条形底色，去掉」）：
+    // 2026-11-04 曾在这层整行刷卡片底色，并用 `pb-3 -mb-3` 多长 12px 去填卡片上圆角外侧的死角；
+    // 底色撤销后那 12px 没有意义，一并去掉（两者相互抵消，排版位置不变）。
+    <div className="@container shrink-0">
       <div className="relative flex items-end gap-2 @max-[26rem]:[--ft-tab-font:0.8125rem] @max-[19rem]:[--ft-tab-font:0.75rem]">
         {/* 页签组靠左、**不铺满整行**：`shrink`（basis auto）让它按内容宽排布，等宽由每个页签里的
             `FolderTabRuler` 提供（各页签 max-content 都等于最长标签宽 → 组宽 = N × 最长标签宽）。 */}
@@ -136,7 +132,7 @@ export function BasicDataSubmenuHeader({ children }: { children?: ReactNode }) {
 }
 
 /**
- * 基本资料页的「导出模板 / 导入 EXCEL」入口。
+ * 基本资料页的「导入 / 导出」入口。
  *
  * 复用账户页那套批量导入组件，只是基础资料（机构 / 往来对象 / 家庭成员 / 基准币种）由这里
  * 自己按需取（`fetchSettingsAccountData` 带缓存，四个子页共用一份请求）。
@@ -144,6 +140,10 @@ export function BasicDataSubmenuHeader({ children }: { children?: ReactNode }) {
  * 2026-11-04 用户：「把导出与导入放到新增左边，鼠标放上去的时候提示这是整个基础资料的
  * 模板导出和导入」——所以不再挂 FT 页签条右端（`BasicDataSubmenuHeader` 的 children），
  * 而是由各页放进 `SettingsSection.actions` 的 `addButton` 之前，并带 tooltip 说明作用域。
+ *
+ * 形态与账户页完全一致：一枚「导入 / 导出」下拉按钮，`exportTemplateTitle` /
+ * `importExcelTitle` 的 tooltip 挂在菜单两项上（2026-11-16 用户要求两处统一，不要在这里
+ * 另挂一排「导出模板 + 导入 EXCEL」的并排按钮）。
  */
 export function BasicDataImportExportActions({ onImported, className }: { onImported?: () => void; className?: string }) {
   const { t } = useI18n();
@@ -176,7 +176,7 @@ export function BasicDataImportExportActions({ onImported, className }: { onImpo
 
   return (
     <div className={className ? `${className} items-center gap-2` : "flex items-center gap-2"}>
-      {/* 放进卡片标题栏后与「新增」等按钮同高（不再用 compact 的 28px 页签条高度）。 */}
+      {/* 与「新增」等按钮同高；形态由 AccountBatchImportButton 自己决定（单枚下拉）。 */}
       <AccountBatchImportButton
         exportTemplateTitle={t("settings.basicData.templateTip")}
         importExcelTitle={t("settings.basicData.importTip")}

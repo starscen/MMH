@@ -3,7 +3,7 @@ import { ModalLayer } from "@/components/ModalLayer";
 
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState, useCallback, type FormEvent, type ReactNode } from "react";
-import { Plus } from "lucide-react";
+import { Plus, X } from "lucide-react";
 import { COUNTERPARTY_TYPE_OPTIONS, FINANCIAL_INSTITUTION_TYPE_VALUES, institutionTypeLabel, institutionTypeOptions, kindOrder } from "@/lib/account-kinds";
 import { PRODUCT_TYPES, supportsCostBasisMethod } from "@/lib/investment-config";
 import { supportsTradingCalendarForAccount, TRADING_CALENDARS } from "@/lib/fund/trading-calendar";
@@ -15,6 +15,7 @@ import { CurrencySmartSelect } from "@/components/CurrencySmartSelect";
 import { notifySettingsDataChanged, type SettingsDataScope } from "@/lib/client/settingsCache";
 import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
 import { CURRENCY_OPTIONS, normalizeCurrency } from "@/lib/currency";
+import { institutionFullName } from "@/lib/institution-display";
 import {
   accountInstitutionTypeIsAllowed,
   accountRequiresInstitution,
@@ -147,6 +148,8 @@ type CompactModeProps = {
   includeInitialBalanceFields?: boolean;
   /** For account creation: initial currency selected from the current ledger setting. */
   defaultCurrency?: string;
+  /** 只读提示条（表单顶部）：说明这套字段被锁定的默认口径，例如提取实物新建账户默认是收藏品。 */
+  notice?: string;
 };
 
 /* ---- Full mode props (new, for settings pages) ---- */
@@ -478,6 +481,7 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
   const displayNameLabel = props.nameLabel ?? t(config.nameLabelKey);
   const displayNamePlaceholder = props.namePlaceholder ?? t(config.namePlaceholderKey);
   const defaultName = props.defaultName ?? "";
+  const notice = mode === "compact" ? props.notice ?? "" : "";
   const includeInitialBalanceFields = entityType === "account" && Boolean(props.includeInitialBalanceFields);
 
   // Unpack mode-specific props
@@ -699,33 +703,94 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
     setDupWarning("");
   }, [mode, defaultName, defaultType, extraFields, defaultParentId, typeKey, config.fullFields, getDefaultTypeCompact, entityType, allowedInstitutionTypes, allowedAccountKinds, includeInitialBalanceFields, defaultValueForField, fallbackSelectValueForField]);
 
+  /**
+   * 表单只在「语义值」变化时重新初始化，绝不因为 props 引用换了个新对象就重置。
+   *
+   * 调用方普遍内联传 `allowedCounterpartyTypes={["person", "organization"]}`、
+   * `allowedInstitutionTypes={[...VALUES]}`、`extraFields={{ type }}`、
+   * `nestedFieldData={...}`，这些每次父组件渲染都是新引用；而 initForm 的依赖里
+   * 正好包含它们。以前 effect 直接依赖 initForm，于是父组件任何一次异步重渲染
+   * （例如弹窗打开几秒后账户/往来对象数据才加载完）都会把用户已经填好的
+   * 「往来对象名称」整张表单清空（2026-11-17 用户报障）。
+   * 现在把初始化条件收敛成一个值签名：内容没变就不动表单。
+   */
+  const initSignature = useMemo(
+    () => JSON.stringify({
+      mode,
+      entityType,
+      defaultName,
+      defaultType,
+      defaultParentId,
+      typeKey,
+      accountDefaultCurrency,
+      includeInitialBalanceFields: Boolean(includeInitialBalanceFields),
+      extraFields: extraFields ?? null,
+      allowedInstitutionTypes: allowedInstitutionTypes ?? null,
+      allowedAccountKinds: allowedAccountKinds ?? null,
+      allowedTypeValues: allowedTypeValues ?? null,
+    }),
+    [
+      mode,
+      entityType,
+      defaultName,
+      defaultType,
+      defaultParentId,
+      typeKey,
+      accountDefaultCurrency,
+      includeInitialBalanceFields,
+      extraFields,
+      allowedInstitutionTypes,
+      allowedAccountKinds,
+      allowedTypeValues,
+    ],
+  );
+  // initForm 的引用会随上面这些 props 的引用变化而无意义地重建，所以 effect 只通过 ref 调它。
+  const initFormRef = useRef(initForm);
+  initFormRef.current = initForm;
+  const runInitForm = useCallback(() => { initFormRef.current(); }, []);
+  const prevOpenRef = useRef(false);
+  const lastInitSignatureRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (mode !== "compact") return;
-    if (open) {
-      // When a nested entity was just created, keep the current form state
-      // (including the newly selected entity) instead of re-initializing it.
-      // The flag must survive across renders: creating a nested entity fires
-      // notifySettingsDataChanged, and the parent's async refresh lands later
-      // as a nestedFieldData prop change. Clearing the flag on every render
-      // would let that late refresh wipe the user's input.
-      if (!nestedCreatedRef.current) initForm();
-      nestedCreatedRef.current = false;
-      // Sync nestedFieldData with compact prop changes
-      if (compactNestedFieldData) setNestedFieldData(compactNestedFieldData);
-    } else {
+    const opened = Boolean(open);
+    const justOpened = opened && !prevOpenRef.current;
+    prevOpenRef.current = opened;
+    if (!opened) {
       // Reset on close so a lingering flag never suppresses initialization
       // of the next open.
       nestedCreatedRef.current = false;
+      return;
     }
-  }, [mode, open, initForm, compactNestedFieldData]);
+    const signatureChanged = lastInitSignatureRef.current !== initSignature;
+    lastInitSignatureRef.current = initSignature;
+    // 刚打开、或初始化参数真的换了（例如正文父分类从 A 切到 B）才重建表单；
+    // 父组件的异步刷新只换引用，不会走到这里。
+    if ((justOpened || signatureChanged) && !nestedCreatedRef.current) runInitForm();
+    nestedCreatedRef.current = false;
+  }, [mode, open, initSignature, runInitForm]);
 
   useEffect(() => {
-    if (mode === "full") {
-      initForm();
-      // Sync nestedFieldData with fieldData changes
-      if (fieldData) setNestedFieldData(fieldData);
-    }
-  }, [mode, initForm, fieldData]);
+    // 只同步下拉数据源，不碰用户已填内容。
+    if (mode === "compact" && compactNestedFieldData) setNestedFieldData(compactNestedFieldData);
+  }, [mode, compactNestedFieldData]);
+
+  useEffect(() => {
+    if (mode !== "full") return;
+    // 弹窗形态跟随 open 开关；卡片/行内形态常驻，只在参数值变化时重建。
+    const opened = layout === "modal" ? Boolean(props.open) : true;
+    const justOpened = opened && !prevOpenRef.current;
+    prevOpenRef.current = opened;
+    if (!opened) return;
+    const signatureChanged = lastInitSignatureRef.current !== initSignature;
+    lastInitSignatureRef.current = initSignature;
+    if (justOpened || signatureChanged) runInitForm();
+  }, [mode, layout, props.open, initSignature, runInitForm]);
+
+  useEffect(() => {
+    // 只同步下拉数据源，不碰用户已填内容。
+    if (mode === "full" && fieldData) setNestedFieldData(fieldData);
+  }, [mode, fieldData]);
 
   /** Determine if the type selector should be shown in compact mode */
   const shouldHideType = !typeKey
@@ -762,6 +827,26 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
     return dataList.filter((item) => accountInstitutionTypeIsAllowed(accountKind, investProductType, item.type));
   }
 
+  /**
+   * 切换账户类型时机构要不要跟着清空：只看「新类型是否仍允许这个机构」。
+   * 用户裁定（2026-11-15）：银行同时允许借记卡与电子钱包，借记卡 → 电子钱包 这类迁移必须保留
+   * 用户已填好的机构，切换类型不该抹掉其它字段。机构清单里查不到（还没加载到）时也保留原值，
+   * 宁可保存时明确报「机构类型不符」，也不静默清空。
+   * 返回 null 表示保持不动。
+   */
+  function nextInstitutionIdOnKindChange(nextKind: string, current: Record<string, string>): string | null {
+    const institutionId = (current.institutionId ?? "").trim();
+    if (!institutionId) return null;
+    if (nextKind === "settlement") return "";
+    const nextProductType = nextKind === "investment"
+      ? (current.investProductType || "fund")
+      : nextKind === "fixed_asset" ? "property" : "";
+    if (allowedInstitutionTypesForAccount(nextKind, nextProductType).length === 0) return "";
+    const institution = (nestedFieldData.institutionId ?? []).find((item) => item.id === institutionId);
+    if (institution && !accountInstitutionTypeIsAllowed(nextKind, nextProductType, institution.type)) return "";
+    return null;
+  }
+
   function institutionTypeMatchesCurrentAccount(type?: string) {
     if (entityType !== "account") return true;
     const accountKind = form.kind || form.type || extraFields?.kind || defaultType;
@@ -783,6 +868,8 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
     if (isStockInvestmentAccount(accountKind, investProductType)) return "brokerage";
     if (accountKind === "investment" && (investProductType === "fund" || investProductType === "money")) return "fund_company";
     if (accountKind === "loan") return "bank";
+    // 电子钱包的机构已放开（银行/基金公司/证券等），但新增时仍默认第三方支付——最常见的钱包形态。
+    if (accountKind === "ewallet") return "payment";
     if (allowedTypes.length === 1) return allowedTypes[0];
     return undefined;
   }
@@ -960,7 +1047,8 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
   function selectFieldPatch(field: FieldDef, value: string, current: Record<string, string>) {
     const patch: Record<string, string> = { [field.key]: value };
     if (field.key === "kind") {
-      patch.institutionId = "";
+      const keepInstitutionId = nextInstitutionIdOnKindChange(value, current);
+      if (keepInstitutionId !== null) patch.institutionId = keepInstitutionId;
       patch.counterpartyId = "";
       patch.loanType = value === "loan" ? (current.loanType || "home") : "";
       patch.isConsumerLoan = value === "loan" && current.loanType === "consumer" ? "true" : "false";
@@ -1084,7 +1172,10 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
         const selectedTypeValue = typeKey ? (form[typeKey] || created[typeKey] || "") : "";
         notifySmartSelectOptionCreated({
           id: created.id,
-          label: created.shortName?.trim?.() || created.name,
+          // 新建机构后广播给机构下拉：机构是独立主体 → 全称；其余实体（账户等）沿用简称优先。
+          label: entityType === "institution"
+            ? institutionFullName(created)
+            : created.shortName?.trim?.() || created.name,
           subLabel: entityType === "account"
             ? (created.AccountGroup?.name || (created.kind ? t(`account.kind.${created.kind}`) : undefined))
             : entityType === "institution" || entityType === "counterparty"
@@ -1176,12 +1267,17 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
           <div className="app-modal-panel max-w-sm">
             <div className="modal-header">
               <div className="text-sm font-semibold text-slate-800">{displayTitle}</div>
-              <button type="button" onClick={onClose}
-                className="secondary-button h-8 px-2">
-                {t("entityForm.close")}
+              <button title={t("entityForm.close")} aria-label={t("entityForm.close")} type="button" onClick={onClose}
+                className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0">
+                <X className="h-4 w-4" />
               </button>
             </div>
             <form className="p-4 space-y-3" onSubmit={onSubmit}>
+              {notice ? (
+                <div className="rounded-lg border border-sky-100 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-800">
+                  {notice}
+                </div>
+              ) : null}
               <div className="space-y-1">
                 <div className="form-label">{displayNameLabel}</div>
                 <input
@@ -1199,7 +1295,20 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
                   <div className="form-label">{t(config.typeLabelKey)}</div>
                   <select
                     value={(typeKey ? form[typeKey] : "") ?? ""}
-                    onChange={(e) => setForm(prev => ({ ...prev, ...(typeKey ? { [typeKey]: e.target.value } : {}), institutionId: "" }))}
+                    onChange={(e) => {
+                      const nextType = e.target.value;
+                      setForm((prev) => {
+                        const next: Record<string, string> = { ...prev, ...(typeKey ? { [typeKey]: nextType } : {}) };
+                        if (typeKey === "kind") {
+                          // 与全量模式同口径：新类型仍允许该机构就保留，不再一律清空。
+                          const keepInstitutionId = nextInstitutionIdOnKindChange(nextType, prev);
+                          if (keepInstitutionId !== null) next.institutionId = keepInstitutionId;
+                        } else {
+                          next.institutionId = "";
+                        }
+                        return next;
+                      });
+                    }}
                     className="form-input"
                   >
                     {typeSelectOptions.map((typeOption) => (
@@ -1350,10 +1459,6 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
               ))}
               {error && <div className="text-xs text-red-500">{error}</div>}
               <div className="flex justify-end gap-2">
-                <button type="button" onClick={onClose}
-                  className="secondary-button h-9 px-3">
-                  {t("common.cancel")}
-                </button>
                 <button type="submit" disabled={saving || !(form.name?.trim())}
                   className="primary-button h-9 disabled:opacity-50">
                   {saving ? t("entityForm.saving") : t("common.save")}
@@ -1492,12 +1597,12 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
           <div className="app-modal-panel max-w-3xl">
             <div className="modal-header shrink-0">
               <div className="text-sm font-semibold text-slate-800">{displayTitle}</div>
-              <button
+              <button title={t("entityForm.close")} aria-label={t("entityForm.close")}
                 type="button"
                 onClick={() => { props.onClose?.(); setError(""); initForm(); }}
-                className="secondary-button h-8 px-2"
+                className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
               >
-                {t("entityForm.close")}
+                <X className="h-4 w-4" />
               </button>
             </div>
             <form className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4" onSubmit={onSubmit}>
@@ -1673,13 +1778,6 @@ export function EntityCreateForm(props: EntityCreateFormProps) {
               </div>
 
               <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
-                <button
-                  type="button"
-                  onClick={() => { props.onClose?.(); setError(""); initForm(); }}
-                  className="secondary-button h-9 px-4"
-                >
-                  {t("common.cancel")}
-                </button>
                 <button
                   type="submit"
                   disabled={saving || !(form.name?.trim())}

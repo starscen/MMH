@@ -3,6 +3,7 @@ import { kindLabel } from "@/lib/account-kinds";
 import { normalizeUserFacingAccountKind } from "@/lib/account-kind-utils";
 import { accountCurrencyLabelText, accountNameMentionsCurrency } from "@/lib/currency";
 import { FIXED_ASSET_EXPENSE_CATEGORY_NAME, isFixedAssetAccountLike } from "@/lib/fixed-asset";
+import { institutionFullName, institutionShortName } from "@/lib/institution-display";
 
 export type AccountDisplaySource = {
   id: string;
@@ -17,6 +18,12 @@ export type AccountDisplaySource = {
   baseCurrency?: string | null;
   numberMasked?: string | null;
   groupId?: string | null;
+  /**
+   * 自定义分组标签（2026-11-13）。与 `groupId`/`AccountGroup` 的「所有人分组」
+   * 完全是两件事：这是用户自己起的分类名（「日常现金」「孩子教育」），
+   * 只用于侧边栏 / 账户下拉的分组显示，空 = 未分组。
+   */
+  accountGroup?: string | null;
   investProductType?: string | null;
   Institution?: { name: string | null; shortName?: string | null; type?: string | null } | null;
   AccountGroup?: { id: string; name: string | null } | null;
@@ -242,7 +249,15 @@ export type AccountDisplayOption = {
   selectorCoreLabel: string;
   groupId: string;
   groupName: string;
+  /** 账户自定义分组标签（`Account.accountGroup`），空串 = 未分组。 */
+  accountGroupName: string;
+  /** 账户标签里用的机构名（简称优先）——账户语境。 */
   institutionName: string;
+  /**
+   * 机构全称（全称优先），只用于机构作为独立主体展示的位置，
+   * 例如「按机构分组」的表头。账户标签仍然用 `institutionName`。
+   */
+  institutionFullName: string;
   investProductType: string | null;
   subLabel: string;
   fullLabel: string;
@@ -399,14 +414,15 @@ export function counterpartyQualifiedAccountName(
   return `${counterpartyName}${ACCOUNT_LABEL_SEPARATOR}${name}`;
 }
 
+/**
+ * 账户标签里的机构名：**简称优先**（2026-11-14 用户裁定，只有账户语境用简称）。
+ * 机构作为独立主体展示时走 `institutionFullName`（src/lib/institution-display.ts）。
+ */
 function formatDisplayInstitutionName(
   institution?: { name: string | null; shortName?: string | null } | null,
   preferShort = true,
 ) {
-  const shortName = institution?.shortName?.trim() ?? "";
-  const fullName = institution?.name?.trim() ?? "";
-  if (preferShort && shortName) return shortName;
-  return fullName || shortName;
+  return preferShort ? institutionShortName(institution) : institutionFullName(institution);
 }
 
 export function formatAccountSelectorLabel(input: {
@@ -604,6 +620,7 @@ export function buildAccountDisplayOption(
   // so the dropdown/table sub-label matches what the account actually is.
   const displayKind = normalizeUserFacingAccountKind(account);
   const institutionName = isFixedAsset ? "" : formatDisplayInstitutionName(account.Institution, true);
+  const institutionFull = isFixedAsset ? "" : institutionFullName(account.Institution);
   const showOwner = accountUsesOwnerInDisplay(account);
   const groupId = showOwner ? account.groupId ?? account.AccountGroup?.id ?? "" : "";
   const groupName = showOwner ? account.AccountGroup?.name?.trim() ?? "" : "";
@@ -731,7 +748,9 @@ export function buildAccountDisplayOption(
     selectorCoreLabel,
     groupId,
     groupName,
+    accountGroupName: (account.accountGroup ?? "").trim(),
     institutionName,
+    institutionFullName: institutionFull,
     investProductType: account.investProductType ?? null,
     subLabel,
     fullLabel: ownerQualifiedLabel,
@@ -858,18 +877,54 @@ function buildOptionSubLabel(
   );
 }
 
-export function buildGroupedAccountOptions(accounts: AccountDisplayOption[]): SmartSelectOption[] {
+/**
+ * 账户下拉的分组维度（2026-11-13）。`owner` = 历史行为（按所有人分组），
+ * 另外两种是本次新增的「按账户自定义分组标签 / 按机构」。
+ * 与 `src/lib/preferences.ts` 的 `accountDropdownGroupBy` 设置一一对应。
+ */
+export type AccountGroupByMode = "owner" | "accountGroup" | "institution";
+
+type AccountGroupBucket = { id: string; name: string };
+
+/**
+ * 一个账户应该落进哪个表头。返回 null = 没有该维度 → 排到列表尾部（无表头），
+ * 与 `owner` 模式下「贷款/往来账户没有所有人」的处理一致。
+ *
+ * 表头 id 保持 `group:` 前缀 + 维度前缀，避免三种维度同一账簿里撞 id；
+ * `owner` 维度特意保留旧的 `group:<groupId>`（多处调用点手写了同样的 id）。
+ */
+function resolveAccountGroupBucket(
+  account: AccountDisplayOption,
+  groupBy: AccountGroupByMode,
+): AccountGroupBucket | null {
+  if (groupBy === "accountGroup") {
+    const name = account.accountGroupName.trim();
+    return name ? { id: `group:ag:${name}`, name } : null;
+  }
+  if (groupBy === "institution") {
+    // 分组表头是机构作为独立主体出现，用全称（账户标签里才用简称）。
+    const name = account.institutionFullName.trim();
+    return name ? { id: `group:in:${name}`, name } : null;
+  }
+  if (account.groupId && accountUsesOwnerInDisplay(account)) {
+    return { id: `group:${account.groupId}`, name: account.groupName || "未命名所有人" };
+  }
+  return null;
+}
+
+export function buildGroupedAccountOptions(
+  accounts: AccountDisplayOption[],
+  groupBy: AccountGroupByMode = "owner",
+): SmartSelectOption[] {
   const groups = new Map<string, { id: string; name: string }>();
-  const grouped: AccountDisplayOption[] = [];
+  const grouped: Array<{ account: AccountDisplayOption; headerId: string; groupName: string }> = [];
   const ungrouped: AccountDisplayOption[] = [];
 
   for (const account of accounts) {
-    if (account.groupId && accountUsesOwnerInDisplay(account)) {
-      groups.set(account.groupId, {
-        id: account.groupId,
-        name: account.groupName || "未命名所有人",
-      });
-      grouped.push(account);
+    const bucket = resolveAccountGroupBucket(account, groupBy);
+    if (bucket) {
+      groups.set(bucket.id, { id: bucket.id, name: bucket.name });
+      grouped.push({ account, headerId: bucket.id, groupName: bucket.name });
     } else {
       ungrouped.push(account);
     }
@@ -877,18 +932,20 @@ export function buildGroupedAccountOptions(accounts: AccountDisplayOption[]): Sm
 
   const headers = Array.from(groups.values())
     .sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"))
-    .map((group) => ({ id: `group:${group.id}`, label: group.name, isHeader: true }));
+    .map((group) => ({ id: group.id, label: group.name, isHeader: true }));
 
   const groupedItems = grouped
-    .sort((a, b) => (a.groupName + a.selectorLabel).localeCompare(b.groupName + b.selectorLabel, "zh-Hans-CN"))
-    .map((account) => ({
+    .sort((a, b) =>
+      (a.groupName + a.account.selectorLabel).localeCompare(b.groupName + b.account.selectorLabel, "zh-Hans-CN"),
+    )
+    .map(({ account, headerId }) => ({
       id: account.id,
       label: account.selectorLabel,
       subLabel: buildOptionSubLabel(account.selectorLabel, [account.subLabel]),
       // 悬浮必须能看到「所有人」：分组表头会被折叠/搜索过滤，平铺场景下更是看不到，
       // 而 hoverTitle 已经按「行内可见文本才剔除」生成，直接使用即可。
       title: account.hoverTitle,
-      parentId: `group:${account.groupId}`,
+      parentId: headerId,
     }));
 
   const ungroupedItems = ungrouped

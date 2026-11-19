@@ -1,17 +1,22 @@
 import { parseFlexibleDateToYmd } from "@/lib/date-utils";
 import {
-  dropTemplateSampleRows,
-  findTemplateGuideTitleRowIndex,
-  findTemplateSampleColumnIndex,
-  rowsBeforeTemplateGuide,
+  stripTemplateRows,
+  TEMPLATE_GUIDE_TITLE_HINTS,
+  type TemplateGuideTitle,
 } from "@/lib/import-template-sample";
 import {
   inferBalanceBasedInflowSign,
   inferSignedAmountInflowSign,
+  isCreditCardRepaymentKeywordText,
   isCreditCardRepaymentLikeText,
+  isCreditCardVoucherLikeText,
   isExpenseRefundLikeText,
   signedAmountDirection,
 } from "@/lib/statement/amount-direction";
+import {
+  creditCardSummaryMeta,
+  extractCreditCardStatementSummary,
+} from "@/lib/statement/credit-card-summary";
 import {
   STATEMENT_IMPORT_FIELD_HEADERS,
   SPDB_CREDIT_CARD_TRANSACTION_REPORT_PROFILE,
@@ -20,10 +25,7 @@ import {
   normalizeSpdbCurrencyCode,
   parseSpdbOriginalAmount,
 } from "@/lib/statement/header-catalog";
-import {
-  guessCaizhiAccountNameFromFilename,
-  type CaizhiBalanceAdjustRow,
-} from "@/lib/statement/caizhi-template";
+import type { CaizhiBalanceAdjustRow } from "@/lib/statement/caizhi-template";
 import { readStatementSheetRows } from "@/lib/statement/statement-sheet-reader";
 import { normalizeStatementHeader as normalizeHeader } from "@/lib/statement/header-utils";
 import { wechatMetaFromRow, wechatMetaHeaderIndexes } from "@/lib/statement/wechat-transfer-guard";
@@ -284,16 +286,20 @@ export function parseStatementTemplateRows(
   rows: string[][],
   defaultAccountName: string,
   fieldHeaders: StatementFieldHeaders = STATEMENT_IMPORT_FIELD_HEADERS,
-  /** 模板说明区标题行文案；传入后会截断标题行以下的所有说明行 */
-  guideTitle = "",
+  /** 模板说明区标题行文案（可传多语言候选）；默认已含三种语言的标题前缀 */
+  guideTitle: TemplateGuideTitle = TEMPLATE_GUIDE_TITLE_HINTS,
 ): StatementExcelPreviewItem[] {
   const [headers = [], ...rawDataRows] = rows;
   // 模板自带的样板行和底部字段说明区都不是真实账单数据。
-  const guideTitleRowIndex = findTemplateGuideTitleRowIndex(rawDataRows, guideTitle);
-  const sampleColumnIndex = findTemplateSampleColumnIndex(headers);
-  const dataRows = dropTemplateSampleRows(rowsBeforeTemplateGuide(rawDataRows, guideTitleRowIndex), sampleColumnIndex);
+  const dataRows = stripTemplateRows(rawDataRows, headers, guideTitle);
   const spdbIndexes = matchStatementHeaderProfile(headers, SPDB_CREDIT_CARD_TRANSACTION_REPORT_PROFILE);
   const knownInstitutionName = spdbIndexes ? SPDB_CREDIT_CARD_TRANSACTION_REPORT_PROFILE.institutionName : undefined;
+  // 账单摘要与 PDF/文本通道共用同一份词表（credit-card-summary.ts）：信用卡账单里若带
+  // 「本期应还金额」，每一行都挂上，导入时就能走共用的 BillOverride 把该账期账单金额锁住。
+  const statementSummaryMeta = creditCardSummaryMeta(
+    extractCreditCardStatementSummary(rows.map((row) => row.join(" ")).join("\n")),
+  );
+  const hasStatementSummary = Object.keys(statementSummaryMeta).length > 0;
   const reader = createStatementHeaderReader(headers, fieldHeaders);
   const dateIndex = spdbIndexes?.transactionDate ?? reader.findFieldIndex("transactionDate");
   const typeIndex = reader.findIndex([...fieldHeaders.explicitType, ...fieldHeaders.majorType]);
@@ -385,12 +391,20 @@ export function parseStatementTemplateRows(
       : null;
     const postedDate = postedIndex >= 0 ? normalizeDate(row[postedIndex] ?? "") : undefined;
     const sourceText = `${typeText} ${category} ${institution} ${remark} ${rowText(row)}`;
-    const isRepayment = /转账|转帐|transfer|振替/.test(typeText)
-      || (!EXPLICIT_DIRECTION_TYPE_RE.test(typeText) && isCreditCardRepaymentLikeText(sourceText))
-      || remarkFlowType === "transfer";
+    const isRepayment = !isCreditCardVoucherLikeText(sourceText) && (
+      /转账|转帐|transfer|振替/.test(typeText)
+      || (!EXPLICIT_DIRECTION_TYPE_RE.test(typeText) && (
+        isCreditCardRepaymentLikeText(sourceText)
+        // 备注列写「口袋银行一键还款」「银联在线还款」时严格词表不命中；整行兜底时不放宽。
+        || (remarkFromColumn && isCreditCardRepaymentKeywordText(remark))
+      ))
+      || remarkFlowType === "transfer"
+    );
     const isRefund = isExpenseRefundLikeText(sourceText);
     const isSignedInflow = signedDirection === "in";
-    const isIncome = !isRefund && (/income|收入|収入/.test(typeText) || isSignedInflow);
+    // 还款券/立减券是银行补贴：无符号列的普通流水表也要落收入，不能落到支出。
+    const isIncome = isCreditCardVoucherLikeText(sourceText)
+      || (!isRefund && (/income|收入|収入/.test(typeText) || isSignedInflow));
     const rawCounterAccount = counterIndex >= 0
       ? cleanStatementCounterparty(String(row[counterIndex] ?? "").trim())
       : "";
@@ -456,9 +470,10 @@ export function parseStatementTemplateRows(
         remark,
         tags: tags || undefined,
         postedDate,
-        _meta: cardLast4 || knownInstitutionName ? {
+        _meta: cardLast4 || knownInstitutionName || hasStatementSummary ? {
           institutionName: knownInstitutionName,
           cardNumberMasked: cardLast4 || undefined,
+          ...statementSummaryMeta,
         } : undefined,
       }];
     }
@@ -496,9 +511,10 @@ export function parseStatementTemplateRows(
       postedDate,
       originalCurrency: settlementDiffers ? settlementCurrency : undefined,
       originalAmount: settlementDiffers ? settlementAmount ?? undefined : undefined,
-      _meta: cardLast4 || knownInstitutionName ? {
+      _meta: cardLast4 || knownInstitutionName || hasStatementSummary ? {
         institutionName: knownInstitutionName,
         cardNumberMasked: cardLast4 || undefined,
+        ...statementSummaryMeta,
       } : undefined,
     }];
   });
@@ -552,7 +568,7 @@ export async function parseStatementExcelFile(
   file: File,
   defaultAccountName: string,
   fieldHeaders: StatementFieldHeaders = STATEMENT_IMPORT_FIELD_HEADERS,
-  guideTitle = "",
+  guideTitle: TemplateGuideTitle = TEMPLATE_GUIDE_TITLE_HINTS,
   /** 已经读过（可能还剔过基金买卖行）的工作表行；不传则自己读文件。 */
   sheetRows?: readonly { sheetName: string; rows: string[][] }[],
 ) {

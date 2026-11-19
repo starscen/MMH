@@ -2,8 +2,8 @@
 import { ModalLayer } from "@/components/ModalLayer";
 
 import { createPortal } from "react-dom";
-import { useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { Download, FileUp, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { ChevronDown, Download, FileUp, X } from "lucide-react";
 import { AdvancedDataTable, type AdvancedDataTableColumn } from "@/components/AdvancedDataTable";
 import { BatchReplacePopoverButton, type BatchReplaceFieldConfig } from "@/components/BatchReplacePopoverButton";
 import { normalizeCurrency } from "@/lib/currency";
@@ -18,6 +18,11 @@ import { COUNTERPARTY_TYPE_OPTIONS, institutionTypeLabel, institutionTypeOptions
 import { useI18n } from "@/lib/i18n";
 import { TAG_COLORS, TAG_COLOR_NAME_KEYS } from "@/lib/tag-colors";
 import { isCreditCardMonthEndBillingDay } from "@/lib/credit/rules";
+import {
+  findTemplateGuideTitleRowIndex,
+  findTemplateSampleColumnIndex,
+  isTemplateSampleRowValue,
+} from "@/lib/import-template-sample";
 
 /**
  * 基本资料批量导入的字段全集。
@@ -157,9 +162,14 @@ type AccountBatchImportButtonProps = {
   counterparties: Array<{ id: string; name: string; shortName?: string | null; type?: string | null }>;
   baseCurrency: string;
   onImported: () => void;
-  /** 紧凑模式：按钮高 28px（`--ft-tab-filter-h`），用于挂在 FT 页签条右端。 */
-  compact?: boolean;
-  /** 按钮 tooltip。基本资料页用来说明「这是整套基础资料模板的导出/导入」，不传则不加 title。 */
+  /**
+   * 按钮 tooltip。基本资料页用来说明「这是整套基础资料模板的导出/导入」，不传则不加 title。
+   *
+   * 形态**只有一种**：一枚「导入 / 导出」下拉按钮，菜单里是「导出模板」「导入 Excel」两项。
+   * 账户页筛选工具栏与基本资料四页（家庭成员 / 往来对象 / 机构 / 标签）共用这一形态
+   * （2026-11-16 用户：「有的合在一个组件里，有的是分开，都统一成一个组件」）；不要再加
+   * `variant` 之类的第二形态，两处再各写一遍就会重新长歪。
+   */
   exportTemplateTitle?: string;
   importExcelTitle?: string;
 };
@@ -507,9 +517,10 @@ function normalizeImportHeader(value: unknown) {
 }
 
 // The exported guide title cell holds the title plus an explanatory note in one
-// wrapped cell, so match on the leading title text instead of the full cell.
-function isGuideTitleCell(value: unknown, guideTitle: string) {
-  return normalizeImportHeader(value).startsWith(guideTitle);
+// wrapped cell, so the shared helper matches on the leading title text instead of
+// the full cell (see import-template-sample.ts).
+function findGuideRowOffset(rows: ReadonlyArray<readonly unknown[]>, guideTitle: string) {
+  return findTemplateGuideTitleRowIndex(rows, guideTitle);
 }
 
 function normalizeImportCell(value: unknown) {
@@ -570,13 +581,9 @@ function isRequiredField(sheetType: ImportSheetType, field: AccountBatchImportFi
   return REQUIRED_FIELDS_BY_SHEET[sheetType].includes(field);
 }
 
-function isTemplateSampleRow(value: string, t: (key: string) => string) {
-  const normalized = normalizeImportHeader(value);
-  if (!normalized) return false;
-  return normalized === normalizeImportHeader(t("settings.accounts.import.sampleRowYes")) ||
-    normalized === "yes" ||
-    normalized === "true" ||
-    normalized === "sample";
+// 样板行判定统一走共享实现（yes/true/1/是/はい/样板…），各导入通道口径一致。
+function isTemplateSampleRow(value: string) {
+  return isTemplateSampleRowValue(value);
 }
 
 function requiredFieldError(
@@ -705,8 +712,7 @@ function parseSheetRows(
   if (!fieldIndex.has("name")) return [];
 
   const bodyRows = rows.slice(headerIndex + 1);
-  const guideTitle = normalizeImportHeader(t("settings.accounts.import.sheetGuideTitle"));
-  const guideOffset = bodyRows.findIndex((row) => row.some((cell) => isGuideTitleCell(cell, guideTitle)));
+  const guideOffset = findGuideRowOffset(bodyRows, t("settings.accounts.import.sheetGuideTitle"));
   const importRows = guideOffset >= 0 ? bodyRows.slice(0, guideOffset) : bodyRows;
 
   return importRows.flatMap((source, offset): ImportAccountRow[] => {
@@ -717,7 +723,7 @@ function parseSheetRows(
     };
     const errors: string[] = [];
     const rawName = valueAt("name");
-    if (isTemplateSampleRow(valueAt("sample"), t)) return [];
+    if (isTemplateSampleRow(valueAt("sample"))) return [];
     const rowHasData = definition.fields.some((field) => field !== "sample" && valueAt(field));
     if (!rowHasData) return [];
     if (!rawName) errors.push(requiredFieldError("name", t));
@@ -945,6 +951,9 @@ function categoryTreeHeaders(t: (key: string) => string, thirdLevelCount = 4) {
     t("settings.accounts.import.categoryRootColumn"),
     t("settings.accounts.import.categorySecondLevelColumn"),
     ...Array.from({ length: Math.max(1, thirdLevelCount) }, (_, index) => `${thirdLevel}${index + 1}`),
+    // 分类树是「一级 / 二级 / 三级…」的横向层级，样板行标记只能放最后一列，
+    // 解析时按表头定位该列，第三级及以下用 slice 到该列之前，避免「是」被当成分类名。
+    t("settings.accounts.import.sampleRow"),
   ];
 }
 
@@ -1036,16 +1045,21 @@ function parseCategoryTreeRows(
 ) {
   const headerIndex = findCategoryTreeHeaderIndex(rows, t);
   if (headerIndex < 0) return [];
+  // 分类树的样板行标记在末列（表头可能是各语言的「样板行」）；老模板没有该列时按无标记处理。
+  const sampleColumnIndex = findTemplateSampleColumnIndex(rows[headerIndex] ?? []);
   const bodyRows = rows.slice(headerIndex + 1);
-  const guideTitle = normalizeImportHeader(t("settings.accounts.import.sheetGuideTitle"));
-  const guideOffset = bodyRows.findIndex((row) => row.some((cell) => isGuideTitleCell(cell, guideTitle)));
+  const guideOffset = findGuideRowOffset(bodyRows, t("settings.accounts.import.sheetGuideTitle"));
   const importRows = guideOffset >= 0 ? bodyRows.slice(0, guideOffset) : bodyRows;
 
   return importRows.flatMap((source, offset): ImportAccountRow[] => {
     const sourceRow = headerIndex + offset + 2;
+    if (sampleColumnIndex >= 0 && isTemplateSampleRow(normalizeImportCell(source[sampleColumnIndex]))) return [];
     const rawType = normalizeImportCell(source[0]);
     const secondLevelName = normalizeImportCell(source[1]);
-    const thirdLevelNames = source.slice(2).map(normalizeImportCell).filter(Boolean);
+    const thirdLevelNames = source
+      .slice(2, sampleColumnIndex > 1 ? sampleColumnIndex : source.length)
+      .map(normalizeImportCell)
+      .filter(Boolean);
     if (!rawType && !secondLevelName && thirdLevelNames.length === 0) return [];
 
     const parsedType = parseImportEnum(rawType, CATEGORY_TYPE_OPTIONS, t);
@@ -2260,36 +2274,57 @@ function appendStyledSheet(
   XLSX.utils.book_append_sheet(workbook, sheet, sheetName);
 }
 
-function fallbackCategoryTemplateRows(t: (key: string) => string) {
+/**
+ * 分类树 sheet：三级列数取各行最大值（至少 4），末列统一是「样板行」标记。
+ * 数据行必须补空到标记列之前，否则标记列会错位、样板行识别不到。
+ */
+function buildCategoryTreeSheet(t: (key: string) => string, rows: string[][], sampleCell: string) {
+  const thirdLevelCount = Math.max(4, ...rows.map((row) => Math.max(0, row.length - 2)));
+  const headers = categoryTreeHeaders(t, thirdLevelCount);
+  const markerIndex = headers.length - 1;
   return [
-    categoryTreeHeaders(t),
-    [
-      categoryTypeLabel("expense", t),
-      t("settings.accounts.importSampleCategoryDining"),
-      t("settings.accounts.importSampleCategoryBreakfast"),
-      t("settings.accounts.importSampleCategoryLunch"),
-      t("settings.accounts.importSampleCategoryDinner"),
-    ],
-    [
-      categoryTypeLabel("expense", t),
-      t("settings.accounts.importSampleCategoryTransport"),
-      t("settings.accounts.importSampleCategoryTaxi"),
-      t("settings.accounts.importSampleCategoryBus"),
-      t("settings.accounts.importSampleCategorySubway"),
-    ],
-    [
-      categoryTypeLabel("income", t),
-      t("settings.accounts.importSampleCategorySalary"),
-      t("settings.accounts.importSampleCategoryBaseSalary"),
-      t("settings.accounts.importSampleCategoryBonus"),
-    ],
-    [
-      categoryTypeLabel("income", t),
-      t("settings.accounts.importSampleCategoryInvestmentIncome"),
-      t("settings.accounts.importSampleCategoryInterest"),
-      t("settings.accounts.importSampleCategoryDividend"),
-    ],
+    headers,
+    ...rows.map((row) => {
+      const cells = row.slice(0, markerIndex);
+      while (cells.length < markerIndex) cells.push("");
+      return [...cells, sampleCell];
+    }),
   ];
+}
+
+function fallbackCategoryTemplateRows(t: (key: string) => string) {
+  return buildCategoryTreeSheet(
+    t,
+    [
+      [
+        categoryTypeLabel("expense", t),
+        t("settings.accounts.importSampleCategoryDining"),
+        t("settings.accounts.importSampleCategoryBreakfast"),
+        t("settings.accounts.importSampleCategoryLunch"),
+        t("settings.accounts.importSampleCategoryDinner"),
+      ],
+      [
+        categoryTypeLabel("expense", t),
+        t("settings.accounts.importSampleCategoryTransport"),
+        t("settings.accounts.importSampleCategoryTaxi"),
+        t("settings.accounts.importSampleCategoryBus"),
+        t("settings.accounts.importSampleCategorySubway"),
+      ],
+      [
+        categoryTypeLabel("income", t),
+        t("settings.accounts.importSampleCategorySalary"),
+        t("settings.accounts.importSampleCategoryBaseSalary"),
+        t("settings.accounts.importSampleCategoryBonus"),
+      ],
+      [
+        categoryTypeLabel("income", t),
+        t("settings.accounts.importSampleCategoryInvestmentIncome"),
+        t("settings.accounts.importSampleCategoryInterest"),
+        t("settings.accounts.importSampleCategoryDividend"),
+      ],
+    ],
+    t("settings.accounts.import.sampleRowYes"),
+  );
 }
 
 function buildCategoryTemplateRows(
@@ -2329,8 +2364,8 @@ function buildCategoryTemplateRows(
   }
 
   if (categoryRows.length === 0) return fallbackCategoryTemplateRows(t);
-  const thirdLevelCount = Math.max(4, ...categoryRows.map((row) => Math.max(0, row.length - 2)));
-  return [categoryTreeHeaders(t, thirdLevelCount), ...categoryRows];
+  // 从既有分类导出的都是真实数据，标记列留空。
+  return buildCategoryTreeSheet(t, categoryRows, "");
 }
 
 function appendCategoryStyledSheet(
@@ -2357,6 +2392,12 @@ function appendCategoryStyledSheet(
       t("settings.accounts.import.categoryThirdLevelColumn"),
       t("settings.accounts.import.guideOptionalValue"),
       t("settings.accounts.import.guideCategoryThirdLevel"),
+      false,
+    ],
+    [
+      t("settings.accounts.import.sampleRow"),
+      t("settings.accounts.import.sampleRowYes"),
+      t("settings.accounts.import.guideSampleRow"),
       false,
     ],
   ];
@@ -2477,12 +2518,14 @@ export function AccountBatchImportButton({
   counterparties,
   baseCurrency,
   onImported,
-  compact = false,
   exportTemplateTitle,
   importExcelTitle,
 }: AccountBatchImportButtonProps) {
   const { t } = useI18n();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // 导出/导入收进一枚下拉按钮，展开状态自管。
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
   const [fileName, setFileName] = useState("");
   const [parseError, setParseError] = useState("");
@@ -2494,6 +2537,24 @@ export function AccountBatchImportButton({
   const [importAccounts, setImportAccounts] = useState<ExistingAccountRef[]>([]);
 
   const selectedRows = useMemo(() => rows.filter((row) => row.selected), [rows]);
+
+  // 下拉形态：点面板外部或按 Esc 收起（用 pointerdown 而不是 click，和 ADT 列菜单一致，
+  // 免得同一次点击既收起旧的又立刻展开新的）。
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) setMenuOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuOpen]);
 
   const sheetOptions = useMemo(() => {
     const names: string[] = [];
@@ -3248,24 +3309,53 @@ export function AccountBatchImportButton({
           event.target.value = "";
         }}
       />
-      <button
-        type="button"
-        title={exportTemplateTitle}
-        onClick={() => void downloadTemplate()}
-        className={`inline-flex ${compact ? "h-7" : "h-8"} shrink-0 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-600 shadow-sm transition-colors hover:bg-slate-50`}
-      >
-        <Download className="h-3.5 w-3.5" />
-        {t("settings.accounts.exportTemplate")}
-      </button>
-      <button
-        type="button"
-        title={importExcelTitle}
-        onClick={() => fileInputRef.current?.click()}
-        className={`inline-flex ${compact ? "h-7" : "h-8"} shrink-0 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-600 shadow-sm transition-colors hover:bg-blue-50`}
-      >
-        <FileUp className="h-3.5 w-3.5" />
-        {t("settings.accounts.importExcel")}
-      </button>
+      {/* 唯一形态：一枚「导入 / 导出」下拉按钮（账户页工具栏与基本资料四页共用）。 */}
+      <div ref={menuRef} className="relative shrink-0">
+        <button
+          type="button"
+          onClick={() => setMenuOpen((value) => !value)}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-600 shadow-sm transition-colors hover:bg-slate-50"
+        >
+          <Download className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
+          {t("settings.accounts.importExport")}
+          <ChevronDown className={`h-3 w-3 shrink-0 text-slate-400 transition-transform ${menuOpen ? "rotate-180" : ""}`} aria-hidden="true" />
+        </button>
+        {menuOpen ? (
+          <div
+            role="menu"
+            className="absolute right-0 top-full z-50 mt-1 w-36 rounded-lg border border-slate-200 bg-white p-1 shadow-soft"
+          >
+            <button
+              type="button"
+              role="menuitem"
+              title={exportTemplateTitle}
+              onClick={() => {
+                setMenuOpen(false);
+                void downloadTemplate();
+              }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-600 transition-colors hover:bg-slate-50"
+            >
+              <Download className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden="true" />
+              {t("settings.accounts.exportTemplate")}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              title={importExcelTitle}
+              onClick={() => {
+                setMenuOpen(false);
+                fileInputRef.current?.click();
+              }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-600 transition-colors hover:bg-blue-50"
+            >
+              <FileUp className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden="true" />
+              {t("settings.accounts.importExcel")}
+            </button>
+          </div>
+        ) : null}
+      </div>
       {dialog}
     </>
   );

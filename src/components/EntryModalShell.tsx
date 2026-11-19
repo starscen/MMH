@@ -3,7 +3,7 @@
 import type { CSSProperties, ReactNode, Ref } from "react";
 import { useEffect } from "react";
 import { createPortal } from "react-dom";
-import { Lock } from "lucide-react";
+import { Lock, X } from "lucide-react";
 import { FolderTabsCard, type FolderTabsCardItem } from "@/components/FolderTabsCard";
 import {
   registerOpenLayerZIndex,
@@ -29,7 +29,7 @@ import { useI18n } from "@/lib/i18n";
  *  5. `.ft-card-surface` / `.ft-card-footer` / `REQUIRED_FIELD_CLASS` = 卡片外观与必填红框。
  *
  * 按钮行规则：退出窗口只有**一个**入口 —— 标题栏右上角的关闭按钮（`onClose`，
- * 文字默认 `table.close`）。`footer` 只放本窗的主操作（保存 / 创建…），
+ * 统一为 16px 的 `X` 图标，不要再放文字「关闭」）。`footer` 只放本窗的主操作（保存 / 创建…），
  * **不要再放「取消」**：下面再摆一个取消，和右上角的关闭是同一个动作，重复。
  *
  * **上方位置规则（硬要求）**：窗口顶边只在**首次打开时**定一次（取当时的居中位置），此后
@@ -74,8 +74,9 @@ export function EntryModalShell({
   panelRef,
   title,
   subtitle,
+  /** 标题栏右侧、关闭按钮左边的附加操作（如编辑窗里的「转换」下拉）。 */
+  headerExtra,
   onClose,
-  closeLabel,
   closeTitle,
   onSubmit,
   formRef,
@@ -113,9 +114,10 @@ export function EntryModalShell({
   title: ReactNode;
   /** 标题右侧的次要说明（如产品类型） */
   subtitle?: ReactNode;
+  /** 标题栏右侧的附加操作，渲染在关闭按钮左侧（层级、宽度都由标题栏统一管）。 */
+  headerExtra?: ReactNode;
   onClose: () => void;
-  closeLabel?: ReactNode;
-  /** 关闭按钮的 title（关闭按钮只有图标时给无障碍名称） */
+  /** 关闭按钮的无障碍名称 / title（默认 `table.close`） */
   closeTitle?: string;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   /** 表单 ref：调用方需要 `formRef.current.requestSubmit()`（如「保存并继续」）时用 */
@@ -183,9 +185,18 @@ export function EntryModalShell({
               {title}
               {subtitle ? <span className="ml-2 text-xs font-normal text-slate-500">{subtitle}</span> : null}
             </div>
-            <button type="button" onClick={onClose} title={closeTitle} className="secondary-button h-8 px-2">
-              {closeLabel ?? t("table.close")}
-            </button>
+            <div className="flex min-w-0 items-center gap-2">
+              {headerExtra}
+              <button
+                type="button"
+                onClick={onClose}
+                title={closeTitle ?? t("table.close")}
+                aria-label={closeTitle ?? t("table.close")}
+                className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
+              >
+                <X className="h-4 w-4 shrink-0" />
+              </button>
+            </div>
           </div>
 
           <form ref={formRef} className="flex min-h-0 flex-1 flex-col" onSubmit={onSubmit}>

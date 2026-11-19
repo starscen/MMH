@@ -17,8 +17,13 @@ import {
 } from "@/lib/date-utils";
 import {
   DEFAULT_ACCOUNT_USAGE_SORT_ENABLED,
+  DEFAULT_REPO_OCCUPIED_DAYS_MODE,
   PREFERENCE_COOKIE_MIRROR,
+  normalizeAccountDropdownGroupBy,
+  normalizeRepoOccupiedDaysMode,
+  type AccountDropdownGroupBy,
   type AppPreferences,
+  type RepoOccupiedDaysMode,
 } from "@/lib/preferences";
 import {
   normalizeRowHeightMode,
@@ -43,10 +48,10 @@ const CREDIT_CARD_LABEL_TEMPLATE_COOKIE = "mmh_credit_card_label_template";
 const CREDIT_CARD_SIDEBAR_LABEL_TEMPLATE_COOKIE = "mmh_credit_card_sidebar_label_template";
 const CREDIT_BILL_HIDE_ZERO_COOKIE = "mmh_credit_hide_zero_bills";
 const CREDIT_BILL_HIDE_SETTLED_COOKIE = "mmh_credit_hide_settled_bills";
-const CREDIT_BILL_RECENT_CYCLES_COOKIE = "mmh_credit_recent_cycles";
 export const DISPLAY_LANGUAGE_COOKIE = "mmh_display_language";
 const DATE_DISPLAY_FORMAT_COOKIE = "mmh_date_display_format";
 const SIDEBAR_GROUP_BY_KEY = "sidebar_group_by";
+const ACCOUNT_DROPDOWN_GROUP_BY_KEY = "account_dropdown_group_by";
 const SIDEBAR_HIDE_ZERO_KEY = "sidebar_hide_zero";
 const SIDEBAR_HIDE_INITIAL_DATA_KEY = "sidebar_hide_initial_data";
 const SIDEBAR_SHOW_FIXED_ASSETS_KEY = "sidebar_show_fixed_assets";
@@ -57,6 +62,7 @@ const ROW_HEIGHT_MODE_KEY = "advanced_data_table_row_height_mode";
 export const ACCOUNT_LABEL_FIELDS_COOKIE = "mmh_account_label_fields";
 export const ACCOUNT_DROPDOWN_RESTRICT_TYPE_COOKIE = "mmh_account_dropdown_restrict_type";
 export const ACCOUNT_USAGE_SORT_KEY = "mmh_account_usage_sort";
+export const REPO_OCCUPIED_DAYS_MODE_KEY = "mmh_repo_occupied_days_mode";
 const SIDEBAR_COLLAPSED_KEY = "sidebar_collapsed";
 const SIDEBAR_OWNER_FILTER_KEY = "sidebar_owner_filter";
 const AI_PANEL_COLLAPSED_KEY = "mmh_ai_panel_collapsed";
@@ -68,7 +74,9 @@ const DEFAULT_SIDE_NAV_TOP_OFFSET_PX = 160;
 const MIN_SIDE_NAV_TOP_OFFSET_PX = 72;
 const MAX_SIDE_NAV_TOP_OFFSET_PX = 520;
 
-export type SidebarGroupMode = "kind" | "institution";
+export type SidebarGroupMode = "kind" | "institution" | "accountGroup";
+/** 账户下拉分组维度（单一事实来源在 `src/lib/preferences.ts`）。 */
+export type { AccountDropdownGroupBy } from "@/lib/preferences";
 export type CreditCardLabelMode = "short_last4" | "full_name";
 export type DisplayLanguage = "zh-CN" | "en-US" | "ja-JP";
 
@@ -82,10 +90,10 @@ type AppPreferencesSnapshot = {
   creditCardSidebarLabelTemplate: string;
   creditBillHideZero: boolean;
   creditBillHideSettled: boolean;
-  creditBillShowRecentCycles: boolean;
   displayLanguage: DisplayLanguage;
   dateDisplayFormat: DateDisplayFormat;
   sidebarGroupBy: SidebarGroupMode;
+  accountDropdownGroupBy: AccountDropdownGroupBy;
   sidebarOwnerFilter: string;
   sidebarHideZero: boolean;
   sidebarHideInitialData: boolean;
@@ -98,6 +106,7 @@ type AppPreferencesSnapshot = {
   accountLabelFields: AccountLabelField[];
   accountDropdownRestrictType: boolean;
   accountUsageSortEnabled: boolean;
+  repoOccupiedDaysMode: RepoOccupiedDaysMode;
 };
 
 const DEFAULT_SESSION_DAYS = 30;
@@ -195,18 +204,6 @@ export function setCreditBillHideSettledPreference(value: boolean) {
   emitPreferencesChanged();
 }
 
-function getCreditBillShowRecentCyclesPreference(): boolean {
-  const raw = parseCookieValue(CREDIT_BILL_RECENT_CYCLES_COOKIE);
-  if (raw == null) return true;
-  return raw === "1" || raw === "true";
-}
-
-export function setCreditBillShowRecentCyclesPreference(value: boolean) {
-  if (typeof document === "undefined") return;
-  setCookieValue(CREDIT_BILL_RECENT_CYCLES_COOKIE, value ? "1" : "0");
-  emitPreferencesChanged();
-}
-
 export function normalizeDisplayLanguage(value: unknown): DisplayLanguage {
   if (value === "en-US" || value === "ja-JP" || value === "zh-CN") return value;
   return DEFAULT_DISPLAY_LANGUAGE;
@@ -233,13 +230,27 @@ export function setDisplayLanguagePreference(value: DisplayLanguage) {
 }
 
 export function getSidebarGroupPreference(): SidebarGroupMode {
+  const normalize = (value: string | null): SidebarGroupMode =>
+    value === "institution" || value === "accountGroup" ? value : "kind";
   try {
-    const value = localStorage.getItem(SIDEBAR_GROUP_BY_KEY) ?? parseCookieValue(SIDEBAR_GROUP_BY_KEY);
-    if (value === "institution") return "institution";
-    return "kind";
+    return normalize(localStorage.getItem(SIDEBAR_GROUP_BY_KEY) ?? parseCookieValue(SIDEBAR_GROUP_BY_KEY));
   } catch {
-    return parseCookieValue(SIDEBAR_GROUP_BY_KEY) === "institution" ? "institution" : "kind";
+    return normalize(parseCookieValue(SIDEBAR_GROUP_BY_KEY));
   }
+}
+
+/**
+ * 账户下拉的分组维度。默认 `owner`（按所有人），与历史行为一致；
+ * 用户在「设置 → 显示」里可以换成按账户分组标签或按机构。
+ */
+export function getAccountDropdownGroupByPreference(): AccountDropdownGroupBy {
+  return normalizeAccountDropdownGroupBy(parseCookieValue(ACCOUNT_DROPDOWN_GROUP_BY_KEY));
+}
+
+export function setAccountDropdownGroupByPreference(mode: AccountDropdownGroupBy) {
+  if (typeof document === "undefined") return;
+  setCookieValue(ACCOUNT_DROPDOWN_GROUP_BY_KEY, mode);
+  emitPreferencesChanged();
 }
 
 export function setSidebarGroupPreference(mode: SidebarGroupMode) {
@@ -502,10 +513,10 @@ export function getAppPreferences(): AppPreferencesSnapshot {
     creditCardSidebarLabelTemplate: getCreditCardSidebarLabelTemplatePreference(),
     creditBillHideZero: getCreditBillHideZeroPreference(),
     creditBillHideSettled: getCreditBillHideSettledPreference(),
-    creditBillShowRecentCycles: getCreditBillShowRecentCyclesPreference(),
     displayLanguage: getDisplayLanguagePreference(),
     dateDisplayFormat: getDateDisplayFormatPreference(),
     sidebarGroupBy: getSidebarGroupPreference(),
+    accountDropdownGroupBy: getAccountDropdownGroupByPreference(),
     sidebarOwnerFilter: getSidebarOwnerFilterPreference(),
     sidebarHideZero: getSidebarHideZeroPreference(),
     sidebarHideInitialData: getSidebarHideInitialDataPreference(),
@@ -518,6 +529,7 @@ export function getAppPreferences(): AppPreferencesSnapshot {
     accountLabelFields: getAccountLabelFieldsPreference(),
     accountDropdownRestrictType: getAccountDropdownRestrictTypePreference(),
     accountUsageSortEnabled: getAccountUsageSortEnabledPreference(),
+    repoOccupiedDaysMode: getRepoOccupiedDaysModePreference(),
   };
 }
 
@@ -581,3 +593,18 @@ export function setAccountUsageSortEnabledPreference(value: boolean) {
   setCookieValue(ACCOUNT_USAGE_SORT_KEY, value ? "1" : "0");
   emitPreferencesChanged();
 }
+
+/**
+ * 逆回购占款天数口径。表单预览与提交都要用它，否则屏幕上算的利息和落账的利息
+ * 会是两套数（服务端按 DB 里的值，客户端按 cookie 镜像，两边由同一个 PUT 同步）。
+ */
+export function getRepoOccupiedDaysModePreference(): RepoOccupiedDaysMode {
+  return normalizeRepoOccupiedDaysMode(parseCookieValue(REPO_OCCUPIED_DAYS_MODE_KEY));
+}
+
+export function setRepoOccupiedDaysModePreference(value: RepoOccupiedDaysMode) {
+  setCookieValue(REPO_OCCUPIED_DAYS_MODE_KEY, normalizeRepoOccupiedDaysMode(value));
+  emitPreferencesChanged();
+}
+
+export type { RepoOccupiedDaysMode } from "@/lib/preferences";

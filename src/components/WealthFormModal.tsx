@@ -3,6 +3,7 @@ import { accountOptionFromParts } from "@/lib/account-display";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 /** 记账弹窗整窗外壳：宽度/标题栏/表单/FT 页签卡片/固定页脚/高度锁定统一由它负责。 */
 import { EntryModalShell } from "@/components/EntryModalShell";
+import { EntryConvertHeaderAction } from "@/components/EntryConvertHeaderAction";
 import {
   HoldingAccountCreateModal,
   HoldingHoldingFields,
@@ -250,7 +251,7 @@ export function WealthFormModal({
     arrivalAmount, setArrivalAmount, arrivalEdited, setArrivalEdited,
     cashAccountId, setCashAccountId, toAccountId, setToAccountId,
     memo, setMemo, pendingAttachmentFiles, setPendingAttachmentFiles, submitting, setSubmitting,
-    requestId, editEntryId, editBusinessTransactionId,
+    requestId, editEntryId, editBusinessTransactionId, conversionEntry,
     setInvestmentAccountList, setLocalInvestSSOpts, setNestedEntityType,
     isRedeem, isDividend, isWriteOff, isHoldingAction,
     selectedCashAccount, accountIds: wealthAccountIds,
@@ -564,6 +565,8 @@ export function WealthFormModal({
           await uploadEntryAttachmentFiles(createdEntryId, pendingAttachmentFiles);
           setPendingAttachmentFiles([]);
         }
+        // 「转换交易」靠 requestId 把这次新建和原记录串起来（见 lib/client/entry-conversion.ts）。
+        if (requestId) window.dispatchEvent(new CustomEvent("mmh:wealth:create:success", { detail: { requestId } }));
       }
       if (keepAdding && mode === "create") {
         resetAfterKeepAdding();
@@ -634,7 +637,26 @@ export function WealthFormModal({
           setOpen(false);
           if (mode === "create") reset();
         }}
-        closeLabel={t("table.close")}
+        headerExtra={(
+          <EntryConvertHeaderAction
+            source={mode === "edit" ? {
+              entryId: editEntryId,
+              type: "wealth",
+              date,
+              amount,
+              note: memo,
+              accountId: toAccountId,
+              cashAccountId,
+              fundName,
+              // 赎回 / 现金分红是钱进来，买入是钱出去：转换菜单只列同向目标。
+              inflow: subtype === "redeem" || subtype === "dividend_cash",
+            } : null}
+            onBeforeConvert={() => {
+              setOpen(false);
+              reset();
+            }}
+          />
+        )}
         onSubmit={onSubmit}
         tabs={family === "advisor"
           // 投顾组合只有买入/赎回：分红在投顾平台直接体现为组合净值变化，核销不适用。
@@ -652,7 +674,7 @@ export function WealthFormModal({
         onTabChange={(id) => selectSubtypeTab(id as WealthSubtype)}
         footer={(
           <>
-            {mode === "create" ? (
+            {mode === "create" && !conversionEntry ? (
               <button
                 type="button"
                 disabled={submitting}

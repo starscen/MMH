@@ -8,9 +8,22 @@ mmh
 
 现有 MMH 普通 NAS 安装与更新主线仍然是 Docker，继续参考 `deploy/nas-install-manual.md` 和 `deploy/nas/`。飞牛版只是额外的 `.fpk` 分发形式，不把普通 NAS 安装改成 SQLite。
 
-飞牛专用 `.fpk` 使用 SQLite 原生运行方式：包内包含 Next standalone、Linux Node runtime、Prisma runtime、SQLite 初始化脚本和应用入口，不依赖 Docker/PostgreSQL。它不是源码包，也不是调试归档。由于包含原生二进制，正式 Release 资产只按架构发布两个文件：`mmh-fnos-v0.1.x-x86_64.fpk` 和 `mmh-fnos-v0.1.x-arm64.fpk`，但应用 ID 仍然是同一个 `mmh`。
+飞牛专用 `.fpk` 使用 SQLite 原生运行方式：包内包含 Next standalone、Prisma runtime、SQLite 初始化脚本和应用入口，不依赖 Docker/PostgreSQL。它不是源码包，也不是调试归档。由于包含原生二进制，正式 Release 资产按「架构 × 运行时」发布四支：内置 Node.js 22 的 bundled 包，以及**不内置运行时**的 `-external-node` 轻量包（约 20MB，manifest 声明 `install_dep_apps=nodejs_v22`）。两者区别与选包建议见下文「先选包」。应用 ID 始终是同一个 `mmh`。
 
 ## 用户安装
+
+### 现在只有一支包：不含内置 Node.js（external-node）
+
+**0.1.87 起 Release 每种架构只有一个 `.fpk`，文件名带 `-external-node`**，包内不含 Node.js：
+
+| 资产名 | Node.js | 体积 |
+|---|---|---|
+| `mmh-fnos-v0.1.x-x86_64-external-node.fpk` | **不含**，安装时由应用中心自动装「Node.js 22」依赖 | 约 21MB |
+| `mmh-fnos-v0.1.x-arm64-external-node.fpk` | 同上 | 约 21MB |
+
+> 体积小是因为包里整个删掉了 `app/bin/node`，运行时去 `/vol*/@appcenter/nodejs_v22/bin/node` 等处找 Node.js 22（manifest 里声明了 `install_dep_apps=nodejs_v22`，应用中心会自己装这个依赖，不需要用户准备运行时）。找不到或主版本低于 22 会直接报错并提示，不会静默降级到别的 Node。
+>
+> 设备完全离线、应用中心拉不到「Node.js 22」时才需要内置 Node.js 的 bundled 包（文件名不带后缀，约 64MB）。它自 0.1.87 起只是手动兜底，**不再随 Release 发布**；`appname` 同样是 `mmh`，应用中心里只显示一个「MMH 记账」，装哪个都能覆盖升级。FN 软仓 / FnDepot 下发的也是轻量包。
 
 ### 推荐：FN 软仓安装和更新
 
@@ -20,7 +33,7 @@ mmh
 https://gitee.com/hhxs2025/fn-appstores/releases
 ```
 
-打开 FN 软仓客户端，搜索 `MMH` 或 `MMH 家庭财务工作台`，点击安装。当前软仓已经内置 MMH 源，不需要手动添加应用源。软仓源提供 x86_64 和 arm64 两个架构的正式 `.fpk`，客户端会按设备架构下载对应安装包。
+打开 FN 软仓客户端，搜索 `MMH 记账`（或直接搜 `MMH`），点击安装。当前软仓已经内置 MMH 源，不需要手动添加应用源。软仓源提供 x86_64 和 arm64 两个架构的正式 `.fpk`，客户端会按设备架构下载对应安装包。
 
 以后更新时，在 FN 软仓客户端里查看 MMH，看到新版本后直接点击更新。更新不会弹出任何向导：MMH 包内不包含 `wizard/install`、`wizard/upgrade`、`wizard/uninstall`，`0.1.47` 起 FN 软仓客户端的更新是完全静默的。更新会沿用已安装 MMH 写入 `.port` / `mmh.env` 的在用端口，不会用包内默认的 `7777` 覆盖已有端口。
 
@@ -34,7 +47,7 @@ https://gitee.com/hhxs2025/fn-appstores/releases
 
 ### 备用：手动安装 `.fpk`
 
-1. 下载 Release 资产中适合当前飞牛设备架构的 `.fpk`。x86_64 设备使用 `mmh-fnos-v0.1.x-x86_64.fpk`，ARM64 设备使用 `mmh-fnos-v0.1.x-arm64.fpk`。
+1. 按架构下载：x86_64 设备用 `*-x86_64-external-node.fpk`，ARM64 设备用 `*-arm64-external-node.fpk`。包内不含 Node.js，安装时应用中心会自动装上「Node.js 22」依赖；设备离线装不了依赖时，才需要内网自备 bundled 包（不随 Release 发布）。
 2. 在飞牛应用中心或支持手动安装 `.fpk` 的入口上传安装包。
 3. 安装过程没有向导，直接安装完成。首次安装的服务端口从 `7777` 开始自动探测，若已被占用则顺延到下一个空闲端口；覆盖安装或更新会沿用已有的持久端口。装好后可在应用中心的 MMH 设置页里改端口。系统初始化、删除账簿等敏感操作验证当前登录用户的密码（操作仅管理员可见）。
 4. 启动后访问：
@@ -70,13 +83,21 @@ mmh.db
 npm run build:fnos:app
 FNOS_NODE_TARBALL=/path/to/node-v22.x-linux-x64.tar.gz npm run build:fnos
 FNOS_TARGET_ARCH=arm64 FNOS_NODE_TARBALL=/path/to/node-v22.x-linux-arm64.tar.gz npm run build:fnos
+
+# 不含 Node.js 的轻量变体（每架构再出一个包）
+FNOS_EXTERNAL_NODE=1 FNOS_NODE_TARBALL=/path/to/node-v22.x-linux-x64.tar.gz npm run build:fnos
+FNOS_EXTERNAL_NODE=1 FNOS_TARGET_ARCH=arm64 FNOS_NODE_TARBALL=/path/to/node-v22.x-linux-arm64.tar.gz npm run build:fnos
 ```
 
-成功后生成：
+external-node 变体仍然要传 `FNOS_NODE_TARBALL`：包里虽然不放 Node，但打包时要用它校验 `better-sqlite3` 的 ABI 与 `engines.node` 下限。
+
+成功后生成（不带后缀的是内置 Node.js 的 bundled 包；加 `FNOS_EXTERNAL_NODE=1` 再跑一次，产出不含 Node.js 的轻量包）：
 
 ```text
 release-artifacts/fnos/mmh-fnos-v0.1.x-x86_64.fpk
 release-artifacts/fnos/mmh-fnos-v0.1.x-arm64.fpk
+release-artifacts/fnos/mmh-fnos-v0.1.x-x86_64-external-node.fpk
+release-artifacts/fnos/mmh-fnos-v0.1.x-arm64-external-node.fpk
 ```
 
 仅调试 FPK 工程结构时，可以运行：
@@ -95,13 +116,16 @@ release-artifacts/fnos/mmh-fnos-v0.1.x-arm64-fpk-source.tgz
 这个归档只用于排查 `manifest`、`cmd`、应用文件和图标结构，不是用户安装包。正式安装和应用源下载目标只能是 `.fpk`：
 
 ```text
-mmh-fnos-v0.1.x-x86_64.fpk
-mmh-fnos-v0.1.x-arm64.fpk
+mmh-fnos-v0.1.x-x86_64-external-node.fpk        # 发布资产：不含 Node.js，约 21MB
+mmh-fnos-v0.1.x-arm64-external-node.fpk         # 发布资产：不含 Node.js，约 21MB
+mmh-fnos-v0.1.x-x86_64.fpk                      # 手动兜底：内置 Node.js 22，不随 Release 发布
+mmh-fnos-v0.1.x-arm64.fpk                       # 手动兜底：内置 Node.js 22，不随 Release 发布
 ```
 
 ## 发布
 
 - GitHub Release 通过 `.github/workflows/fnos-release.yml` 构建并上传 `release-artifacts/fnos/*.fpk`。
+- 一次发布固定是**两支**资产（x86_64/arm64 × external-node）。matrix 仍保留 bundled 两条腿，但 `release: published` 只跑 external-node，上传步骤也 gate 到 `external-node`——`-external-node` 两支持续缺失即视为发布不完整，bundled 出现在 Release 上同样视为发布不完整（它只是 `workflow_dispatch` 手动兜底，且不上传 Release）。
 - Release workflow 每次发布都必须重新构建并覆盖既有 `.fpk` 资产，不能因为 Release 已存在某个 `.fpk` 就跳过构建。
 - 飞牛包版本直接使用 `package.json` 的 `0.1.x`，与 GitHub Release tag `v0.1.x` 和 GHCR 镜像 tag 一致；不要再发布 `v0.1.x-fnos` 或包内 `-fnos` 版本。
 - 上传前必须运行 `FNOS_VERIFY_BUILT_FPK=1 npm run check:fnos`，确认包内 `cmd/main`、manifest 和数据目录逻辑来自当前源码。
@@ -111,12 +135,12 @@ mmh-fnos-v0.1.x-arm64.fpk
 ## 软仓源维护说明
 
 - 当前验证过的公开源地址是：
-  `http://fnapp.floatingice.win:5660`
+  `http://fnapp.floatingice.win`（直连 `http://107.175.62.109:5660`）
 - FN 软仓当前已经内置 MMH 源，普通用户不需要手动添加源。
-- VPS 软仓服务同步 GitHub `frankluise5220/MMH` 仓库的 `main/deploy/fnos/repository` 目录并对外提供 `/api/apps`；`fnpack.json` 作为源数据文件保留在同一目录。
+- VPS 侧不是镜像 `main/deploy/fnos/repository` 目录，而是 `sync.sh` 每小时读 GitHub Release：下载本版 fpk 到 `data/apps/`、拉两个群晖 SPK、重写 `data/fn-appstores.json`（mmh 的 `x86` + `arm` 两条目，FPK 由 5660 本地直发），再由 `fn-appstores.json` 监听器追加公告；管理页（`https://fnapp.floatingice.win/fnstore/`）与群晖源由 5661 的 Python 补丁旁路提供。详见 `docs/fnos-selfhosted-source.md`。
 - **`fnpack.json` 的 release 条目由「发布」创建，不由 `npm run release:version` 写入**：该文件会被 FnDepot 每小时镜像，bump 时就写条目会让还没发布的版本提前出现在用户的应用源里，点下载必然 404（FnDepot 报「Range 探测返回 HTTP 404」）。条目改由 `release: published` 触发的 `.github/workflows/fnos-fndepot-sync.yml` → `scripts/sync-fndepot-source.cjs` 建立并回填 `sha256` / `size`。**因此「源里没有当前版本」是正常的待发布状态，不是缺漏。**
 - `check:release-version` 会拦住三类坏源：条目缺 `sha256` / `size`（= 死链）、`changelog` 指向别的版本、版本数超过 5 或顺序错乱；`fnos-fndepot-sync.yml` 在回填前还会用 `sync-fndepot-source.cjs --check` 实时查一遍 GitHub Release，确认没有死链条目。
-- `download_url` 和 `download_urls.x86_64` 指向 VPS 托管的 x86_64 包 `http://fnapp.floatingice.win/apps/mmh-0.1.x.fpk`，`download_urls.arm64` 仍指向 GitHub Release 中的 arm64 FPK，直到 VPS 也托管 arm64 本地包。
+- `download_url` 和 `download_urls.x86_64` 指向 VPS 托管的 x86_64 包 `http://fnapp.floatingice.win/apps/mmh-0.1.x.fpk`，`download_urls.arm64` 仍指向 GitHub Release 中的 arm64 FPK —— 这是 FnDepot（GitHub 侧静态源）的口径；自建软仓源 `data/fn-appstores.json` 的两个条目都已本地托管（`/apps/mmh-<版本>-x86.fpk` 与 `-arm.fpk`）。
 
 ## 升级边界
 

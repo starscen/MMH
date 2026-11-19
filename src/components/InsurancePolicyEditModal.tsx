@@ -1,4 +1,5 @@
 "use client";
+import { X } from "lucide-react";
 import { ModalLayer } from "@/components/ModalLayer";
 
 import { useEffect, useState } from "react";
@@ -8,6 +9,8 @@ import { useI18n } from "@/lib/i18n";
 
 type InsurancePolicyEditValue = {
   id: string;
+  /** active / matured / surrendered / lapsed；失效保单在「失效保单」页签里查看。 */
+  status: string;
   policyNo: string;
   effectiveDate: string;
   policyholderPersonId: string;
@@ -55,8 +58,8 @@ export function InsurancePolicyEditModal({
       <div className="app-modal-panel max-w-xl">
         <div className="modal-header">
           <div className="text-sm font-semibold text-slate-800">{t("insurancePolicy.editTitle")}</div>
-          <button type="button" onClick={onClose} className="secondary-button h-8 px-2">
-            {t("table.close")}
+          <button title={t("table.close")} aria-label={t("table.close")} type="button" onClick={onClose} className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0">
+            <X className="h-4 w-4" />
           </button>
         </div>
 
@@ -169,14 +172,28 @@ export function InsurancePolicyEditModal({
                   precision={2}
                 />
               </div>
+              <div className="space-y-1">
+                <div className="form-label">{t("insuranceShell.colStatus")}</div>
+                <select
+                  value={draft.status}
+                  onChange={(event) => {
+                    const next = { ...draft, status: event.target.value };
+                    setDraft(next);
+                    onChange?.(next);
+                  }}
+                  className="form-input"
+                >
+                  <option value="active">{t("insuranceShell.status.active")}</option>
+                  <option value="matured">{t("insuranceShell.status.matured")}</option>
+                  <option value="surrendered">{t("insuranceShell.status.surrendered")}</option>
+                  <option value="lapsed">{t("insuranceShell.status.lapsed")}</option>
+                </select>
+              </div>
             </div>
           </div>
 
           <div className="shrink-0 border-t border-slate-100 bg-white/95 px-4 py-3">
             <div className="flex items-center justify-end gap-2">
-              <button type="button" onClick={onClose} className="secondary-button h-9 px-4">
-                {t("common.cancel")}
-              </button>
               <button
                 type="submit"
                 disabled={saving}

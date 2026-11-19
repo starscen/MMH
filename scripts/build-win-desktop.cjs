@@ -457,6 +457,17 @@ function applyRuntimeMigrations(db) {
   // 20261017_add_metal_arrival_date 同义（可空，读取侧回退到 date）。
   // 0.1.74 漏了这段，升级后的桌面库查贵金属会报 "no such column: arrivalDate"。
   addColumnIfMissing(db, "precious_metal_transactions", "arrivalDate", "DATETIME");
+  // 2026-11-13 贵金属行情：latestPrice / latestPriceDate / priceSource。
+  // 与 prisma/migrations/20261113_add_metal_latest_price 同义（三列可空，无行情时
+  // 读取侧回退 unitPrice）。漏掉这段：升级后的桌面库刷新价格会成功，但重新打开
+  // 贵金属账户读持仓报 "no such column: latestPrice"（Prisma 是整行查询）。
+  // 表名两种写法都试：原生 schema 未给 PreciousMetalHolding 加 @@map，
+  // 但同族的 precious_metal_transactions 是蛇形，存量库两种都可能存在。
+  for (const metalHoldingTable of ["PreciousMetalHolding", "precious_metal_holdings"]) {
+    addColumnIfMissing(db, metalHoldingTable, "latestPrice", "DECIMAL(20,6)");
+    addColumnIfMissing(db, metalHoldingTable, "latestPriceDate", "DATETIME");
+    addColumnIfMissing(db, metalHoldingTable, "priceSource", "TEXT");
+  }
   // 2026-10-18 多币种父账户：parentId / isAggregate 以及 (parentId, currency) 唯一索引。
   // 与 build-fnos-package.cjs 的 20261018_add_account_parent 同义。
   addColumnIfMissing(db, "Account", "parentId", "TEXT");
@@ -473,12 +484,22 @@ function applyRuntimeMigrations(db) {
   // "no such column"，用户看到的就是「升级后账簿/首页都空了」。
   addColumnIfMissing(db, "HouseholdPreference", "detailWindowYears", "INTEGER NOT NULL DEFAULT 5");
   addColumnIfMissing(db, "HouseholdPreference", "accountUsageSortEnabled", "BOOLEAN NOT NULL DEFAULT 1");
+  // 2026-11-12 逆回购占款天数口径。同上是全列 findUnique，存量库缺这一列会让
+  // 首屏/侧边栏抛 "no such column: repoOccupiedDaysMode"。
+  addColumnIfMissing(db, "HouseholdPreference", "repoOccupiedDaysMode", "TEXT NOT NULL DEFAULT 'actual'");
   // 2026-10-29 账单日 / 还款日变更记录。与 build-fnos-package.cjs 的
   // 20261029_credit_billing_repayment_day 同义（两列可空，读取侧回退账户级设置）。
   // 漏掉这段：升级后的桌面库打开账户 / 负债 / 账单页会报
   // "no such column: repaymentOffsetDays"（23 个文件在读这两列）。
   addColumnIfMissing(db, "CreditCardBillingDay", "repaymentDay", "INTEGER");
   addColumnIfMissing(db, "CreditCardBillingDay", "repaymentOffsetDays", "INTEGER");
+  // 2026-11-15 信用卡分期「期供行落库水位」。计划记住已落地到第几期，materialize 只落
+  // installmentNo > 水位的期，用户删掉的期（含回收站「彻底删除」）不会再被补回来。
+  // 与 prisma/migrations/20261115_add_installment_materialized_watermark 同义。
+  // 漏掉这段：升级后的桌面库跑分期落地会报 "no such column: materializedThroughNo"
+  // （materialize 是查计划整行，缺列直接抛错，账单页/计划任务页的分期也跟着空）。
+  // 存量库该列取默认 0 即可：历史期由「这一期是否已有行」兜底判重，不会重发。
+  addColumnIfMissing(db, "CreditCardInstallmentPlan", "materializedThroughNo", "INTEGER NOT NULL DEFAULT 0");
   // 2026-11-02 国债逆回购：顺手补上 0.1.81 漏掉的那一列。
   // 与 build-fnos-package.cjs 的 20261102_add_bond_instrument_kind 同义（老数据全是债券）。
   // 漏掉这段：升级后的桌面库缺 bond_transactions.instrumentKind，债券 / 逆回购 /
@@ -501,6 +522,43 @@ function applyRuntimeMigrations(db) {
     db.exec('DROP INDEX IF EXISTS "Category_householdId_name_key"');
     db.exec('CREATE UNIQUE INDEX IF NOT EXISTS "Category_householdId_type_name_key" ON "Category"("householdId", "type", "name")');
   }
+  // 2026-11-13 账户自定义分组标签。与 build-fnos-package.cjs 的
+  // 20261113_add_account_group_label 同义（可空自由文本，存量账户 = 未分组）。
+  // 漏掉这段：升级后的桌面库打开账户页 / 侧边栏会报 "no such column: accountGroup"
+  // （账户查询是全列 findMany，不是 select 白名单）。
+  addColumnIfMissing(db, "Account", "accountGroup", "TEXT");
+  // 2026-11-18 电子钱包 → 货币基金支付关联。账户查询是全列 findMany，
+  // 漏掉这两列会让升级后的桌面库打开账户设置 / 记账弹窗时报 no such column。
+  addColumnIfMissing(db, "Account", "linkedFundAccountId", "TEXT");
+  addColumnIfMissing(db, "Account", "linkedFundCode", "TEXT");
+  // 账户下拉分组维度。household-preferences 走全列 findUnique，缺列即首屏报错。
+  addColumnIfMissing(db, "HouseholdPreference", "accountDropdownGroupBy", "TEXT NOT NULL DEFAULT 'owner'");
+  // 2026-11-15 固定资产扩展属性（生产日期 / 重量）+ 折旧（方式 / 年限 / 残值 / 累计折旧）。
+  // 与 prisma/migrations/20261115_add_fixed_asset_depreciation 同义；
+  // 折旧口径在 src/lib/fixed-asset-depreciation.ts。
+  // 漏掉这段：升级后的桌面库打开固定资产页 / 编辑资产会报 "no such column:
+  // accumulatedDepreciation"（固定资产持仓虽走 select 白名单，但资产编辑与
+  // 资产处置都查整行）。新增列都有默认值，存量资产不需要回填。
+  // 表名两种写法都试（原生 schema 未给 PropertyAsset 加 @@map，Postgres 侧是蛇形）。
+  for (const propertyAssetTable of ["PropertyAsset", "property_assets"]) {
+    addColumnIfMissing(db, propertyAssetTable, "productionDate", "DATETIME");
+    addColumnIfMissing(db, propertyAssetTable, "weight", "DECIMAL(18,3)");
+    addColumnIfMissing(db, propertyAssetTable, "weightUnit", "TEXT");
+    addColumnIfMissing(db, propertyAssetTable, "depreciationMethod", "TEXT NOT NULL DEFAULT 'none'");
+    addColumnIfMissing(db, propertyAssetTable, "usefulLifeMonths", "INTEGER");
+    addColumnIfMissing(db, propertyAssetTable, "salvageValue", "DECIMAL(18,2) NOT NULL DEFAULT 0");
+    addColumnIfMissing(db, propertyAssetTable, "accumulatedDepreciation", "DECIMAL(18,2) NOT NULL DEFAULT 0");
+  }
+  // 2026-11-18 净值源可配置化：parser / parserConfig。
+  // 与 prisma/migrations/20261118_add_fund_query_api_parser 同义（两列可空，无需回填）。
+  // 漏掉这段：升级后的桌面库打开设置页或触发取净值会报 "no such column: parser"
+  // （FundQueryApi 的读取都是全列 findMany，没有 select 白名单）。
+  addColumnIfMissing(db, "FundQueryApi", "parser", "TEXT");
+  addColumnIfMissing(db, "FundQueryApi", "parserConfig", "TEXT");
+  // 2026-11-18 折旧台账的手工登记说明。与 prisma/migrations/20261118_add_property_depreciation_note
+  // 同义（可空）。漏掉这段：升级后的桌面库读台账会报 "no such column: note"
+  // （台账查询是全列 findMany，没有 select 白名单）。
+  addColumnIfMissing(db, "property_asset_depreciations", "note", "TEXT");
 }
 
 fs.mkdirSync(dataDir, { recursive: true });

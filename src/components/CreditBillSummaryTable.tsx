@@ -10,6 +10,7 @@ import { AdvancedDataTable, type AdvancedDataTableColumn } from "@/components/Ad
 import { CalcInput } from "@/components/CalcInput";
 import { DateStepper } from "@/components/DateStepper";
 import { CreditCardBillingDaySettingsDialog } from "@/components/CreditCardBillingDaySettingsDialog";
+import { SimpleModal } from "@/components/SimpleModal";
 import { currentBillingDayFromRules, type CreditBillingDayRuleView } from "@/lib/credit/billing-day-rules";
 import EditBillAmount from "@/components/EditBillAmount";
 import { HANDSET_HIDDEN_CLASS, ViewExcelImportMenuButton, exportRowsToXlsx } from "@/components/ViewExcelImportMenuButton";
@@ -23,7 +24,6 @@ import { creditBillUnpaidAmount, isCreditBillSettled, type BillingDayTxPeriod } 
 import {
   setCreditBillHideSettledPreference,
   setCreditBillHideZeroPreference,
-  setCreditBillShowRecentCyclesPreference,
 } from "@/lib/client/appPreferences";
 import { dispatchFinanceDataChanged, FINANCE_DATA_CHANGED_EVENT } from "@/lib/client/refresh";
 import { useI18n } from "@/lib/i18n";
@@ -62,7 +62,6 @@ type CreditBillSummaryTableProps = {
   settledBillMonth: string;
   hideZeroBills: boolean;
   hideSettledBills: boolean;
-  showRecentBillCycles: boolean;
   className?: string;
   fillHeight?: boolean;
 };
@@ -119,7 +118,6 @@ export function CreditBillSummaryTable({
   settledBillMonth,
   hideZeroBills,
   hideSettledBills,
-  showRecentBillCycles,
   className,
   fillHeight = false,
 }: CreditBillSummaryTableProps) {
@@ -222,7 +220,6 @@ export function CreditBillSummaryTable({
         billMonth: url.searchParams.get("billMonth") || "all",
         hideZeroBills: hideZeroBills ? "1" : "0",
         hideSettledBills: hideSettledBills ? "1" : "0",
-        billMonthsLimit: showRecentBillCycles ? "10" : "all",
       });
       const seq = ++summaryRefreshSeqRef.current;
       fetch(`/api/v1/bill/summary?${params.toString()}`, { cache: "no-store" })
@@ -255,7 +252,7 @@ export function CreditBillSummaryTable({
     };
     window.addEventListener(FINANCE_DATA_CHANGED_EVENT, handleBillOverrideChange as EventListener);
     return () => window.removeEventListener(FINANCE_DATA_CHANGED_EVENT, handleBillOverrideChange as EventListener);
-  }, [accountId, hideSettledBills, hideZeroBills, showRecentBillCycles, t]);
+  }, [accountId, hideSettledBills, hideZeroBills, t]);
 
   useEffect(() => {
     if (page === safePage) return;
@@ -379,7 +376,6 @@ export function CreditBillSummaryTable({
     q.set("billPage", String(safePage));
     if (hideZeroBills) q.set("hideZeroBills", "1");
     if (hideSettledBills) q.set("hideSettledBills", "1");
-    if (!showRecentBillCycles) q.set("billMonthsLimit", "all");
     mutate?.(q);
     return `/?${q.toString()}`;
   };
@@ -673,25 +669,6 @@ export function CreditBillSummaryTable({
               <button
                 type="button"
                 onClick={() => {
-                  const next = !showRecentBillCycles;
-                  setCreditBillShowRecentCyclesPreference(next);
-                  navigateWithQuery((q) => {
-                    if (next) q.delete("billMonthsLimit");
-                    else q.set("billMonthsLimit", "all");
-                  });
-                }}
-                className={`flex h-7 items-center rounded-md border px-2 text-xs ${
-                  showRecentBillCycles
-                    ? "border-blue-300 bg-blue-50 text-blue-700"
-                    : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
-                }`}
-                title={showRecentBillCycles ? t("creditBill.recentTitle") : t("creditBill.allBillsTitle")}
-              >
-                {showRecentBillCycles ? t("creditBill.recent10") : t("creditBill.allBills")}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
                   const next = !hideZeroBills;
                   setCreditBillHideZeroPreference(next);
                   navigateWithQuery((q) => {
@@ -747,55 +724,50 @@ export function CreditBillSummaryTable({
         onRulesChanged={setBillingDayRulesLocal}
       />
       {exportOpen ? (
-        <ModalLayer className="fixed inset-0 flex items-center justify-center bg-slate-900/25 px-4">
-          <div className="w-full max-w-md overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
-            <div className="border-b border-slate-100 px-4 py-3">
-              <div className="text-sm font-semibold text-slate-800">{t("creditBillSummary.exportTitle")}</div>
-              <div className="mt-1 text-xs text-slate-500">
-                {t("creditBillSummary.exportDesc")}
-              </div>
-            </div>
-            <div className="space-y-3 px-4 py-4">
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-slate-600">{t("creditBillSummary.exportStartLabel")}</span>
-                <select
-                  value={exportStartMonth}
-                  onChange={(event) => setExportStartMonth(event.target.value)}
-                  className="form-input"
-                >
-                  {exportBillOptions.map((row) => (
-                    <option key={row.month} value={row.month}>
-                      {t("creditBillSummary.exportOption", { month: row.month, start: row.periodStart, end: row.periodEnd })}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-slate-600">{t("creditBillSummary.exportEndLabel")}</span>
-                <select
-                  value={exportEndMonth}
-                  onChange={(event) => setExportEndMonth(event.target.value)}
-                  className="form-input"
-                >
-                  {exportBillOptions.map((row) => (
-                    <option key={row.month} value={row.month}>
-                      {t("creditBillSummary.exportOption", { month: row.month, start: row.periodStart, end: row.periodEnd })}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {exportError ? <div className="rounded bg-red-50 px-3 py-2 text-xs text-red-700">{exportError}</div> : null}
-            </div>
-            <div className="flex justify-end gap-2 border-t border-slate-100 px-4 py-3">
-              <button type="button" onClick={() => setExportOpen(false)} className="secondary-button h-8 px-3 text-xs" disabled={exportBusy}>
-                {t("common.cancel")}
-              </button>
-              <button type="button" onClick={() => void exportBillExcel()} className="primary-button h-8 px-3 text-xs" disabled={exportBusy || exportBillOptions.length === 0}>
-                {exportBusy ? t("creditBillSummary.exporting") : t("creditBillSummary.export")}
-              </button>
-            </div>
+        <SimpleModal
+          open={exportOpen}
+          onClose={() => setExportOpen(false)}
+          closeDisabled={exportBusy}
+          title={t("creditBillSummary.exportTitle")}
+          description={t("creditBillSummary.exportDesc")}
+          footer={
+            <button type="button" onClick={() => void exportBillExcel()} className="primary-button h-8 px-3 text-xs" disabled={exportBusy || exportBillOptions.length === 0}>
+              {exportBusy ? t("creditBillSummary.exporting") : t("creditBillSummary.export")}
+            </button>
+          }
+        >
+          <div className="space-y-3">
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">{t("creditBillSummary.exportStartLabel")}</span>
+              <select
+                value={exportStartMonth}
+                onChange={(event) => setExportStartMonth(event.target.value)}
+                className="form-input"
+              >
+                {exportBillOptions.map((row) => (
+                  <option key={row.month} value={row.month}>
+                    {t("creditBillSummary.exportOption", { month: row.month, start: row.periodStart, end: row.periodEnd })}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600">{t("creditBillSummary.exportEndLabel")}</span>
+              <select
+                value={exportEndMonth}
+                onChange={(event) => setExportEndMonth(event.target.value)}
+                className="form-input"
+              >
+                {exportBillOptions.map((row) => (
+                  <option key={row.month} value={row.month}>
+                    {t("creditBillSummary.exportOption", { month: row.month, start: row.periodStart, end: row.periodEnd })}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {exportError ? <div className="rounded bg-red-50 px-3 py-2 text-xs text-red-700">{exportError}</div> : null}
           </div>
-        </ModalLayer>
+        </SimpleModal>
       ) : null}
       {installmentOpen ? (
         <ModalLayer className="fixed inset-0 flex items-center justify-center bg-slate-900/25 px-4">
@@ -957,9 +929,6 @@ export function CreditBillSummaryTable({
               {installmentError ? <div className="rounded bg-red-50 px-3 py-2 text-xs text-red-700">{installmentError}</div> : null}
             </div>
             <div className="flex justify-end gap-2 border-t border-slate-100 px-4 py-3">
-              <button type="button" onClick={() => setInstallmentOpen(false)} className="secondary-button h-8 px-3 text-xs" disabled={installmentSaving}>
-                {t("common.cancel")}
-              </button>
               <button
                 type="button"
                 onClick={saveStatementInstallment}

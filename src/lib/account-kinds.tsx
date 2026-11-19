@@ -13,7 +13,9 @@ const KIND_LABEL_KEYS: Record<string, string> = {
   loan: "account.kind.loan",
   insurance: "account.kind.insurance",
   other: "account.kind.other",
-  bank_savings: "account.kind.bank_savings",
+  // 历史别名（库里从未存在该 kind，Postgres 枚举 AccountKind 无此值）：仅防御旧库脏数据，
+  // 统一按「借记卡」显示。储蓄卡与借记卡是同一个类型，别当成两种账户。
+  bank_savings: "account.kind.bank_debit",
 };
 
 // Legacy account-kind labels kept as data for callers without a `t` function
@@ -30,7 +32,7 @@ const KIND_LABEL_FALLBACK: Record<string, string> = {
   loan: "贷款",
   insurance: "保险",
   other: "其他",
-  bank_savings: "储蓄卡",
+  bank_savings: "借记卡",
 };
 
 export function kindLabel(k: string, t?: I18nT): string {
@@ -235,6 +237,21 @@ export const LOAN_DIALOG_INSTITUTION_TYPE_VALUES = ["bank", "provident_fund", "l
 /** 贷款账户（kind=loan）允许挂的机构类型（账户层规则，比贷款弹窗多 payment/other）。 */
 export const LOAN_ACCOUNT_INSTITUTION_TYPE_VALUES = ["bank", "provident_fund", "payment", "other"] as const;
 
+/**
+ * 电子钱包账户（kind=ewallet）允许挂的机构类型。
+ * 2026-11-15 用户裁定放开：电子钱包不一定开在第三方支付，银行钱包、基金公司现金宝、
+ * 券商余额理财都能记成钱包，因此不再只认 payment。顺序保持 payment 在首位（最常见的钱包形态，
+ * 新增机构的默认类型也取它）。不含家庭/往来对象类与公积金中心/放款机构。
+ */
+export const EWALLET_INSTITUTION_TYPE_VALUES = [
+  "payment",
+  "bank",
+  "fund_company",
+  "brokerage",
+  "insurance",
+  "other",
+] as const;
+
 /** 负债页「来自机构」来源子集：贷款机构 + 可挂往来款的组织类。 */
 export const LENDER_INSTITUTION_TYPE_VALUES = ["bank", "provident_fund", "lender", "organization", "other"] as const;
 
@@ -263,6 +280,22 @@ export function institutionTypeLabel(type: string | null | undefined, t: I18nT):
   return INSTITUTION_TYPE_LABEL_FALLBACK[type ?? "other"] ?? type ?? INSTITUTION_TYPE_LABEL_FALLBACK.other;
 }
 
+
+/** 「未打标签」账户在选择器里的哨兵值（真实标签是自由文本，不会等于它）。 */
+export const UNGROUPED_GROUP_KEY = "__ungrouped__";
+
+/**
+ * 账户「自定义分组」键：`Account.accountGroup` 自由文本标签（如「日常现金」
+ * 「孩子教育」），空 = 未分组。与 `accountFilterGroupKey`（按账户类型）以及
+ * `AccountGroup`（归属人分组）是三个不同概念，别混用。
+ *
+ * 放这里（而不是 `AccountScopeFilter`）是因为那个文件带 `"use client"`，
+ * 从它导出函数会让服务端组件拿到 client reference，调用时直接报错。
+ */
+export function accountCustomGroupKey(account: { accountGroup?: string | null }): string {
+  const name = account.accountGroup?.trim() ?? "";
+  return name || UNGROUPED_GROUP_KEY;
+}
 
 export const kindOrder: string[] = [
   "cash",

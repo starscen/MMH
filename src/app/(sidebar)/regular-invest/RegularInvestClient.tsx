@@ -10,7 +10,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Pause, Pencil, Play, RefreshCw, Square, Trash2 } from "lucide-react";
+import { ChevronRight, Pause, Pencil, Play, RefreshCw, Square, Trash2, X } from "lucide-react";
 import { AdvancedDataTable, ROW_ACTION_BUTTON_BOX_CLASS, type AdvancedDataTableColumn, type AdvancedDataTableSortState } from "@/components/AdvancedDataTable";
 import { DateStepper } from "@/components/DateStepper";
 import {
@@ -176,6 +176,10 @@ type RegularInvestPlanView = {
   taskCategoryId?: string | null;
   taskCategoryName?: string | null;
   taskInsuranceProductId?: string | null;
+  taskMetalTypeId?: string | null;
+  taskMetalTypeName?: string | null;
+  taskMetalUnitId?: string | null;
+  taskMetalUnitName?: string | null;
   taskNote?: string | null;
   taskAnnualRate?: number | null;
   taskRepaymentMethod?: string | null;
@@ -242,7 +246,11 @@ type RegularInvestPlanView = {
 };
 
 type RegularInvestDisplayRow =
-  | { kind: "group"; key: string; label: string; title: string; count: number }
+  /**
+   * 分组标题行。`collapseKey` 是**稳定**的收起标识（组名 + 悬浮标题，不含下标），
+   * 表里的 `key`（`group:${index}:…`）会随排序/筛选变，用它记收起状态会串组。
+   */
+  | { kind: "group"; key: string; collapseKey: string; label: string; title: string; count: number; collapsed: boolean }
   // grouped：该计划行挂在某个分组标题下面，首列要左缩进一级，跟分组行区分开层级。
   | { kind: "plan"; plan: RegularInvestPlanView; grouped?: boolean };
 
@@ -794,12 +802,16 @@ function filterRegularInvestDisplayRows(
   let currentPlanRows: Array<Extract<RegularInvestDisplayRow, { kind: "plan" }>> = [];
 
   const flushGroup = () => {
-    if (currentPlanRows.length === 0) {
+    // 收起的分组：组头照常输出（点一下就能展开），组内行不输出。count 仍按当前筛选
+    // 结果算 —— 收起前后组头上那个数字不变；不这样做的话，「筛选 + 收起」会让整组
+    // 从表里消失（组头没了，也没法再点开），或者数字忽然跳回未筛选的总数。
+    const collapsed = currentGroup?.collapsed ?? false;
+    if (currentPlanRows.length === 0 && !collapsed) {
       currentGroup = null;
       return;
     }
     if (currentGroup) filteredRows.push({ ...currentGroup, count: currentPlanRows.length });
-    filteredRows.push(...currentPlanRows);
+    if (!collapsed) filteredRows.push(...currentPlanRows);
     currentGroup = null;
     currentPlanRows = [];
   };
@@ -849,6 +861,7 @@ export function RegularInvestClient({
   initialPlans,
   installmentPlans,
   investmentAccounts,
+  metalAccounts,
   cashAccounts,
   loanAccounts,
   transferTargetAccounts,
@@ -873,6 +886,8 @@ export function RegularInvestClient({
   /** 正在执行的信用卡分期（服务端已算好进度与下一期），独立页签只读展示。 */
   installmentPlans: CreditInstallmentPlanView[];
   investmentAccounts: AccountDisplayOption[];
+  /** 贵金属投资账户，供「贵金属积存」页签使用 */
+  metalAccounts: AccountDisplayOption[];
   cashAccounts: AccountDisplayOption[];
   loanAccounts: AccountDisplayOption[];
   transferTargetAccounts: AccountDisplayOption[];
@@ -912,6 +927,8 @@ export function RegularInvestClient({
   // 计划任务来源 FT 页签：user=用户计划任务（默认）/ system=系统计划任务。
   const [sourceTab, setSourceTab] = useState<PlanSourceTab>("user");
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
+  // 分组行点一下收起 / 再点展开：按 collapseKey（组名 + 悬浮标题）记，不跟行下标走。
+  const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<string[]>([]);
   const [executionProgress, setExecutionProgress] = useState<ExecutionProgressState | null>(null);
   const [runningExecution, setRunningExecution] = useState<{ mode: "single" | "all"; planId?: string } | null>(null);
   const executionBusy = executionProgress?.status === "running";
@@ -962,11 +979,13 @@ export function RegularInvestClient({
     const accountCandidates =
       taskType === "fund_regular_invest"
         ? investmentAccounts
-        : taskType === "loan_repayment"
-          ? loanAccounts
-          : taskType === "income" || taskType === "expense"
-            ? ordinaryAccounts
-            : transferTargetAccounts;
+        : taskType === "metal_regular_invest"
+          ? metalAccounts
+          : taskType === "loan_repayment"
+            ? loanAccounts
+            : taskType === "income" || taskType === "expense"
+              ? ordinaryAccounts
+              : transferTargetAccounts;
     const fundAccount = accountCandidates.find((account) => account.id === plan.accountId);
     const cashAccount = cashAccounts.find((account) => account.id === plan.cashAccountId);
     return {
@@ -1832,18 +1851,30 @@ export function RegularInvestClient({
   const sortedPlans = sortPlansByDefault(filteredPlans, t);
   const groupedPlans = groupPlans(sortedPlans, groupBy, t);
 
+  const toggleGroupCollapsed = (collapseKey: string) => {
+    setCollapsedGroupKeys((prev) => prev.includes(collapseKey)
+      ? prev.filter((key) => key !== collapseKey)
+      : [...prev, collapseKey]);
+  };
+
   const tableRows: RegularInvestDisplayRow[] = groupedPlans.flatMap((group, index) => {
     // 有分组标题时，组内计划行标记 grouped，首列缩进一级。
     const grouped = Boolean(group.label);
     const planRows = group.items.map((plan) => ({ kind: "plan" as const, plan, grouped }));
     if (!group.label) return planRows;
+    // 收起状态只挂在组头上：行照常交给表格，由 filterRegularInvestDisplayRows 在
+    // 汇总处把收起组的行滤掉 —— 这样组头的 count 仍然按「当前筛选后的条数」算。
+    const collapseKey = `${group.label}\u0000${group.title || group.label}`;
+    const collapsed = collapsedGroupKeys.includes(collapseKey);
     return [
       {
         kind: "group" as const,
         key: `group:${index}:${group.label}:${group.title}`,
+        collapseKey,
         label: group.label,
         title: group.title || group.label,
         count: group.items.length,
+        collapsed,
       },
       ...planRows,
     ];
@@ -1947,9 +1978,19 @@ export function RegularInvestClient({
   );
 
   const mainTableColumns = useMemo<AdvancedDataTableColumn<RegularInvestDisplayRow>[]>(() => {
+    // 组头本身就是「收起 / 展开」的开关：整行可点（见表格的 onRowClick），
+    // chevron 朝右 = 已收起、朝下 = 已展开，与列表页常见的折叠树一致。
     const groupCell = (row: RegularInvestDisplayRow) =>
       row.kind === "group"
-        ? <span className="font-semibold text-slate-600" title={row.title}>{row.label} ({row.count})</span>
+        ? (
+          <span className="flex items-center gap-1.5 font-semibold text-slate-600" title={row.title}>
+            <ChevronRight
+              className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform ${row.collapsed ? "" : "rotate-90"}`}
+              aria-hidden="true"
+            />
+            <span className="min-w-0 truncate">{row.label} ({row.count})</span>
+          </span>
+        )
         : null;
 
     const planOnly = (
@@ -2137,6 +2178,7 @@ export function RegularInvestClient({
               <RegularInvestForm
                 accountId={investmentAccounts[0]?.id ?? ""}
                 investmentAccounts={investmentAccounts}
+                metalAccounts={metalAccounts}
                 cashAccounts={cashAccounts}
                 loanAccounts={loanAccounts}
                 transferTargetAccounts={transferTargetAccounts}
@@ -2210,8 +2252,8 @@ export function RegularInvestClient({
           <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
             {/* 页签组的 stretch 变体本身带 `flex-1 basis-0`，条撑满 left-0 right-0 后两个页签会各占半屏，
                 所以逐个追加 `flex-none!` 把宽度收回到「文字 + px-4」（Tailwind v4 的 important 是后缀）。
-                宽度下限由 `FolderTabRuler` 的四字探针托住。条本身仍撑满左右，
-                好让右侧的标题/汇总/隐藏已结束/执行全部用 ml-auto 贴到卡片右边缘。 */}
+                宽度下限由 `FolderTabRuler` 的四字探针托住。条上现在**只有页签**：
+                筛选、汇总、隐藏已结束、执行全部都在卡片内的工具栏（见下方 `data-advanced-table-toolbar`）。 */}
             <div className={FOLDER_TAB_STRIP}>
               {PLAN_SOURCE_TABS.map((tab, index) => {
                 const active = tab.id === sourceTab;
@@ -2235,89 +2277,6 @@ export function RegularInvestClient({
                   </button>
                 );
               })}
-              {/* 计划类型 + 账户筛选接在页签后面，高度 = `--ft-tab-strip`（条高），
-                  不参与页签的 self-stretch —— 页签要伸到卡片下面被盖住。
-                  下拉按钮组件内写死 h-8，居中会浮到 y=4，比非活动页签顶边还高、看着像从标签里
-                  冒出来；压到 `--ft-tab-filter-h`（= 活动页签高 − 层次 = 28px，见 globals.css 公式
-                  ④）并**顶对齐 + `pt-[var(--ft-tab-rise)]`**，正好与非活动页签顶边齐平，整体落在
-                  活动页签之内 —— 字号变了整排跟着收放，不再写死 28。 */}
-              <div className="flex h-[var(--ft-tab-strip)] shrink-0 items-start gap-1.5 pl-2 pt-[var(--ft-tab-rise)] [&>div>button]:h-[var(--ft-tab-filter-h)]">
-                {/* 分期页签的行不是 RegularInvestPlan，类型/账户筛选对它没有意义，整组隐藏。 */}
-                {sourceTab !== "installment" && (<>
-                <MultiSelectFilterDropdown
-                  options={SCHEDULED_TASK_TYPES}
-                  selectedValues={selectedTypes}
-                  onChange={setSelectedTypes}
-                  labelFor={(value) => getTaskTypeLabel(value as ScheduledTaskType, t)}
-                  allLabel={t("regularInvest.client.filter.allTypes")}
-                  selectedSummaryLabel={(first, count) => t("regularInvest.client.filter.selectedSummary", { first, count })}
-                  clearLabel={t("statistics.clearSelection")}
-                  emptyLabel={t("table.empty")}
-                />
-                <MultiSelectFilterDropdown
-                  options={accountFilterOptions.map((option) => option.id)}
-                  selectedValues={selectedAccountIds}
-                  onChange={setSelectedAccountIds}
-                  labelFor={(id) => accountFilterOptions.find((option) => option.id === id)?.name ?? id}
-                  allLabel={t("regularInvest.client.filter.allAccount")}
-                  selectedSummaryLabel={(first, count) => t("regularInvest.client.filter.selectedSummary", { first, count })}
-                  clearLabel={t("statistics.clearSelection")}
-                  emptyLabel={t("table.empty")}
-                  groups={accountFilterGroups}
-                />
-                </>)}
-              </div>
-              {/* 计划标题、汇总、逾期、隐藏已结束、执行全部也挤在页签这一行的右侧（ml-auto），
-                  不再单独占一行：整页只有页签条那一条（40px 高，由页签算出）横条承载所有
-                  页级控件。 */}
-              <div className="ml-auto flex h-10 shrink-0 items-center gap-3 pl-3">
-                <div className="flex min-w-0 items-center gap-2.5 text-sm">
-                  <span className="whitespace-nowrap font-semibold text-slate-800">{t("nav.scheduledTasks")}</span>
-                  {sourceTab === "installment" ? (
-                    <span className="whitespace-nowrap text-xs text-slate-500">
-                      {t("regularInvest.client.installment.summary", {
-                        count: installmentPlans.filter((plan) => !plan.completed).length,
-                        amount: installmentPlans
-                          .filter((plan) => !plan.completed)
-                          .reduce((sum, plan) => sum + plan.remainingPayment, 0)
-                          .toFixed(2),
-                      })}
-                    </span>
-                  ) : (
-                    <>
-                      <span className="whitespace-nowrap text-xs text-slate-500">
-                        {t("regularInvest.client.toolbarSummary", { total: filteredPlans.length, active: filteredPlans.filter((plan) => plan.status === "active").length })}
-                      </span>
-                      {overduePlans.length > 0 ? (
-                        <span className="whitespace-nowrap rounded-full bg-orange-50 px-2 py-0.5 text-xs font-medium text-orange-600">
-                          {t("regularInvest.client.overdue", { count: overduePlans.length })}
-                        </span>
-                      ) : null}
-                      {sourceTab === "system" ? (
-                        <span className="whitespace-nowrap rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">
-                          {t("regularInvest.client.sourceTab.systemHint")}
-                        </span>
-                      ) : null}
-                    </>
-                  )}
-                </div>
-                {sourceTab !== "installment" && (
-                  <label className="flex shrink-0 cursor-pointer select-none items-center gap-1.5 whitespace-nowrap text-xs text-slate-500">
-                    <input type="checkbox" checked={!showEnded} onChange={(e) => setShowEnded(!e.target.checked)} className="h-3.5 w-3.5 accent-blue-600" />
-                    {t("regularInvest.client.hideEnded")}
-                  </label>
-                )}
-                {sourceTab === "user" && (
-                  <button
-                    onClick={handleBatchExecuteAll}
-                    disabled={executionBusy}
-                    title={t("regularInvest.client.executeAll.title")}
-                    className="flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <RefreshCw className={`h-3.5 w-3.5 ${executionBusy && runningExecution?.mode === "all" ? "animate-spin" : ""}`} />{t("regularInvest.client.executeAll.short")}
-                  </button>
-                )}
-              </div>
             </div>
             {/* 内容板沿用 FT 规范：外壳不再手写 rounded-xl / border-slate-300 / #fbfaf7 / 阴影，
                 直接挂 `.ft-card-surface`（+ `-fill` 撑满窗格，里面是 fillHeight 表格 + 详情面板）。
@@ -2325,9 +2284,91 @@ export function RegularInvestClient({
                 `padding: 12px 0` + `.advanced-table-header` / `.advanced-table-viewport` 的上下横线，
                 2026-10-31 用户：「卡片纸上画了个表格」→「表格外框呢」→「左右不留空，上下留」），
                 即表格左右铺满卡片宽度、上下各留 12px；这里**不要**再包 `p-*` / `border`。
-                卡片里不再有工具栏（标题/汇总/筛选全在外面），顶部第一层就是表头 —— FT 的「页签 ≡ 内容板 ≡ 表头」
-                同色因此自然成立，不会被白色工具栏隔断。 */}
+                卡片第一层是工具栏（筛选 + 标题/汇总/执行全部），第二层才是表头 —— 工具栏挂
+                `data-advanced-table-toolbar`，按 globals.css 的 FT 规范取卡片底色、四边 10px、
+                并让卡片 `:has(table)` 的 12px 顶留白失效，于是页签 ≡ 工具栏 ≡ 表头同色相连。 */}
             <div className="ft-card-surface ft-card-surface-fill">
+              {/* 卡片内工具栏（2026-11-15 用户要求：把「全部类型 / 全部账户」两个筛选框和右侧的
+                  「计划任务 共 N 个计划…」汇总、「待执行」「执行全部」从页签条那一行挪到卡片里、
+                  表头上面）。页签条现在只承载页签，整行控件不再跟页签抢同一根横条。
+                  2026-11-15 追加：「全部类型 / 全部账户」跟着靠右 —— 整条工具栏 `justify-end`，
+                  筛选与汇总、按钮连成一串贴卡片右边缘（不再一左一右分居两端）。 */}
+              <div data-advanced-table-toolbar className="flex shrink-0 flex-wrap items-center justify-end gap-x-3 gap-y-1.5">
+                {/* 分期页签的行不是 RegularInvestPlan，类型/账户筛选对它没有意义，整组隐藏。 */}
+                {sourceTab !== "installment" && (
+                  <div className="flex min-w-0 items-center gap-1.5 [&>div>button]:h-7">
+                    <MultiSelectFilterDropdown
+                      options={SCHEDULED_TASK_TYPES}
+                      selectedValues={selectedTypes}
+                      onChange={setSelectedTypes}
+                      labelFor={(value) => getTaskTypeLabel(value as ScheduledTaskType, t)}
+                      allLabel={t("regularInvest.client.filter.allTypes")}
+                      selectedSummaryLabel={(first, count) => t("regularInvest.client.filter.selectedSummary", { first, count })}
+                      clearLabel={t("statistics.clearSelection")}
+                      emptyLabel={t("table.empty")}
+                    />
+                    <MultiSelectFilterDropdown
+                      options={accountFilterOptions.map((option) => option.id)}
+                      selectedValues={selectedAccountIds}
+                      onChange={setSelectedAccountIds}
+                      labelFor={(id) => accountFilterOptions.find((option) => option.id === id)?.name ?? id}
+                      allLabel={t("regularInvest.client.filter.allAccount")}
+                      selectedSummaryLabel={(first, count) => t("regularInvest.client.filter.selectedSummary", { first, count })}
+                      clearLabel={t("statistics.clearSelection")}
+                      emptyLabel={t("table.empty")}
+                      groups={accountFilterGroups}
+                    />
+                  </div>
+                )}
+                <div className="flex min-w-0 flex-wrap items-center gap-3">
+                  <div className="flex min-w-0 items-center gap-2.5 text-sm">
+                    <span className="whitespace-nowrap font-semibold text-slate-800">{t("nav.scheduledTasks")}</span>
+                    {sourceTab === "installment" ? (
+                      <span className="whitespace-nowrap text-xs text-slate-500">
+                        {t("regularInvest.client.installment.summary", {
+                          count: installmentPlans.filter((plan) => !plan.completed).length,
+                          amount: installmentPlans
+                            .filter((plan) => !plan.completed)
+                            .reduce((sum, plan) => sum + plan.remainingPayment, 0)
+                            .toFixed(2),
+                        })}
+                      </span>
+                    ) : (
+                      <>
+                        <span className="whitespace-nowrap text-xs text-slate-500">
+                          {t("regularInvest.client.toolbarSummary", { total: filteredPlans.length, active: filteredPlans.filter((plan) => plan.status === "active").length })}
+                        </span>
+                        {overduePlans.length > 0 ? (
+                          <span className="whitespace-nowrap rounded-full bg-orange-50 px-2 py-0.5 text-xs font-medium text-orange-600">
+                            {t("regularInvest.client.overdue", { count: overduePlans.length })}
+                          </span>
+                        ) : null}
+                        {sourceTab === "system" ? (
+                          <span className="whitespace-nowrap rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">
+                            {t("regularInvest.client.sourceTab.systemHint")}
+                          </span>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                  {sourceTab !== "installment" && (
+                    <label className="flex shrink-0 cursor-pointer select-none items-center gap-1.5 whitespace-nowrap text-xs text-slate-500">
+                      <input type="checkbox" checked={!showEnded} onChange={(e) => setShowEnded(!e.target.checked)} className="h-3.5 w-3.5 accent-blue-600" />
+                      {t("regularInvest.client.hideEnded")}
+                    </label>
+                  )}
+                  {sourceTab === "user" && (
+                    <button
+                      onClick={handleBatchExecuteAll}
+                      disabled={executionBusy}
+                      title={t("regularInvest.client.executeAll.title")}
+                      className="flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${executionBusy && runningExecution?.mode === "all" ? "animate-spin" : ""}`} />{t("regularInvest.client.executeAll.short")}
+                    </button>
+                  )}
+                </div>
+              </div>
             <div className={`${selectedPlan ? "min-h-[240px] flex-1 border-b border-slate-200 bg-[#fbfaf7]" : "min-h-0 flex-1 bg-[#fbfaf7]"}`}>
               {sourceTab === "installment" ? (
                 // 只读：没有行点击、没有操作列 —— 分期的撤销与修改必须回到账单视图/原消费，
@@ -2359,9 +2400,10 @@ export function RegularInvestClient({
                   emptyText={t("regularInvest.client.empty")}
                   onRowClick={(row) => {
                     if (row.kind === "plan") handleSelectPlan(row.plan);
+                    else toggleGroupCollapsed(row.collapseKey);
                   }}
                   rowClassName={(row) => {
-                    if (row.kind === "group") return "bg-slate-50 hover:bg-slate-50";
+                    if (row.kind === "group") return "cursor-pointer bg-slate-50 hover:bg-slate-100";
                     return `cursor-pointer hover:bg-slate-50 ${selectedPlan?.id === row.plan.id ? "bg-blue-50" : ""}`;
                   }}
                   rowActions={(row) => row.kind === "plan" ? renderPlanActions(row.plan) : null}
@@ -2407,7 +2449,14 @@ export function RegularInvestClient({
                         </button>
                       </>
                     )}
-                    <button onClick={() => { setSelectedPlan(null); setPlanRecords([]); setSelectedRecordIds(new Set()); }} className="text-xs text-slate-400 hover:text-slate-600">{t("table.close")}</button>
+                    <button
+                      onClick={() => { setSelectedPlan(null); setPlanRecords([]); setSelectedRecordIds(new Set()); }}
+                      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                      title={t("table.close")}
+                      aria-label={t("table.close")}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-auto">
@@ -2497,6 +2546,10 @@ export function RegularInvestClient({
           id: editPlan.id,
           taskType: getPlanTaskType(editPlan),
           taskInsuranceProductId: editPlan.taskInsuranceProductId ?? null,
+          taskMetalTypeId: editPlan.taskMetalTypeId ?? null,
+          taskMetalTypeName: editPlan.taskMetalTypeName ?? null,
+          taskMetalUnitId: editPlan.taskMetalUnitId ?? null,
+          taskMetalUnitName: editPlan.taskMetalUnitName ?? null,
           taskCategoryId: editPlan.taskCategoryId ?? null,
           taskCategoryName: editPlan.taskCategoryName ?? null,
           taskNote: editPlan.taskNote ?? null,
@@ -2531,6 +2584,7 @@ export function RegularInvestClient({
         editAccountLabel={editPlan ? (editPlan.accountLabel || editPlan.accountName || undefined) : undefined}
         repaymentSchedule={editPlan?.repaymentSchedule ?? null}
         investmentAccounts={investmentAccounts}
+        metalAccounts={metalAccounts}
         cashAccounts={cashAccounts}
         loanAccounts={loanAccounts}
         transferTargetAccounts={transferTargetAccounts}
@@ -2576,8 +2630,16 @@ export function RegularInvestClient({
       {deleteConfirm && (
         <ModalLayer className="fixed inset-0 flex items-center justify-center bg-black/35 p-4">
           <div className="w-full max-w-sm overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg">
-            <div className="border-b border-slate-200 bg-slate-50 px-4 py-3">
+            <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3">
               <div className="text-sm font-semibold text-slate-800">{t("regularInvest.client.deleteDialog.title")}</div>
+              <button
+                onClick={() => setDeleteConfirm(null)}
+                className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
+                title={t("table.close")}
+                aria-label={t("table.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <div className="space-y-3 p-4">
               <div className="text-sm text-slate-700">{t("regularInvest.client.deleteDialog.confirm", { name: deleteConfirm.planName })}</div>
@@ -2591,9 +2653,6 @@ export function RegularInvestClient({
                 <button onClick={() => executeDelete(deleteConfirm.planId, "records")} className="h-9 w-full rounded-md border border-red-200 bg-red-50 text-sm text-red-600 hover:bg-red-100">
                   {t("regularInvest.client.deleteDialog.deleteRecordsOnly")}
                 </button>
-                <button onClick={() => setDeleteConfirm(null)} className="h-9 w-full rounded-md border border-slate-200 bg-white text-sm text-slate-500 hover:bg-slate-50">
-                  {t("common.cancel")}
-                </button>
               </div>
             </div>
           </div>
@@ -2605,7 +2664,14 @@ export function RegularInvestClient({
           <div className="w-full max-w-sm overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg">
             <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3">
               <div className="text-sm font-semibold text-slate-800">{t("regularInvest.client.editDateDialog.title")}</div>
-              <button onClick={() => setEditingRecord(null)} className="h-8 rounded-md border border-slate-200 bg-white px-2 text-sm text-slate-700 hover:bg-slate-50">{t("table.close")}</button>
+              <button
+                onClick={() => setEditingRecord(null)}
+                className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
+                title={t("table.close")}
+                aria-label={t("table.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <div className="space-y-3 p-4">
               <div className="space-y-1">
@@ -2629,7 +2695,6 @@ export function RegularInvestClient({
                 <div className="text-xs text-slate-400">{t("regularInvest.client.editDateDialog.confirmHint")}</div>
               </div>
               <div className="flex justify-end gap-2 pt-1">
-                <button onClick={() => setEditingRecord(null)} className="h-9 rounded-md border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50">{t("common.cancel")}</button>
                 <button onClick={handleSaveRecord} className="h-9 rounded-md bg-blue-600 px-4 text-sm text-white hover:bg-blue-700">{t("common.save")}</button>
               </div>
             </div>

@@ -153,6 +153,7 @@ function summaryRows(payload: HouseholdBackupPayload) {
     { field: "counterparties", value: payload.counts.counterparties },
     { field: "emailAccounts", value: payload.counts.emailAccounts },
     { field: "fundQueryApis", value: payload.counts.fundQueryApis },
+    { field: "stockQuoteApis", value: payload.counts.stockQuoteApis },
     { field: "regularInvestPlans", value: payload.counts.regularInvestPlans },
     { field: "businessTransactions", value: payload.counts.businessTransactions },
     { field: "systemSettings", value: payload.counts.systemSettings },
@@ -1032,6 +1033,22 @@ const SQLITE_PROPERTY_RESTORE_SCHEMA_SQL = [
     CONSTRAINT "property_valuations_householdId_fkey" FOREIGN KEY ("householdId") REFERENCES "Household"("id") ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT "property_valuations_propertyAssetId_fkey" FOREIGN KEY ("propertyAssetId") REFERENCES "property_assets"("id") ON DELETE CASCADE ON UPDATE CASCADE
   )`,
+  `CREATE TABLE IF NOT EXISTS "property_asset_depreciations" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "householdId" TEXT NOT NULL,
+    "propertyAssetId" TEXT NOT NULL,
+    "periodMonth" DATETIME NOT NULL,
+    "amount" DECIMAL NOT NULL,
+    "accumulatedAfter" DECIMAL NOT NULL,
+    "basisCost" DECIMAL NOT NULL,
+    "basisSalvage" DECIMAL NOT NULL,
+    "basisMonths" INTEGER NOT NULL,
+    "method" TEXT NOT NULL DEFAULT 'straight_line',
+    "note" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "property_asset_depreciations_householdId_fkey" FOREIGN KEY ("householdId") REFERENCES "Household"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "property_asset_depreciations_propertyAssetId_fkey" FOREIGN KEY ("propertyAssetId") REFERENCES "property_assets"("id") ON DELETE CASCADE ON UPDATE CASCADE
+  )`,
   `CREATE TABLE IF NOT EXISTS "property_transactions" (
     "id" TEXT NOT NULL PRIMARY KEY,
     "householdId" TEXT NOT NULL,
@@ -1061,6 +1078,8 @@ const SQLITE_PROPERTY_RESTORE_SCHEMA_SQL = [
   `CREATE INDEX IF NOT EXISTS "property_assets_householdId_status_idx" ON "property_assets"("householdId", "status")`,
   `CREATE INDEX IF NOT EXISTS "property_assets_accountId_idx" ON "property_assets"("accountId")`,
   `CREATE INDEX IF NOT EXISTS "property_assets_deletedAt_idx" ON "property_assets"("deletedAt")`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "property_asset_depreciations_propertyAssetId_periodMonth_key" ON "property_asset_depreciations"("propertyAssetId", "periodMonth")`,
+  `CREATE INDEX IF NOT EXISTS "property_asset_depreciations_householdId_periodMonth_idx" ON "property_asset_depreciations"("householdId", "periodMonth")`,
   `CREATE INDEX IF NOT EXISTS "property_valuations_householdId_valuationDate_idx" ON "property_valuations"("householdId", "valuationDate")`,
   `CREATE INDEX IF NOT EXISTS "property_valuations_propertyAssetId_valuationDate_idx" ON "property_valuations"("propertyAssetId", "valuationDate")`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "property_transactions_cashEntryId_key" ON "property_transactions"("cashEntryId") WHERE "cashEntryId" IS NOT NULL`,
@@ -1859,6 +1878,7 @@ export async function buildHouseholdBackupPayload(
     reimbursementSettlements,
     reimbursementSettlementTransactions,
     fundQueryApis,
+    stockQuoteApis,
     statementRecognitionRules,
     importBatches,
     transactions,
@@ -1883,6 +1903,7 @@ export async function buildHouseholdBackupPayload(
     stockFeeRules,
     stockMarketFeeRules,
     propertyAssets,
+    propertyAssetDepreciations,
     propertyValuations,
     propertyTransactions,
     entryBusinessLinks,
@@ -1949,6 +1970,12 @@ export async function buildHouseholdBackupPayload(
         : { householdId },
       orderBy: [{ createdAt: "asc" }],
     }),
+    // 内置的东财 / 腾讯两行 householdId 为 null，由查询侧 ensureDefaultStockQuoteApis 自愈补齐，
+    // 不随快照走：code 唯一，写回时会与目标实例的 seed 行撞键。用户自建的源完整往返。
+    prisma.stockQuoteApi.findMany({
+      where: { householdId },
+      orderBy: [{ priority: "asc" }, { createdAt: "asc" }],
+    }),
     prisma.statementRecognitionRule.findMany({ where: { householdId }, orderBy: [{ priority: "desc" }, { hitCount: "desc" }, { updatedAt: "desc" }] }),
     prisma.importBatch.findMany({ where: { householdId }, orderBy: [{ createdAt: "asc" }] }),
     prisma.txRecord.findMany({ where: { householdId }, orderBy: [{ createdAt: "asc" }] }),
@@ -2010,6 +2037,12 @@ export async function buildHouseholdBackupPayload(
       "propertyAsset",
       { where: { householdId }, orderBy: [{ createdAt: "asc" }] },
       { tableNames: ["property_assets"] },
+    ),
+    optionalPrismaFindMany<Record<string, unknown>>(
+      prisma,
+      "propertyAssetDepreciation",
+      { where: { householdId }, orderBy: [{ periodMonth: "asc" }, { createdAt: "asc" }] },
+      { tableNames: ["property_asset_depreciations"] },
     ),
     optionalPrismaFindMany<Record<string, unknown>>(
       prisma,
@@ -2133,6 +2166,7 @@ export async function buildHouseholdBackupPayload(
       emailAccounts: emailAccounts.length,
       statementMailAutoImports: statementMailAutoImports.length,
       fundQueryApis: fundQueryApis.length,
+      stockQuoteApis: stockQuoteApis.length,
       regularInvestPlans: regularInvestPlans.length,
       businessTransactions:
         fundTransactions.length +
@@ -2198,6 +2232,7 @@ export async function buildHouseholdBackupPayload(
       reimbursementSettlements,
       reimbursementSettlementTransactions,
       fundQueryApis,
+      stockQuoteApis,
       statementRecognitionRules,
       regularInvestPlans,
       importBatches: options.omitImportBatchRawText === false ? importBatches : importBatchesForBackup(importBatches),
@@ -2221,6 +2256,7 @@ export async function buildHouseholdBackupPayload(
       stockFeeRules,
       stockMarketFeeRules,
       propertyAssets,
+      propertyAssetDepreciations,
       propertyValuations,
       propertyTransactions,
       entryBusinessLinks,
@@ -2329,6 +2365,7 @@ async function buildHouseholdBackupWorkbook(payload: HouseholdBackupPayload) {
     ["ReimbursementSettlements", sheetRows(payload.data.reimbursementSettlements)],
     ["ReimbursementSettlementTransactions", sheetRows(payload.data.reimbursementSettlementTransactions)],
     ["FundQueryApis", sheetRows(payload.data.fundQueryApis)],
+    ["StockQuoteApis", sheetRows(payload.data.stockQuoteApis)],
     ["StatementRecognitionRules", sheetRows(payload.data.statementRecognitionRules)],
     ["RegularInvestPlans", sheetRows(payload.data.regularInvestPlans)],
     ["ImportBatches", sheetRows(payload.data.importBatches)],
@@ -2350,6 +2387,7 @@ async function buildHouseholdBackupWorkbook(payload: HouseholdBackupPayload) {
     ["StockFeeRules", sheetRows(payload.data.stockFeeRules)],
     ["StockMarketFeeRules", sheetRows(payload.data.stockMarketFeeRules)],
     ["PropertyAssets", sheetRows(payload.data.propertyAssets)],
+    ["PropertyAssetDepreciations", sheetRows(payload.data.propertyAssetDepreciations)],
     ["PropertyValuations", sheetRows(payload.data.propertyValuations)],
     ["PropertyTransactions", sheetRows(payload.data.propertyTransactions)],
     ["EntryBusinessLinks", sheetRows(payload.data.entryBusinessLinks)],
@@ -2430,6 +2468,7 @@ export async function buildHouseholdTableExportWorkbook(payload: HouseholdBackup
     ["ReimbursementSettlements", sheetRows(payload.data.reimbursementSettlements)],
     ["ReimbursementSettlementTransactions", sheetRows(payload.data.reimbursementSettlementTransactions)],
     ["FundQueryApis", sheetRows(payload.data.fundQueryApis)],
+    ["StockQuoteApis", sheetRows(payload.data.stockQuoteApis)],
     ["StatementRecognitionRules", sheetRows(payload.data.statementRecognitionRules)],
     ["RegularInvestPlans", sheetRows(tableRegularInvestPlans)],
     ["ImportBatches", sheetRows(payload.data.importBatches)],
@@ -2451,6 +2490,7 @@ export async function buildHouseholdTableExportWorkbook(payload: HouseholdBackup
     ["StockFeeRules", sheetRows(payload.data.stockFeeRules)],
     ["StockMarketFeeRules", sheetRows(payload.data.stockMarketFeeRules)],
     ["PropertyAssets", sheetRows(payload.data.propertyAssets)],
+    ["PropertyAssetDepreciations", sheetRows(payload.data.propertyAssetDepreciations)],
     ["PropertyValuations", sheetRows(payload.data.propertyValuations)],
     ["PropertyTransactions", sheetRows(payload.data.propertyTransactions)],
     ["EntryBusinessLinks", sheetRows(payload.data.entryBusinessLinks)],
@@ -2679,6 +2719,7 @@ export function parseBackupPayload(raw: unknown) {
         "data.reimbursementSettlementTransactions",
       ),
       fundQueryApis: ensureArray(data.fundQueryApis ?? [], "data.fundQueryApis"),
+      stockQuoteApis: ensureArray(data.stockQuoteApis ?? [], "data.stockQuoteApis"),
       statementRecognitionRules: ensureArray(data.statementRecognitionRules ?? [], "data.statementRecognitionRules"),
       statementCategoryRules: ensureArray(data.statementCategoryRules ?? [], "data.statementCategoryRules"),
       regularInvestPlans: ensureArray(data.regularInvestPlans ?? [], "data.regularInvestPlans"),
@@ -2701,6 +2742,7 @@ export function parseBackupPayload(raw: unknown) {
       stockFeeRules: ensureArray(data.stockFeeRules ?? [], "data.stockFeeRules"),
       stockMarketFeeRules: ensureArray(data.stockMarketFeeRules ?? [], "data.stockMarketFeeRules"),
       propertyAssets: ensureArray(data.propertyAssets ?? [], "data.propertyAssets"),
+      propertyAssetDepreciations: ensureArray(data.propertyAssetDepreciations ?? [], "data.propertyAssetDepreciations"),
       propertyValuations: ensureArray(data.propertyValuations ?? [], "data.propertyValuations"),
       propertyTransactions: ensureArray(data.propertyTransactions ?? [], "data.propertyTransactions"),
       entryBusinessLinks: ensureArray(data.entryBusinessLinks ?? [], "data.entryBusinessLinks"),
@@ -2864,6 +2906,7 @@ async function restoreSingleHouseholdBackup(
   ));
   const backupContainsPropertyData =
     data.propertyAssets.length > 0 ||
+    data.propertyAssetDepreciations.length > 0 ||
     data.propertyValuations.length > 0 ||
     data.propertyTransactions.length > 0;
   const backupContainsStockData =
@@ -2891,6 +2934,7 @@ async function restoreSingleHouseholdBackup(
     const currentUserIds = currentUsers.map((item) => item.id);
     const currentAccountIds = currentAccounts.map((item) => item.id);
     const propertyAssetDelegate = getOptionalPrismaDelegate<OptionalPrismaRestoreDelegate>(tx, "propertyAsset");
+    const propertyAssetDepreciationDelegate = getOptionalPrismaDelegate<OptionalPrismaRestoreDelegate>(tx, "propertyAssetDepreciation");
     const propertyValuationDelegate = getOptionalPrismaDelegate<OptionalPrismaRestoreDelegate>(tx, "propertyValuation");
     const propertyTransactionDelegate = getOptionalPrismaDelegate<OptionalPrismaRestoreDelegate>(tx, "propertyTransaction");
 
@@ -2943,6 +2987,12 @@ async function restoreSingleHouseholdBackup(
       { where: { householdId } },
       { tableNames: ["property_valuations"] },
     );
+    const propertyAssetDepreciationsDeleted = await optionalPrismaDeleteMany(
+      tx,
+      "propertyAssetDepreciation",
+      { where: { householdId } },
+      { tableNames: ["property_asset_depreciations"] },
+    );
     const propertyAssetsDeleted = await optionalPrismaDeleteMany(
       tx,
       "propertyAsset",
@@ -2951,7 +3001,10 @@ async function restoreSingleHouseholdBackup(
     );
     if (
       backupContainsPropertyData &&
-      (!propertyTransactionsDeleted || !propertyValuationsDeleted || !propertyAssetsDeleted)
+      (!propertyTransactionsDeleted ||
+        !propertyValuationsDeleted ||
+        !propertyAssetDepreciationsDeleted ||
+        !propertyAssetsDeleted)
     ) {
       restoreError("当前系统版本不支持房产数据，请先更新并完成数据库迁移后再恢复。");
     }
@@ -3064,6 +3117,8 @@ async function restoreSingleHouseholdBackup(
     } else {
       await tx.fundQueryApi.deleteMany({ where: { householdId } });
     }
+    // 只清 household 自建的行情源；内置两行（householdId=null）留给 ensureDefaultStockQuoteApis 自愈。
+    await tx.stockQuoteApi.deleteMany({ where: { householdId } });
     await tx.preciousMetalType.deleteMany({ where: { householdId } });
     await tx.preciousMetalUnit.deleteMany({ where: { householdId } });
     await tx.fxRate.deleteMany({ where: { householdId } });
@@ -3499,6 +3554,27 @@ async function restoreSingleHouseholdBackup(
       });
     }
 
+    if (data.stockQuoteApis.length > 0) {
+      await tx.stockQuoteApi.createMany({
+        data: data.stockQuoteApis.map((item) => ({
+          id: String(item.id),
+          name: String(item.name ?? ""),
+          code: String(item.code ?? ""),
+          market: String(item.market ?? "CN"),
+          baseUrl: String(item.baseUrl ?? ""),
+          apiKey: item.apiKey == null ? null : String(item.apiKey),
+          parser: item.parser == null ? null : String(item.parser),
+          parserConfig: item.parserConfig ?? undefined,
+          priority: Number(item.priority ?? 0),
+          isActive: item.isActive == null ? true : Boolean(item.isActive),
+          builtin: Boolean(item.builtin),
+          householdId,
+          createdAt: item.createdAt ? new Date(String(item.createdAt)) : new Date(),
+          updatedAt: item.updatedAt ? new Date(String(item.updatedAt)) : new Date(),
+        })),
+      });
+    }
+
     if (data.preciousMetalTypes.length > 0) {
       await createManySkipDuplicatesCompat(
         tx.preciousMetalType,
@@ -3591,6 +3667,13 @@ async function restoreSingleHouseholdBackup(
           numberMasked: item.numberMasked == null ? null : String(item.numberMasked),
           routeKey: item.routeKey == null ? null : String(item.routeKey),
           note: item.note == null ? null : String(item.note),
+          // 账户自定义分组标签（2026-11-13）：不显式恢复会静默落回 null，
+          // 恢复后侧边栏/下拉的分组全变「未分组」。
+          accountGroup: item.accountGroup == null ? null : String(item.accountGroup),
+          // 电子钱包 → 货币基金支付关联（2026-11-18）：漏写会让恢复后的钱包
+          // 丢失关联，支出弹窗不再出现「从关联货基支付」选项。
+          linkedFundAccountId: item.linkedFundAccountId == null ? null : String(item.linkedFundAccountId),
+          linkedFundCode: item.linkedFundCode == null ? null : String(item.linkedFundCode),
           usageCount: Number(item.usageCount ?? 0),
           lastUsedAt: item.lastUsedAt == null ? null : new Date(String(item.lastUsedAt)),
           householdId,
@@ -3954,6 +4037,26 @@ async function restoreSingleHouseholdBackup(
             status: item.status == null ? "active" : String(item.status),
           })),
         new Set(["purchaseDate", "latestValuationDate", "deletedAt"]),
+      );
+    }
+
+    if (propertyAssetDepreciationDelegate) {
+      await createManyRecords(
+        propertyAssetDepreciationDelegate,
+        data.propertyAssetDepreciations
+          .filter((item) => importedPropertyAssets.has(String(item.propertyAssetId)))
+          .map((item) => ({
+            ...item,
+            householdId,
+            propertyAssetId: String(item.propertyAssetId),
+            amount: item.amount == null ? "0" : String(item.amount),
+            accumulatedAfter: item.accumulatedAfter == null ? "0" : String(item.accumulatedAfter),
+            basisCost: item.basisCost == null ? "0" : String(item.basisCost),
+            basisSalvage: item.basisSalvage == null ? "0" : String(item.basisSalvage),
+            basisMonths: Number(item.basisMonths ?? 0),
+            method: item.method == null ? "straight_line" : String(item.method),
+          })),
+        new Set(["periodMonth"]),
       );
     }
 

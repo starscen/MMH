@@ -20,6 +20,34 @@ import {
 } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 
+/**
+ * 控件高度阶梯的唯一来源是 `globals.css` 的 `--field-h`（= 字号 × 18/7，14px 字号下 36px）。
+ * 下拉的行高、估算高度必须跟触发器/输入框共用同一把尺子，所以这里把变量读回像素值。
+ * SSR 与首帧先按 36px 走（默认字号下与真实值相等，不会闪），量到真实值后校正。
+ */
+let fieldHeightPxCache = 0;
+
+/** 自定义属性的 computed value 是不求值的 token 流（读出来是 `calc(0.875rem * 18 / 7)`），
+ *  所以挂一个隐形探针让布局系统算成 px，而不是自己手写 calc 解析。整页量一次即可。 */
+function measureFieldHeightPx(): number {
+  if (fieldHeightPxCache > 0) return fieldHeightPxCache;
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:absolute;left:-9999px;top:0;width:0;height:var(--field-h);visibility:hidden;pointer-events:none";
+  document.body.appendChild(probe);
+  const resolved = probe.getBoundingClientRect().height;
+  probe.remove();
+  if (resolved > 0) fieldHeightPxCache = resolved;
+  return fieldHeightPxCache || 36;
+}
+
+function useFieldHeightPx() {
+  const [height, setHeight] = useState(36);
+  useEffect(() => {
+    setHeight(measureFieldHeightPx());
+  }, []);
+  return height;
+}
+
 export type SmartSelectOption = {
   /** Selectable option IDs should be real entity IDs. Use synthetic IDs only for non-selectable headers/groups. */
   id: string;
@@ -104,6 +132,12 @@ type SmartSelectSharedBehavior = {
   hierarchy?: HierarchyBehavior;
   collapsibleGroups?: boolean;
   initialCollapsedAll?: boolean;
+  /**
+   * 默认收起的分组 id（组头 id）。`initialCollapsedAll` 是「所有组都收起」的粗暴版，
+   * 这里只收起指定组——「当前持仓展开、已清仓收起」这类历史组用它，不必让整份列表都折起来。
+   * 选中的选项所在分组会自动展开，所以收起的组不会藏住当前值。
+   */
+  defaultCollapsedGroupIds?: string[];
   accordionGroups?: boolean;
   groupSelectOnDoubleClick?: boolean;
   expandOnGroupSelect?: boolean;
@@ -290,12 +324,14 @@ function initialCollapsedGroups(
   selectedValue: string,
   enabled: boolean,
   collapseAll = false,
+  defaultCollapsedIds?: Set<string>,
 ) {
   const collapsed = new Set<string>();
   if (!enabled) return collapsed;
 
   for (const option of options) {
     if (option.isGroup || (collapseAll && option.isHeader)) collapsed.add(option.id);
+    else if (option.isHeader && defaultCollapsedIds?.has(option.id)) collapsed.add(option.id);
   }
 
   if (!selectedValue) return collapsed;
@@ -417,6 +453,7 @@ function normalizeSingleBehavior(props: SingleModeProps, options: SmartSelectOpt
     clearable: behavior?.clearable ?? true,
     cycleSelectionWithArrowKeys: behavior?.cycleSelectionWithArrowKeys ?? true,
     initialCollapsedAll: behavior?.initialCollapsedAll ?? false,
+    defaultCollapsedGroupIds: behavior?.defaultCollapsedGroupIds,
     accordionGroups: behavior?.accordionGroups ?? false,
     groupSelectOnDoubleClick: behavior?.groupSelectOnDoubleClick ?? false,
     expandOnGroupSelect: behavior?.expandOnGroupSelect ?? false,
@@ -457,6 +494,7 @@ function normalizeMultiBehavior(props: MultiModeProps, options: SmartSelectOptio
     clearable: false,
     cycleSelectionWithArrowKeys: false,
     initialCollapsedAll: behavior?.initialCollapsedAll ?? false,
+    defaultCollapsedGroupIds: behavior?.defaultCollapsedGroupIds,
     accordionGroups: behavior?.accordionGroups ?? false,
     groupSelectOnDoubleClick: behavior?.groupSelectOnDoubleClick ?? false,
     expandOnGroupSelect: behavior?.expandOnGroupSelect ?? false,
@@ -512,6 +550,7 @@ export function SmartSelect(props: SmartSelectProps) {
     clearable,
     cycleSelectionWithArrowKeys,
     initialCollapsedAll,
+    defaultCollapsedGroupIds,
     accordionGroups,
     groupSelectOnDoubleClick,
     expandOnGroupSelect,
@@ -534,13 +573,28 @@ export function SmartSelect(props: SmartSelectProps) {
   const micro = density === "micro";
   const dense = density === "dense" || micro;
   const compact = density === "compact" || dense;
-  const rowHeight = micro ? 16 : dense ? 26 : compact ? 30 : 36;
+  // 行高 / 触发框 / 输入框共用同一把尺子：`--field-h`（字号 × 18/7）与它的档位差
+  // （字号 × 2/7 = 4px）。紧凑档逐级递减 4px，正好落在旧阶梯 36/32/28/20 上。
+  const fieldHeight = useFieldHeightPx();
+  const fieldStep = fieldHeight / 9;
+  const rowHeight = micro
+    ? fieldHeight - fieldStep * 4
+    : dense
+      ? fieldHeight - fieldStep * 2
+      : compact
+        ? fieldHeight - fieldStep
+        : fieldHeight;
   const headerHeight = micro ? 24 : dense ? 30 : compact ? 34 : 42;
   const singleGridColumns = mode === "single" && expandedGroupColumns
     ? Math.max(2, Math.min(6, Math.floor(expandedGroupColumns)))
     : undefined;
   const fullGridRowStyle = singleGridColumns ? { gridColumn: "1 / -1" } : undefined;
-  const resolvedDropdownMaxHeight = dropdownMaxHeight ?? (compact ? 320 : 360);
+  // 栅格（按 expandedGroupColumns 横排）里的格子跟着 density 收高度，横向间距保持 p-1/gap-x-1，
+  // 纵向行距更紧一点，否则 12 个月排三列时整块太松散。
+  const gridCellClass = micro ? "h-[var(--field-h-tight)] text-[11px]" : dense ? "h-[var(--field-h-micro)] text-xs" : compact ? "h-[var(--field-h-dense)] text-xs" : "h-[var(--field-h-compact)] text-sm";
+  // 下拉最高 10 行（36px 行高 → 360px，32px 紧凑行 → 320px）：跟行高一起随字号收放，
+  // 不再写死 320/360 这两个只对默认字号成立的数字。
+  const resolvedDropdownMaxHeight = dropdownMaxHeight ?? rowHeight * 10;
 
   const isSingleCreateButton = mode === "single" && create?.type === "button" ? create : undefined;
   const isMultiInlineCreate = mode === "multi" && create?.type === "inline" ? create : undefined;
@@ -720,12 +774,17 @@ export function SmartSelect(props: SmartSelectProps) {
     setDropdownPos({ top, bottom, left, width, minWidth: width, maxHeight });
   }, [dense, effectiveOptions, fitContent, footerActionHeight, headerHeight, isMultiInlineCreate, isSingleCreateButton, maxDropdownWidth, minDropdownWidth, quickPickHeight, resizableDropdown, resolvedDropdownMaxHeight, rowHeight, search, searchable, singleGridColumns, visible.length]);
 
+  // 调用点常把 behavior 写成内联字面量，数组每次渲染都是新引用；用字符串键做依赖，
+  // 免得 openDropdown 每帧重建、把 autoOpen 的 effect 拖成反复执行。
+  const defaultCollapsedGroupKey = (defaultCollapsedGroupIds ?? []).join("\u0001");
+
   const openDropdown = useCallback((preferredIndex?: "first" | "last") => {
     const nextCollapsed = initialCollapsedGroups(
       effectiveOptions,
       mode === "single" ? value : "",
       hierarchy && collapsibleGroups,
       initialCollapsedAll,
+      defaultCollapsedGroupKey ? new Set(defaultCollapsedGroupKey.split("\u0001")) : undefined,
     );
     const nextFiltered = searchable
       ? (hierarchy ? filterWithGroups(effectiveOptions, "") : filterFlatOptions(effectiveOptions, ""))
@@ -738,7 +797,7 @@ export function SmartSelect(props: SmartSelectProps) {
     setOpen(true);
     setFocusedIndex(findInitialFocusedIndex(nextVisible, mode, value, preferredIndex));
     window.requestAnimationFrame(() => calcPosition());
-  }, [calcPosition, collapsibleGroups, effectiveOptions, hierarchy, initialCollapsedAll, mode, searchable, value]);
+  }, [calcPosition, collapsibleGroups, defaultCollapsedGroupKey, effectiveOptions, hierarchy, initialCollapsedAll, mode, searchable, value]);
 
   useEffect(() => {
     if (!autoOpen) {
@@ -1091,7 +1150,7 @@ export function SmartSelect(props: SmartSelectProps) {
         className={
           capsuleLayout
             ? "flex h-8 min-w-0 items-center gap-1 text-center text-xs outline-none"
-            : `flex ${micro ? "h-5 px-1.5 text-[11px]" : dense ? "h-7 px-2 text-xs" : compact ? "h-8 px-2 text-xs" : "h-9 px-3 text-sm"} w-full items-center gap-1.5 text-left transition-colors ${
+            : `flex ${micro ? "h-[var(--field-h-tight)] px-1.5 text-[11px]" : dense ? "h-[var(--field-h-dense)] px-2 text-xs" : compact ? "h-[var(--field-h-compact)] px-2 text-xs" : "h-[var(--field-h)] px-3 text-sm"} w-full items-center gap-1.5 text-left transition-colors ${
                 focused ? "bg-blue-50" : ""
               } ${selected ? "font-medium text-blue-700" : "text-slate-700"}`
         }
@@ -1152,10 +1211,10 @@ export function SmartSelect(props: SmartSelectProps) {
                 index === focusedIndex ? "border-blue-200 bg-blue-50" : "border-slate-200/70 bg-slate-50 hover:border-slate-300 hover:bg-slate-100"
               } ${selected ? "border-blue-200 bg-blue-50 font-medium text-blue-700" : "text-slate-700"}`
             : singleGridColumns
-              ? `flex h-8 min-w-0 items-center justify-center rounded-md px-2 text-center text-xs transition-colors ${
+              ? `flex ${gridCellClass} min-w-0 items-center justify-center rounded-md px-2 text-center transition-colors ${
                   index === focusedIndex ? "bg-blue-50" : "hover:bg-slate-50"
                 } ${selected ? "bg-blue-50 font-medium text-blue-700" : "text-slate-700"}`
-              : `flex ${micro ? "h-5 px-1.5 text-[11px]" : dense ? "h-7 px-2 text-xs" : compact ? "h-8 px-2 text-xs" : "h-9 px-3 text-sm"} w-full items-center gap-1.5 text-left transition-colors ${
+              : `flex ${micro ? "h-[var(--field-h-tight)] px-1.5 text-[11px]" : dense ? "h-[var(--field-h-dense)] px-2 text-xs" : compact ? "h-[var(--field-h-compact)] px-2 text-xs" : "h-[var(--field-h)] px-3 text-sm"} w-full items-center gap-1.5 text-left transition-colors ${
                   index === focusedIndex ? "bg-blue-50" : ""
                 } ${selected ? "font-medium text-blue-700" : "text-slate-700"}`
         }
@@ -1175,7 +1234,7 @@ export function SmartSelect(props: SmartSelectProps) {
       <div
         key={option.id}
         style={fullGridRowStyle}
-        className={`flex ${micro ? "h-4 px-1.5" : dense ? "h-6 px-2" : compact ? "h-7 px-2" : "h-8 px-3"} w-full items-center justify-between text-xs font-medium transition-colors ${
+        className={`flex ${micro ? "h-[var(--field-h-mini)] px-1.5" : dense ? "h-[var(--field-h-micro)] px-2" : compact ? "h-[var(--field-h-dense)] px-2" : "h-[var(--field-h-compact)] px-3"} w-full items-center justify-between text-xs font-medium transition-colors ${
           index === focusedIndex ? "bg-blue-50 text-blue-700" : "hover:bg-slate-50"
         }`}
         onMouseEnter={() => setFocusedIndex(index)}
@@ -1407,7 +1466,7 @@ export function SmartSelect(props: SmartSelectProps) {
             ref={listRef}
             id={listId}
             role="listbox"
-            className={`min-h-0 flex-1 overflow-y-auto ${singleGridColumns ? "grid content-start gap-1 p-1" : ""}`}
+            className={`min-h-0 flex-1 overflow-y-auto ${singleGridColumns ? "grid content-start gap-x-1 gap-y-0.5 p-1" : ""}`}
             style={{
               maxHeight: resizableDropdown ? undefined : resolvedDropdownMaxHeight,
               ...(singleGridColumns ? { gridTemplateColumns: `repeat(${singleGridColumns}, minmax(0, 1fr))` } : {}),
@@ -1420,7 +1479,7 @@ export function SmartSelect(props: SmartSelectProps) {
                   <div
                     key={option.id}
                     style={fullGridRowStyle}
-                    className={`flex ${micro ? "h-4 px-1.5" : dense ? "h-6 px-2" : compact ? "h-7 px-2" : "h-8 px-3"} w-full items-center justify-between text-xs font-medium transition-colors ${
+                    className={`flex ${micro ? "h-[var(--field-h-mini)] px-1.5" : dense ? "h-[var(--field-h-micro)] px-2" : compact ? "h-[var(--field-h-dense)] px-2" : "h-[var(--field-h-compact)] px-3"} w-full items-center justify-between text-xs font-medium transition-colors ${
                       index === focusedIndex ? "bg-blue-50 text-blue-700" : "hover:bg-slate-50"
                     }`}
                     onMouseEnter={() => setFocusedIndex(index)}
@@ -1464,10 +1523,10 @@ export function SmartSelect(props: SmartSelectProps) {
                   onClick={() => selectSingle(option.id)}
                   onMouseEnter={() => setFocusedIndex(index)}
                   className={singleGridColumns
-                    ? `flex h-8 min-w-0 items-center justify-center rounded-md px-2 text-center text-xs transition-colors ${
+                    ? `flex ${gridCellClass} min-w-0 items-center justify-center rounded-md px-2 text-center transition-colors ${
                         index === focusedIndex ? "bg-blue-50" : "hover:bg-slate-50"
                       } ${selected ? "bg-blue-50 font-medium text-blue-700" : "text-slate-700"}`
-                    : `flex ${micro ? "h-5 px-1.5 text-[11px]" : dense ? "h-7 px-2 text-xs" : compact ? "h-8 px-2 text-xs" : "h-9 px-3 text-sm"} w-full items-center gap-1.5 text-left transition-colors ${
+                    : `flex ${micro ? "h-[var(--field-h-tight)] px-1.5 text-[11px]" : dense ? "h-[var(--field-h-dense)] px-2 text-xs" : compact ? "h-[var(--field-h-compact)] px-2 text-xs" : "h-[var(--field-h)] px-3 text-sm"} w-full items-center gap-1.5 text-left transition-colors ${
                         index === focusedIndex ? "bg-blue-50" : ""
                       } ${selected ? "font-medium text-blue-700" : "text-slate-700"}`}
                 >
@@ -1563,9 +1622,11 @@ export function SmartSelect(props: SmartSelectProps) {
                       setShowNew(false);
                       setNewName("");
                     }}
-                    className="secondary-button h-8 w-8 px-0 text-slate-400"
+                    className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0 text-slate-400"
+                    title={t("common.close")}
+                    aria-label={t("common.close")}
                   >
-                    <X className="h-3.5 w-3.5" />
+                    <X className="h-4 w-4 shrink-0" />
                   </button>
                 </div>
                 <div className="flex gap-1.5">
@@ -1602,7 +1663,7 @@ export function SmartSelect(props: SmartSelectProps) {
                   role="option"
                   aria-selected={checked}
                   onMouseEnter={() => setFocusedIndex(index)}
-                  className={`flex ${micro ? "h-5 px-1.5 text-[11px]" : dense ? "h-7 px-2 text-xs" : compact ? "h-8 px-2 text-xs" : "h-9 px-3 text-sm"} w-full items-center gap-2 text-left transition-colors cursor-pointer ${
+                  className={`flex ${micro ? "h-[var(--field-h-tight)] px-1.5 text-[11px]" : dense ? "h-[var(--field-h-dense)] px-2 text-xs" : compact ? "h-[var(--field-h-compact)] px-2 text-xs" : "h-[var(--field-h)] px-3 text-sm"} w-full items-center gap-2 text-left transition-colors cursor-pointer ${
                     index === focusedIndex ? "bg-blue-50" : ""
                   } ${checked ? "font-medium" : ""}`}
                   onClick={() => selectMultiOnly(option.id)}
@@ -1658,7 +1719,7 @@ export function SmartSelect(props: SmartSelectProps) {
         aria-expanded={open}
         aria-haspopup="listbox"
         aria-activedescendant={open && focusedIndex >= 0 ? `${listId}-${focusedIndex}` : undefined}
-        className={`flex ${micro ? "h-6 rounded-[7px] px-1.5 text-[11px]" : dense ? "h-7 rounded-[8px] px-2 text-xs" : compact ? "h-8 rounded-[8px] px-2 text-xs" : "h-9 smart-select-trigger rounded-[10px] px-3 text-sm"} w-full items-center justify-between border border-slate-300/70 bg-surface-white outline-none transition-colors hover:border-slate-400/60 focus-visible:border-blue-400 focus-visible:ring-2 focus-visible:ring-blue-100`}
+        className={`flex ${micro ? "h-[var(--field-h-micro)] rounded-[7px] px-1.5 text-[11px]" : dense ? "h-[var(--field-h-dense)] rounded-[8px] px-2 text-xs" : compact ? "h-[var(--field-h-compact)] rounded-[8px] px-2 text-xs" : "h-[var(--field-h)] smart-select-trigger rounded-[10px] px-3 text-sm"} w-full items-center justify-between border border-slate-300/70 bg-surface-white outline-none transition-colors hover:border-slate-400/60 focus-visible:border-blue-400 focus-visible:ring-2 focus-visible:ring-blue-100`}
       >
         {mode === "single" ? (
           <span className={`${selectedLabel ? "text-slate-800" : "text-slate-400"} flex min-w-0 flex-1 items-center`} title={selectedTitle}>
@@ -1685,7 +1746,7 @@ export function SmartSelect(props: SmartSelectProps) {
               className="text-slate-300 transition-colors hover:text-slate-500"
               tabIndex={-1}
             >
-              <X className="h-3.5 w-3.5" />
+              <X className="h-3.5 w-3.5 shrink-0" />
             </button>
             <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
           </span>

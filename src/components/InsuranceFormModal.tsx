@@ -4,8 +4,9 @@ import { ModalLayer } from "@/components/ModalLayer";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 /** 记账弹窗整窗外壳：宽度/标题栏/表单/FT 页签卡片/固定页脚/高度锁定统一由它负责。 */
 import { EntryModalShell } from "@/components/EntryModalShell";
+import { EntryConvertHeaderAction } from "@/components/EntryConvertHeaderAction";
 
-import { Repeat } from "lucide-react";
+import { Repeat, X } from "lucide-react";
 import { DateStepper } from "./DateStepper";
 import { CalcInput } from "./CalcInput";
 import { ClearableNoteField } from "./ClearableNoteField";
@@ -16,6 +17,7 @@ import { kindLabel } from "@/lib/account-kinds";
 import { buildAccountDisplayOption } from "@/lib/account-display";
 import { formatAmountDraft, formatMoneyLoose as formatMoney } from "@/lib/format";
 import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
+import { isEntryConversionRequest } from "@/lib/client/entry-conversion";
 import { fetchSettingsAccountData } from "@/lib/client/settingsCache";
 import { useSettingsDataVersion } from "@/lib/client/use-settings-data-version";
 import { useI18n } from "@/lib/i18n";
@@ -226,7 +228,8 @@ function mapInsuranceProduct(item: Record<string, unknown>, t: (key: string) => 
   return {
     id: valueFromRecord(item, "id"),
     label: valueFromRecord(item, "name"),
-    subLabel: [valueFromRecord(item, "institutionShortName") || valueFromRecord(item, "institutionName"), productTypeLabel(t, nullableStringFromRecord(item, "productType"))].filter(Boolean).join(" · "),
+    // 产品的机构信息是独立主体 → 全称（账户标签里才用简称）。
+    subLabel: [valueFromRecord(item, "institutionName") || valueFromRecord(item, "institutionShortName"), productTypeLabel(t, nullableStringFromRecord(item, "productType"))].filter(Boolean).join(" · "),
     productMasterId: nullableStringFromRecord(item, "productMasterId"),
     accountId: valueFromRecord(item, "accountId"),
     accountLabel: valueFromRecord(item, "accountName"),
@@ -267,7 +270,8 @@ function mapInsuranceProductMaster(item: Record<string, unknown>, t: (key: strin
     isMaster: true,
     productMasterId: id,
     label: valueFromRecord(item, "name"),
-    subLabel: [valueFromRecord(item, "institutionShortName") || valueFromRecord(item, "institutionName"), productTypeLabel(t, nullableStringFromRecord(item, "productType"))].filter(Boolean).join(" · "),
+    // 产品的机构信息是独立主体 → 全称（账户标签里才用简称）。
+    subLabel: [valueFromRecord(item, "institutionName") || valueFromRecord(item, "institutionShortName"), productTypeLabel(t, nullableStringFromRecord(item, "productType"))].filter(Boolean).join(" · "),
     accountId: "",
     institutionId: nullableStringFromRecord(item, "institutionId"),
     institutionName: nullableStringFromRecord(item, "institutionName"),
@@ -316,6 +320,8 @@ export function InsuranceFormModal({
   const [cashAccountId, setCashAccountId] = useState(initCashAccountId);
   const [memo, setMemo] = useState(initMemo);
   const [requestId, setRequestId] = useState<string | null>(null);
+  /** 本次新建来自「转换交易」：保存后要删原记录，因此不提供「保存并再记一笔」。 */
+  const [conversionEntry, setConversionEntry] = useState(false);
   const [editEntryId, setEditEntryId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -593,15 +599,25 @@ export function InsuranceFormModal({
       }));
   }, [insuranceProductOptions, selectedOwnerGroupId, subtype]);
 
-  function resetForm(defaults?: { requestId?: string | null; defaultCashAccountId?: string; defaultInsuranceAccountId?: string }) {
-    setSubtype("buy");
-    setDate(today);
-    setArrivalDate(today);
+  function resetForm(defaults?: {
+    requestId?: string | null;
+    defaultSubtype?: string;
+    defaultCashAccountId?: string;
+    defaultInsuranceAccountId?: string;
+    defaultDate?: string;
+    defaultAmount?: string;
+  }) {
+    const presetDate = defaults?.defaultDate && /^\d{4}-\d{2}-\d{2}$/.test(defaults.defaultDate) ? defaults.defaultDate : today;
+    // 转换「流入交易」：同一笔钱进来对应的是退保页签，不是缴费。
+    setSubtype(defaults?.defaultSubtype === "redeem" ? "redeem" : "buy");
+    setDate(presetDate);
+    setArrivalDate(presetDate);
     arrivalDateTouchedRef.current = false;
-    setAmount("");
+    setAmount(defaults?.defaultAmount ?? "");
     setCashAccountId(defaults?.defaultCashAccountId ?? "");
     setMemo("");
     setRequestId(defaults?.requestId ?? null);
+    setConversionEntry(isEntryConversionRequest(defaults?.requestId));
     setEditEntryId(null);
     setInsuranceProductId("");
     setProductType("savings");
@@ -630,6 +646,7 @@ export function InsuranceFormModal({
     setPolicyNo("");
     setMemo("");
     setRequestId(null);
+    setConversionEntry(false);
   }
 
   useEffect(() => setCashAccountList(cashAccounts), [cashAccounts]);
@@ -669,10 +686,11 @@ export function InsuranceFormModal({
           }));
         const nextInstitutions = institutions
           .filter((item) => item.type === "insurance")
+          // 机构下拉展示全称；简称只用于账户标签，不再作为副标签重复。
           .map((item) => ({
             id: item.id,
             label: item.name,
-            subLabel: item.shortName && item.shortName !== item.name ? item.shortName : t("institution.type.insurance"),
+            subLabel: t("institution.type.insurance"),
           }));
         setFamilyMemberOptions(nextFamilyMembers);
         setInstitutionOptions(nextInstitutions);
@@ -756,11 +774,23 @@ export function InsuranceFormModal({
 
   useEffect(() => {
     function onCreate(ev: Event) {
-      const detail = (ev as CustomEvent<{ requestId: string; defaultCashAccountId?: string; defaultInsuranceAccountId?: string }>).detail;
+      const detail = (ev as CustomEvent<{
+        requestId: string;
+        defaultSubtype?: string;
+        defaultCashAccountId?: string;
+        defaultInsuranceAccountId?: string;
+        defaultDate?: string;
+        defaultAmount?: number | string;
+      }>).detail;
       resetForm({
         requestId: detail?.requestId ?? null,
+        defaultSubtype: detail?.defaultSubtype,
         defaultCashAccountId: detail?.defaultCashAccountId,
         defaultInsuranceAccountId: detail?.defaultInsuranceAccountId ?? defaultAccountId,
+        defaultDate: detail?.defaultDate,
+        defaultAmount: detail?.defaultAmount != null && Number(detail.defaultAmount) > 0
+          ? formatAmountDraft(Number(detail.defaultAmount))
+          : undefined,
       });
       setOpen(true);
     }
@@ -846,6 +876,9 @@ export function InsuranceFormModal({
 
       if (isEdit) {
         window.dispatchEvent(new CustomEvent("mmh:insurance:edit:success", { detail: { requestId } }));
+      } else if (requestId) {
+        // 「转换交易」靠 requestId 把这次新建和原记录串起来（见 lib/client/entry-conversion.ts）。
+        window.dispatchEvent(new CustomEvent("mmh:insurance:create:success", { detail: { requestId } }));
       }
       if (keepAdding && !isEdit) {
         resetAfterKeepAdding();
@@ -913,6 +946,25 @@ export function InsuranceFormModal({
           setOpen(false);
           if (mode === "create") resetForm();
         }}
+        headerExtra={(
+          <EntryConvertHeaderAction
+            source={isEditingRecord ? {
+              entryId: editEntryId ?? entry?.id ?? null,
+              type: "insurance",
+              date,
+              amount,
+              note: memo,
+              accountId: cashAccountId,
+              cashAccountId,
+              // 退保是钱进来、缴费是钱出去：转换菜单只列同向目标。
+              inflow: subtype === "redeem",
+            } : null}
+            onBeforeConvert={() => {
+              setOpen(false);
+              resetForm();
+            }}
+          />
+        )}
         onSubmit={onSubmit}
         tabs={[
           { id: "buy", label: t("insuranceFormModal.buy") },
@@ -929,7 +981,7 @@ export function InsuranceFormModal({
         }}
         footer={(
           <>
-            {!isEditingRecord ? (
+            {!isEditingRecord && !conversionEntry ? (
               <button
                 type="button"
                 onClick={() => { void submitInsurance({ createPremiumPlan: false, backfillPastRecords: false }, true); }}
@@ -1000,7 +1052,7 @@ export function InsuranceFormModal({
                 <div className="w-full max-w-sm overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg">
                   <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3">
                     <div className="text-sm font-semibold text-slate-800">{t("insuranceFormModal.newProductTitle")}</div>
-                    <button
+                    <button title={t("table.close")} aria-label={t("table.close")}
                       type="button"
                       onClick={() => {
                         setShowNewProductModal(false);
@@ -1010,9 +1062,9 @@ export function InsuranceFormModal({
                         setNewProductSelectedCandidate(-1);
                         setNewProductLookupError("");
                       }}
-                      className="h-8 rounded-md border border-slate-200 bg-white px-2 text-sm text-slate-700 hover:bg-slate-50"
+                      className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
                     >
-                      {t("table.close")}
+                      <X className="h-4 w-4" />
                     </button>
                   </div>
                   <div className="space-y-3 p-4">
@@ -1096,20 +1148,6 @@ export function InsuranceFormModal({
                     )}
 
                     <div className="flex justify-end gap-2 pt-1">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setShowNewProductModal(false);
-                          setNewProductInstitutionId("");
-                          setNewProductName("");
-                          setNewProductLookupCandidates([]);
-                          setNewProductSelectedCandidate(-1);
-                          setNewProductLookupError("");
-                        }}
-                        className="h-9 rounded-md border border-slate-200 bg-white px-4 text-sm text-slate-700 hover:bg-slate-50"
-                      >
-                        {t("common.cancel")}
-                      </button>
                       <button
                         type="button"
                         onClick={handleCreateProductMaster}

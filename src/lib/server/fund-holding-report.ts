@@ -54,6 +54,8 @@ export type FundHoldingReportRow = {
   historicalProfit: number;
   totalProfit: number;
   currency: string;
+  /** 货币基金按面值 1 元/份核算，收益靠份额结转，统计上必须与开放式基金分开。 */
+  isMoneyFund: boolean;
 };
 
 export type FundClearedReportRow = {
@@ -77,6 +79,15 @@ export type FundClearedReportRow = {
   currency: string;
 };
 
+export type FundHoldingReportBucket = {
+  marketValue: number;
+  cost: number;
+  floatingPnL: number;
+  historicalProfit: number;
+  totalProfit: number;
+  holdingCount: number;
+};
+
 export type FundHoldingReportTotals = {
   marketValue: number;
   cost: number;
@@ -88,7 +99,32 @@ export type FundHoldingReportTotals = {
   clearedCount: number;
   clearedTotalInvested: number;
   clearedHistoricalProfit: number;
+  /** 货币基金分桶：市值 = 份额 × 1，浮盈即累计结转收益。 */
+  moneyFund: FundHoldingReportBucket;
+  /** 开放式基金分桶：市值 = 份额 × 净值。 */
+  openFund: FundHoldingReportBucket;
 };
+
+function emptyBucket(): FundHoldingReportBucket {
+  return { marketValue: 0, cost: 0, floatingPnL: 0, historicalProfit: 0, totalProfit: 0, holdingCount: 0 };
+}
+
+function bucketOf(rows: FundHoldingReportRow[]): FundHoldingReportBucket {
+  const bucket = emptyBucket();
+  for (const row of rows) {
+    bucket.marketValue += row.marketValue;
+    bucket.cost += row.cost;
+    bucket.floatingPnL += row.floatingPnL;
+    bucket.historicalProfit += row.historicalProfit;
+    bucket.holdingCount += 1;
+  }
+  bucket.marketValue = roundMoney(bucket.marketValue);
+  bucket.cost = roundMoney(bucket.cost);
+  bucket.floatingPnL = roundMoney(bucket.floatingPnL);
+  bucket.historicalProfit = roundMoney(bucket.historicalProfit);
+  bucket.totalProfit = roundMoney(bucket.floatingPnL + bucket.historicalProfit);
+  return bucket;
+}
 
 export type FundHoldingReport = {
   rows: FundHoldingReportRow[];
@@ -130,6 +166,7 @@ export async function loadFundHoldingReport(
       name: true,
       currency: true,
       institutionId: true,
+      investProductType: true,
       Institution: { select: { name: true } },
     },
     orderBy: [{ name: "asc" }],
@@ -155,6 +192,8 @@ export async function loadFundHoldingReport(
         clearedCount: 0,
         clearedTotalInvested: 0,
         clearedHistoricalProfit: 0,
+        moneyFund: emptyBucket(),
+        openFund: emptyBucket(),
       },
     };
   }
@@ -194,12 +233,14 @@ export async function loadFundHoldingReport(
         historicalProfit,
         totalProfit: roundMoney(floatingPnL + historicalProfit),
         currency,
+        isMoneyFund: account?.investProductType === FundProductType.money,
       });
     }
 
     for (const cleared of display.clearedPositions) {
       clearedRows.push({
-        id: `${accountId}::${cleared.fundCode}`,
+        // 同一只基金可能清仓过多次（一次清仓一条记录），id 必须带上周期才唯一。
+        id: `${accountId}::${cleared.fundCode}::${cleared.firstBuyDate}~${cleared.clearedDate}`,
         accountId,
         accountName: account?.name ?? accountId,
         institutionName,
@@ -263,6 +304,8 @@ export async function loadFundHoldingReport(
     clearedCount: filteredClearedRows.length,
     clearedTotalInvested: roundMoney(filteredClearedRows.reduce((sum, row) => sum + row.totalInvested, 0)),
     clearedHistoricalProfit: roundMoney(filteredClearedRows.reduce((sum, row) => sum + row.historicalProfit, 0)),
+    moneyFund: bucketOf(filteredRows.filter((row) => row.isMoneyFund)),
+    openFund: bucketOf(filteredRows.filter((row) => !row.isMoneyFund)),
   };
   totals.floatingPnLRate = totals.cost > 0 ? totals.floatingPnL / totals.cost : 0;
   totals.totalProfit = roundMoney(totals.floatingPnL + totals.historicalProfit);

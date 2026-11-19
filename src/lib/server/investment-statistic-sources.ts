@@ -2,6 +2,7 @@ import { FundCashFlowKind, FundSubtype } from "@prisma/client";
 
 import { prisma } from "@/lib/db/prisma";
 import { toNumber } from "@/lib/date-utils";
+import { TRANSACTION_SOURCE_MONEY_INCOME } from "@/lib/transaction-semantics";
 import { calculateWealthPositionsFromEntries } from "@/lib/wealth-position";
 import { getFundProfileNameMap } from "@/lib/fund/fundProfile";
 import { normalizeFundUnitsDecimals } from "@/lib/fund/unit-precision";
@@ -91,13 +92,17 @@ export async function loadFundStatisticSourceEntries(
       fundSubtype: true,
       fundProductType: true,
       fundCode: true,
+      source: true,
       realizedProfit: true,
       units: true,
       nav: true,
       fee: true,
       note: true,
       createdAt: true,
-      Account: { select: { name: true } },
+      // investProductType 是判定「是不是货基」的权威来源：库里存在把普通开放式基金
+      // 交易行标成 fundProductType=money 的历史脏数据，逐行信它会把普通基金的
+      // 赎回收益算进「货币基金」桶（实测 2026-06 被误记 1689.71）。
+      Account: { select: { name: true, investProductType: true } },
       CashAccount: { select: { name: true } },
       cashFlows: {
         select: {
@@ -154,7 +159,13 @@ export async function loadFundStatisticSourceEntries(
   const entries: InvestmentStatisticSourceEntry[] = [];
 
   for (const row of rows) {
+    // 货基收益结转只增份额、没有现金流，不能当买入流水统计（会多出一条 0 元买入）。
+    // 它也不能走「交易条目」这条路：收益已经由估值侧（快照 / 每日净值差）按
+    // source === money_fund_income 单独计入「货币基金」桶，这里再算一次就是双份
+    // （2026-11-18 实测月度货基收益正好翻倍：4.01 → 8.02）。
+    if (row.source === TRANSACTION_SOURCE_MONEY_INCOME) continue;
     const fundName = row.fundCode ? fundNameByCode.get(row.fundCode) ?? null : null;
+    const productType = row.Account.investProductType ?? row.fundProductType;
     const orderedFlows = [...row.cashFlows].sort((a, b) =>
       a.flowDate.getTime() - b.flowDate.getTime() ||
       a.createdAt.getTime() - b.createdAt.getTime() ||
@@ -185,7 +196,7 @@ export async function loadFundStatisticSourceEntries(
         date: mainDate,
         amount: primaryCashEntry?.amount ?? signedFundCashFlowAmount(primaryFlow?.kind, primaryFlow?.amount),
         fundSubtype: row.fundSubtype,
-        fundProductType: row.fundProductType,
+        fundProductType: productType,
         realizedProfit: row.realizedProfit,
         fundUnits: row.units,
         fundNav: row.nav,
@@ -221,7 +232,7 @@ export async function loadFundStatisticSourceEntries(
         date,
         amount: cashEntry?.amount ?? signedFundCashFlowAmount(flow.kind, flow.amount),
         fundSubtype: FundSubtype.buy_failed,
-        fundProductType: row.fundProductType,
+        fundProductType: productType,
         fundCode: row.fundCode,
         fundName,
         accountId: cashEntry?.accountId ?? flow.accountId ?? row.cashAccountId ?? row.fundAccountId,

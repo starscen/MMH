@@ -2,10 +2,13 @@ import { FundSubtype } from "@prisma/client";
 
 import { toNumber, todayDateBusinessYmd } from "@/lib/date-utils";
 import { prisma } from "@/lib/db/prisma";
-import { getHouseholdTimeZone } from "@/lib/server/household-preferences";
+import { getHouseholdPreferences } from "@/lib/server/household-preferences";
+import type { RepoOccupiedDaysMode } from "@/lib/preferences";
+import { institutionFullName } from "@/lib/institution-display";
 import {
   estimateRepoFee,
   estimateRepoInterest,
+  repoOccupiedDays,
   repoProductFromLabel,
 } from "@/lib/repo";
 import { loadBondTransactionEntryLike } from "@/lib/server/business-transaction-entries";
@@ -16,7 +19,8 @@ import { loadBondTransactionEntryLike } from "@/lib/server/business-transaction-
  * 逆回购存单就是 bond_transactions 里 instrumentKind = "repo" 的 buy 行：
  *   - 本金固定、年化固定、到期一次还本付息，没有付息计划；
  *   - 回款 = 同一存单的 redeem 子行（sourceBondTransactionId 指回 buy 行）；
- *   - 利息按**实际占款天数**（成交日 → 回款日）计，不按名义期限。
+ *   - 利息按**占款天数**（自然日）计：周五 1 天期顺延到周一到账算 3 天，周末照付利息，
+ *     与券商实付一致。
  * 这里只做投影，不写库；落账见 repo-transactions.ts。
  */
 
@@ -33,7 +37,7 @@ export type RepoShellLot = {
   startDate: string | null;
   maturityDate: string | null;
   clearedDate: string | null;
-  /** 占款天数（成交日 → 回款日 / 到期日）。 */
+  /** 占款天数：成交日 → 到期日（回款日）的自然日差，周五 1 天期顺延到周一是 3 天。 */
   occupiedDays: number | null;
   /** 距到期还剩几天（已回款为 null，过期未回款为负数）。 */
   remainingDays: number | null;
@@ -48,6 +52,8 @@ export type RepoShellLot = {
   status: "open" | "closed";
   /** 该存单在明细表里的分录 id，用于点中收窄明细。 */
   relatedEntryIds: string[];
+  /** 借出时的资金账户：行内编辑要按它回填逆回购窗口的「现金账户」。 */
+  cashAccountId: string | null;
 };
 
 export type RepoShellData = {
@@ -105,8 +111,28 @@ function daysBetween(fromKey: string | null, toKey: string | null): number | nul
   return Math.round((to - from) / 86400000);
 }
 
+/**
+ * 占款天数，口径由账簿设置决定（`RepoOccupiedDaysMode`，见 `repoOccupiedDays`）。
+ * 未回款时才用品种期限兜底。
+ * 与落账（repo-transactions）和录入预览（RepoEntryFields）共用 `repoOccupiedDays`，
+ * 三处口径必须一致，否则列表写的利息和落库的利息会对不上。
+ */
+function occupiedDaysOf(
+  startKey: string,
+  endKey: string | null,
+  termDays: number | null | undefined,
+  mode: RepoOccupiedDaysMode,
+): number | null {
+  if (!endKey) return termDays ?? null;
+  return repoOccupiedDays(startKey, endKey, termDays, mode) || termDays || null;
+}
+
 /** 逆回购存单投影（视图与回款弹窗共用同一份口径）。 */
-export function projectRepoLots(rows: RepoRow[], todayKey: string): RepoShellLot[] {
+export function projectRepoLots(
+  rows: RepoRow[],
+  todayKey: string,
+  occupiedDaysMode: RepoOccupiedDaysMode = "actual",
+): RepoShellLot[] {
   type LotAcc = {
     id: string;
     name: string;
@@ -121,6 +147,7 @@ export function projectRepoLots(rows: RepoRow[], todayKey: string): RepoShellLot
     realizedProfit: number;
     clearedDate: string | null;
     relatedEntryIds: string[];
+    cashAccountId: string | null;
   };
 
   const lots: LotAcc[] = [];
@@ -134,7 +161,7 @@ export function projectRepoLots(rows: RepoRow[], todayKey: string): RepoShellLot
     const startKey = ymd(row.tradeDate) ?? todayKey;
     const maturityKey = ymd(row.maturityDate);
     const principal = Math.abs(toNumber(row.grossAmount));
-    const occupiedDays = daysBetween(startKey, maturityKey) ?? row.termDays ?? null;
+    const occupiedDays = occupiedDaysOf(startKey, maturityKey, row.termDays, occupiedDaysMode);
     const lot: LotAcc = {
       id: row.id,
       name,
@@ -149,6 +176,7 @@ export function projectRepoLots(rows: RepoRow[], todayKey: string): RepoShellLot
       realizedProfit: 0,
       clearedDate: null,
       relatedEntryIds: [entryIdOf(row)],
+      cashAccountId: row.cashAccountId ?? null,
     };
     // 借出行没有落利息时，用同一公式补一个预计值（占款天数口径）。
     if (lot.expectedInterest == null && occupiedDays) {
@@ -190,7 +218,12 @@ export function projectRepoLots(rows: RepoRow[], todayKey: string): RepoShellLot
       const principal = Math.max(0, Number(lot.principal.toFixed(2)));
       const status: RepoShellLot["status"] = principal > PRINCIPAL_EPSILON ? "open" : "closed";
       const product = repoProductFromLabel(lot.name);
-      const occupiedDays = daysBetween(lot.startKey, lot.clearedDate ?? lot.maturityKey);
+      const occupiedDays = occupiedDaysOf(
+        lot.startKey,
+        lot.clearedDate ?? lot.maturityKey,
+        lot.termDays,
+        occupiedDaysMode,
+      );
       return {
         id: lot.id,
         name: lot.name,
@@ -211,6 +244,7 @@ export function projectRepoLots(rows: RepoRow[], todayKey: string): RepoShellLot
         realizedProfit: Number(lot.realizedProfit.toFixed(2)),
         status,
         relatedEntryIds: lot.relatedEntryIds,
+        cashAccountId: lot.cashAccountId,
       } satisfies RepoShellLot;
     })
     .sort((a, b) => {
@@ -231,7 +265,8 @@ export async function loadRepoShellData(params: {
     include: { Institution: true },
   });
   if (!account) return null;
-  const todayKey = params.todayKey ?? todayDateBusinessYmd(await getHouseholdTimeZone(householdId));
+  const preferences = await getHouseholdPreferences(householdId);
+  const todayKey = params.todayKey ?? todayDateBusinessYmd(preferences.timeZone);
 
   const [rows, entries] = await Promise.all([
     prisma.bondTransaction.findMany({
@@ -264,7 +299,7 @@ export async function loadRepoShellData(params: {
     }),
   ]);
 
-  const lots = projectRepoLots(rows, todayKey);
+  const lots = projectRepoLots(rows, todayKey, preferences.repoOccupiedDaysMode);
   const openLots = lots.filter((lot) => lot.status === "open");
   const latestBuy = [...rows].reverse().find((row) => row.action === FundSubtype.buy);
 
@@ -272,7 +307,8 @@ export async function loadRepoShellData(params: {
     account: {
       id: account.id,
       name: account.name,
-      institutionName: account.Institution?.shortName || account.Institution?.name || "",
+      // 账户所属机构作为范围说明展示时用全称（账户标签里才用简称）。
+      institutionName: institutionFullName(account.Institution),
       currency: account.currency,
     },
     lots,

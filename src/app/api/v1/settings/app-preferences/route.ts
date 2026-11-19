@@ -4,6 +4,7 @@ import { normalizeDateDisplayFormat } from "@/lib/date-utils";
 import { prisma } from "@/lib/db/prisma";
 import {
   PREFERENCE_COOKIE_MIRROR,
+  normalizeAccountDropdownGroupBy,
   normalizeAccountLabelFieldsSetting,
   normalizeBoolean,
   normalizeColorScheme,
@@ -11,6 +12,7 @@ import {
   normalizeDetailWindowYears,
   normalizeDisplayLanguage,
   normalizeFundUnitsDecimals,
+  normalizeRepoOccupiedDaysMode,
   normalizeSessionDays,
   normalizeSidebarGroupMode,
   normalizeTimeZone,
@@ -97,12 +99,12 @@ export async function PUT(req: NextRequest) {
     }
     if (has("creditBillHideZero")) patch.creditBillHideZero = normalizeBoolean(body.creditBillHideZero, false);
     if (has("creditBillHideSettled")) patch.creditBillHideSettled = normalizeBoolean(body.creditBillHideSettled, false);
-    if (has("creditBillShowRecentCycles")) {
-      patch.creditBillShowRecentCycles = normalizeBoolean(body.creditBillShowRecentCycles, true);
-    }
     if (has("displayLanguage")) patch.displayLanguage = normalizeDisplayLanguage(body.displayLanguage);
     if (has("dateDisplayFormat")) patch.dateDisplayFormat = normalizeDateDisplayFormat(body.dateDisplayFormat);
     if (has("sidebarGroupBy")) patch.sidebarGroupBy = normalizeSidebarGroupMode(body.sidebarGroupBy);
+    if (has("accountDropdownGroupBy")) {
+      patch.accountDropdownGroupBy = normalizeAccountDropdownGroupBy(body.accountDropdownGroupBy);
+    }
     if (has("sidebarHideZero")) patch.sidebarHideZero = normalizeBoolean(body.sidebarHideZero, false);
     if (has("sidebarHideInitialData")) {
       patch.sidebarHideInitialData = normalizeBoolean(body.sidebarHideInitialData, false);
@@ -127,6 +129,9 @@ export async function PUT(req: NextRequest) {
     }
     if (has("accountUsageSortEnabled")) {
       patch.accountUsageSortEnabled = normalizeBoolean(body.accountUsageSortEnabled, true);
+    }
+    if (has("repoOccupiedDaysMode")) {
+      patch.repoOccupiedDaysMode = normalizeRepoOccupiedDaysMode(body.repoOccupiedDaysMode);
     }
 
     const preferences = await updateHouseholdPreferences(householdId, patch);

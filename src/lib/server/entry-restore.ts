@@ -20,6 +20,7 @@ import {
   type RestoredBusinessFundTarget,
 } from "@/lib/server/entry-business-link";
 import { syncIndependentBusinessTransactionFromTxRecord } from "@/lib/server/business-transactions";
+import { restoreMetalExtractPropertyTransactions } from "@/lib/property/transactions";
 
 export async function restoreDeletedEntries(ctx: HouseholdContext, transactionIds: string[]) {
   const { householdId } = ctx;
@@ -31,7 +32,7 @@ export async function restoreDeletedEntries(ctx: HouseholdContext, transactionId
     where: { id: { in: transactionIds } },
     data: { deletedAt: null },
   });
-  const restoredInstallmentPlans = await prisma.creditCardInstallmentPlan.findMany({
+  const affectedInstallmentPlans = await prisma.creditCardInstallmentPlan.findMany({
     where: {
       householdId,
       OR: [
@@ -45,17 +46,28 @@ export async function restoreDeletedEntries(ctx: HouseholdContext, transactionId
         },
       ],
     },
-    select: { id: true },
+    select: { id: true, status: true, sourceEntryId: true },
   });
-  if (restoredInstallmentPlans.length > 0) {
-    const planIds = restoredInstallmentPlans.map((plan) => plan.id);
+  // 期供行是「单期可删」的，恢复时也必须只恢复被选中的那几行。
+  // 只有两种情况才整条计划连坐恢复：
+  //   1. 计划已被取消（删除的是原消费/账单调节行，整条计划一起删的）；
+  //   2. 本次恢复的就是计划来源行。
+  // 否则「删掉第 2 期和第 4 期，再恢复第 2 期」会把第 4 期一起偷偷带回来。
+  const planIdsToRevive = affectedInstallmentPlans
+    .filter(
+      (plan) =>
+        plan.status === "cancelled" ||
+        (plan.sourceEntryId ? transactionIds.includes(plan.sourceEntryId) : false),
+    )
+    .map((plan) => plan.id);
+  if (planIdsToRevive.length > 0) {
     await prisma.$transaction([
       prisma.creditCardInstallmentPlan.updateMany({
-        where: { id: { in: planIds }, householdId },
+        where: { id: { in: planIdsToRevive }, householdId },
         data: { status: "active" },
       }),
       prisma.txRecord.updateMany({
-        where: { creditCardInstallmentPlanId: { in: planIds }, householdId },
+        where: { creditCardInstallmentPlanId: { in: planIdsToRevive }, householdId },
         data: { deletedAt: null },
       }),
     ]);
@@ -70,6 +82,15 @@ export async function restoreDeletedEntries(ctx: HouseholdContext, transactionId
   const restoredBusiness = await restoreBusinessRecordsForCashEntryIds(ctx, transactionIds).catch((error) => {
     logger.catchLog("恢复整笔业务明细失败", "entry-restore.ts")(error);
     return { restoredCount: 0, fundTargets: [] as RestoredBusinessFundTarget[] };
+  });
+  // 提取实物的固定资产交易只靠 cashEntryId 挂在明细上（没有 EntryBusinessLink），删除时被连带软删、
+  // 资产被重算成已删除；这里要把它一起复活，否则撤销删除后收藏品资产永远回不来。
+  const restoredMetalAssets = await restoreMetalExtractPropertyTransactions(prisma, {
+    householdId,
+    cashEntryIds: transactionIds,
+  }).catch((error) => {
+    logger.catchLog("恢复提取实物固定资产交易失败", "entry-restore.ts")(error);
+    return { restoredCount: 0, propertyAssetIds: [] as string[] };
   });
   await syncFundTransactionsFromTxRecords(transactionIds).catch(logger.catchLog("同步基金业务单失败", "entry-restore.ts"));
   for (const id of transactionIds) {
@@ -114,7 +135,12 @@ export async function restoreDeletedEntries(ctx: HouseholdContext, transactionId
   );
   // 资金腿本身没有 fundCode / fundProductType，只看腿判断不出投资侧是否变化；
   // 整笔恢复带回业务单时也要失效投资侧缓存，否则页面仍读旧缓存。
-  if (touchedInvestment || restoredBusiness.restoredCount > 0 || restoredBusiness.fundTargets.length > 0) {
+  if (
+    touchedInvestment
+    || restoredBusiness.restoredCount > 0
+    || restoredBusiness.fundTargets.length > 0
+    || restoredMetalAssets.restoredCount > 0
+  ) {
     revalidateAfterInvestChange();
   } else {
     revalidateAfterTxChange();

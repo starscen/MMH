@@ -24,6 +24,7 @@ type Source = {
   id: string;
   name: string;
   kind?: ImportAccountKind | null;
+  isActive?: boolean | null;
   numberMasked?: string | null;
   Institution?: { name?: string | null; shortName?: string | null } | null;
   AccountGroup?: {
@@ -238,6 +239,40 @@ expectCard("亲属卡(老四)", "墨斗鱼", "(未解析)", null, "亲属卡不�
   }
 }
 
+// 2026-11-15 用户报告：预览提示「“招商银行储蓄卡(9447)”匹配到3个账户，请手动选择」。
+// 复现条件：导入上下文的所有人判成了「付斌」（在该所有人的账户视图/文件名下导入），
+// 而 9447 这张卡属于墨斗鱼。旧逻辑在 byLast4 阶段按所有人硬过滤，把唯一正确的卡滤掉，
+// 退化到「同机构同类型且尾号为空」的 3 张借记卡，3 个候选全都不是这张卡。
+// 口径：尾号是卡的身份，所有人只是提示——尾号唯一命中就该定案。
+{
+  const crossOwnerAccounts: Source[] = [
+    { id: "cmb-9447", name: "9447", kind: "bank_debit", Institution: { name: "招商银行", shortName: "招行" }, AccountGroup: { name: "墨斗鱼" } },
+    { id: "cmb-usd", name: "美元账户", kind: "bank_debit", Institution: { name: "招商银行", shortName: "招行" }, AccountGroup: { name: "付斌" } },
+    { id: "cmb-jpy", name: "日元账户", kind: "bank_debit", Institution: { name: "招商银行", shortName: "招行" }, AccountGroup: { name: "付斌" } },
+    { id: "cmb-zzy", name: "朝朝盈", kind: "bank_debit", Institution: { name: "招商银行", shortName: "招行" }, AccountGroup: { name: "付斌" } },
+  ];
+  const crossOwnerMatch = createImportAccountMatcher(crossOwnerAccounts, { ownerName: "付斌" });
+  const byTail = crossOwnerMatch("招商银行储蓄卡(9447)");
+  if (byTail.account?.id === "cmb-9447" && byTail.ambiguousAccounts.length === 0) {
+    console.log("PASS  上下文所有人判错时，尾号唯一仍定案：招商银行储蓄卡(9447) -> cmb-9447");
+  } else {
+    failed += 1;
+    console.error(
+      `FAIL  上下文所有人判错时，尾号唯一仍定案：-> ${byTail.account?.id ?? `歧义${byTail.ambiguousAccounts.length}个`}，期望 cmb-9447`,
+    );
+  }
+  // 没有尾号的同机构同类型文本仍按所有人收窄，不能因为上面的放宽变成静默串人。
+  const withoutTail = crossOwnerMatch("招商银行储蓄卡");
+  if (!withoutTail.account && withoutTail.ambiguousAccounts.length === 3) {
+    console.log("PASS  不带尾号仍按所有人收窄：招商银行储蓄卡 -> 保留 3 个同所有人候选");
+  } else {
+    failed += 1;
+    console.error(
+      `FAIL  不带尾号仍按所有人收窄：-> ${withoutTail.account?.id ?? `${withoutTail.ambiguousAccounts.length} 个歧义`}，期望 3 个歧义候选`,
+    );
+  }
+}
+
 {
   const ownerGroup = (name: string, shortName: string) => ({ name, Institution: { name, shortName } });
   const ownedAccounts: Source[] = [
@@ -409,6 +444,56 @@ expectConflictKind("yeb-lisi", "张三·支付宝·余额宝·电子钱包", "ow
 expectConflictKind("fund-zhangsan", "张三·支付宝·余额宝·电子钱包", "account", "原文能匹配到本人余额宝时选基金账户仍报账户冲突");
 expectConflictKind("yeb-zhangsan", "张三·支付宝·余额宝·电子钱包", null, "归属正确的账户无冲突");
 expectConflictKind("yeb-lisi", "余额宝", null, "原文没写所有人时不误报归属冲突");
+
+/**
+ * 2026-11-18 用户裁定：停用不要阻止匹配。
+ *
+ * 背景：财智导出的历史流水里，对向账户多是早已停用的老卡（「财智.章啸的往来款」这份
+ * 2271 条里 444 条如此）。预览只把启用账户交给 matcher，这些行就只能落到
+ * 「未识别 / 新建账户」，凭空多出一张同名卡。
+ * 口径：停用账户参与匹配，但启用账户优先——候选里还有启用账户时只在启用账户里定案，
+ * 宽松包含/启发式阶段不许用停用账户兜底（否则一张停用的泛名「信用卡」会抢在
+ * 银行、卡种都更贴合的那张启用卡前面定案）。
+ */
+const inactiveAccounts: Source[] = [
+  // 停用的老卡：尾号唯一，应能定案。
+  { id: "zs-7701", name: "7701", kind: "bank_credit", isActive: false, Institution: { name: "浙商银行", shortName: "浙商" }, AccountGroup: { name: "付斌" } },
+  // 停用的泛名卡：不能在宽松包含阶段抢答。
+  { id: "boc-generic", name: "信用卡", kind: "bank_credit", isActive: false, Institution: { name: "中国银行", shortName: "中行" }, AccountGroup: { name: "付斌" } },
+  // 农商行那张启用卡，名字里没有「信用卡」三个字。
+  { id: "rcb-jd", name: "京东联名", kind: "bank_credit", Institution: { name: "农商银行" }, AccountGroup: { name: "付斌" } },
+  // 同一张卡既有启用又有停用账户（换卡后留了旧账户）：启用优先。
+  { id: "abc-6308-active", name: "6308", kind: "bank_debit", isActive: true, Institution: { name: "农业银行" }, AccountGroup: { name: "付斌" } },
+  { id: "abc-6308-stopped", name: "6308", kind: "bank_debit", isActive: false, Institution: { name: "农业银行" }, AccountGroup: { name: "付斌" } },
+];
+const inactiveMatch = createImportAccountMatcher(inactiveAccounts, { ownerName: "付斌" });
+
+function expectInactive(input: string, expectedId: string | null, note: string) {
+  const result = inactiveMatch(input);
+  const actual = result.account?.id ?? null;
+  if (actual === expectedId) {
+    console.log(`PASS  "${input}" -> ${actual ?? "未匹配"}  (${note})`);
+  } else {
+    failed += 1;
+    console.error(`FAIL  "${input}" -> ${actual ?? "未匹配"}，期望 ${expectedId ?? "未匹配"}  (${note})`);
+  }
+}
+
+expectInactive("付斌·浙商·7701", "zs-7701", "停用老卡尾号唯一命中，不再落到新建账户");
+expectInactive("付斌·农行·6308", "abc-6308-active", "同尾号同时有启用与停用账户时启用优先");
+expectInactive("付斌·农商行·信用卡", "rcb-jd", "停用的泛名卡不得在宽松包含阶段抢答");
+
+// 停用账户参与匹配，但不进「账户中有N个」的计数（原本 44 → 11 的收敛不能被推翻）。
+{
+  const result = inactiveMatch("付斌·信用卡");
+  const leaked = result.ambiguousAccounts.filter((account) => account.isActive === false);
+  if (leaked.length === 0) {
+    console.log(`PASS  歧义候选不含停用账户（候选 ${result.ambiguousAccounts.length} 个）`);
+  } else {
+    failed += 1;
+    console.error(`FAIL  歧义候选混入停用账户：${leaked.map((account) => account.id).join(", ")}`);
+  }
+}
 
 if (failed > 0) {
   console.error(`\n${failed} 个用例失败`);

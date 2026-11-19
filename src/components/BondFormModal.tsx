@@ -9,6 +9,7 @@ import { SmartSelect, type SmartSelectOption } from "./SmartSelect";
 import { useCloseOnNavigation } from "@/lib/client/useCloseOnNavigation";
 /** 记账弹窗整窗外壳：宽度/标题栏/表单/FT 页签卡片/固定页脚/高度锁定统一由它负责。 */
 import { EntryModalShell } from "@/components/EntryModalShell";
+import { EntryConvertHeaderAction } from "@/components/EntryConvertHeaderAction";
 import {
   HoldingAccountCreateModal,
   HoldingHoldingFields,
@@ -285,7 +286,7 @@ export function BondFormModal({
     interestAmount, arrivalAmount, setArrivalAmount, arrivalEdited, setArrivalEdited,
     cashAccountId, setCashAccountId, toAccountId, setToAccountId,
     memo, setMemo, pendingAttachmentFiles, setPendingAttachmentFiles, submitting, setSubmitting,
-    requestId, editEntryId, editBusinessTransactionId,
+    requestId, editEntryId, editBusinessTransactionId, conversionEntry,
     setInvestmentAccountList, setLocalInvestSSOpts, setNestedEntityType,
     isRedeem, isDividend, isWriteOff, isHoldingAction,
     selectedCashAccount, accountIds: bondAccountIds,
@@ -735,6 +736,8 @@ export function BondFormModal({
           await uploadEntryAttachmentFiles(createdEntryId, pendingAttachmentFiles);
           setPendingAttachmentFiles([]);
         }
+        // 「转换交易」靠 requestId 把这次新建和原记录串起来（见 lib/client/entry-conversion.ts）。
+        if (requestId) window.dispatchEvent(new CustomEvent("mmh:bond:create:success", { detail: { requestId } }));
       }
       if (!isHoldingAction && selectedProduct?.productType === "bond") {
         // 债券条款写债券主数据（/api/v1/bond-products/[id]），不再写理财产品表。
@@ -800,7 +803,26 @@ export function BondFormModal({
         width="lg"
         title={mode === "edit" ? t("bondForm.title.edit") : t("bondForm.title.create")}
         onClose={closeBondModal}
-        closeLabel={t("table.close")}
+        headerExtra={(
+          <EntryConvertHeaderAction
+            source={mode === "edit" ? {
+              entryId: editEntryId,
+              type: "bond",
+              date,
+              amount,
+              note: memo,
+              accountId: toAccountId,
+              cashAccountId,
+              fundName,
+              // 赎回 / 利息收款是钱进来，买入是钱出去：转换菜单只列同向目标。
+              inflow: subtype === "redeem" || subtype === "dividend_cash",
+            } : null}
+            onBeforeConvert={() => {
+              setOpen(false);
+              reset();
+            }}
+          />
+        )}
         onSubmit={onSubmit}
         tabs={[
           { id: "buy", label: t("fund.subtype.buy") },
@@ -812,7 +834,7 @@ export function BondFormModal({
         onTabChange={(id) => selectSubtypeTab(id as BondSubtype)}
         footer={(
           <>
-            {mode === "create" ? (
+            {mode === "create" && !conversionEntry ? (
               <button
                 type="button"
                 disabled={submitting}

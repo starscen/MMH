@@ -34,8 +34,8 @@ import { getMaintainedAccountBalances, recalcAndSaveAccountBalance } from "@/lib
 import {
   CREDIT_CARD_MAX_REPAYMENT_OFFSET_DAYS,
   CREDIT_CARD_MONTH_END_BILLING_DAY,
-  creditCardDisplayBalanceFromCurrentCycle,
 } from "@/lib/credit/billing";
+import { loadCreditCardBillGroupBalances } from "@/lib/server/credit-card-display-balance";
 import {
   accountSupportsNumberMasked,
   assertAccountIdentityUnique,
@@ -389,6 +389,8 @@ export async function POST(req: NextRequest) {
       ? String(body.numberMasked ?? "").trim() || null
       : null;
     const note = String(body.note ?? "").trim() || null;
+    // 自定义分组标签（2026-11-13）：用户自己起的分类名，可空。
+    const accountGroup = String(body.accountGroup ?? "").trim() || null;
 
     await assertAccountIdentityUnique(prisma, {
       householdId,
@@ -445,6 +447,7 @@ export async function POST(req: NextRequest) {
           billingDayTxPeriod,
           numberMasked,
           note,
+          accountGroup,
           investProductType: investProductType as any,
           fixedAssetType: fixedAssetType as any,
           costBasisMethod: isInvestment && supportsCostBasisMethod(investProductType) ? normalizeCostBasisMethod(body.costBasisMethod) as any : null,
@@ -636,12 +639,88 @@ export async function PUT(req: NextRequest) {
       data.isConsumerLoan = body.isConsumerLoan === true || String(body.isConsumerLoan ?? "").trim().toLowerCase() === "true";
     }
     if (body.note !== undefined) data.note = String(body.note ?? "").trim() || null;
+    // 自定义分组标签（2026-11-13）：自由文本，清空即回到「未分组」。
+    if (body.accountGroup !== undefined) data.accountGroup = String(body.accountGroup ?? "").trim() || null;
 
     if (body.fundUnitsDecimals !== undefined) {
       data.fundUnitsDecimals = normalizeFundUnitsDecimals(body.fundUnitsDecimals ?? existing.fundUnitsDecimals);
     }
 
     const nextKind = String(data.kind ?? existing.kind);
+    // 电子钱包 → 货基支付关联（2026-11-18）：只有 ewallet 能配置，目标必须是
+    // 本账簿里的货币基金账户；解绑时两列一起清掉，避免留下半截关联。
+    if (body.linkedFundAccountId !== undefined) {
+      const rawLinkedId = String(body.linkedFundAccountId ?? "").trim();
+      if (!rawLinkedId) {
+        data.linkedFundAccountId = null;
+        data.linkedFundCode = null;
+      } else {
+        if (nextKind !== "ewallet") {
+          return NextResponse.json(
+            { ok: false, code: "ACCOUNT_LINKED_FUND_KIND", error: "Only e-wallet accounts can link a money fund" },
+            { status: 400 },
+          );
+        }
+        if (rawLinkedId === id) {
+          return NextResponse.json(
+            { ok: false, code: "ACCOUNT_LINKED_FUND_SELF", error: "An account cannot link itself" },
+            { status: 400 },
+          );
+        }
+        const linkedAccount = await prisma.account.findFirst({
+          where: { id: rawLinkedId, householdId, kind: "investment", investProductType: "money" },
+          select: { id: true, institutionId: true, groupId: true },
+        });
+        if (!linkedAccount) {
+          return NextResponse.json(
+            { ok: false, code: "ACCOUNT_LINKED_FUND_NOT_FOUND", error: "Money fund account not found in this household" },
+            { status: 404 },
+          );
+        }
+        // 2026-11-18 用户裁定：只能关联**本机构**的货币基金，不能跨机构串。
+        const walletInstitutionId = String(data.institutionId ?? existing.institutionId ?? "").trim() || null;
+        if (!walletInstitutionId || linkedAccount.institutionId !== walletInstitutionId) {
+          return NextResponse.json(
+            { ok: false, code: "ACCOUNT_LINKED_FUND_INSTITUTION", error: "The linked money fund must belong to the same institution as the e-wallet" },
+            { status: 400 },
+          );
+        }
+        // 2026-11-18 用户裁定：还必须**同一所有人**（AccountGroup）。跨所有人关联等于记账时
+        // 从别人的货基里扣钱——「墨斗鱼的余额宝能关联付斌的货基」就是漏了这条。
+        const walletGroupId = String(data.groupId ?? existing.groupId ?? "").trim() || null;
+        if ((linkedAccount.groupId ?? null) !== walletGroupId) {
+          return NextResponse.json(
+            { ok: false, code: "ACCOUNT_LINKED_FUND_OWNER", error: "The linked money fund must belong to the same owner as the e-wallet" },
+            { status: 400 },
+          );
+        }
+
+        // 基金代码来自持仓下拉，服务端仍校验 6 位且确实属于该货基账户。
+        const rawCode = body.linkedFundCode == null ? "" : String(body.linkedFundCode).trim();
+        if (rawCode && !/^\d{6}$/.test(rawCode)) {
+          return NextResponse.json(
+            { ok: false, code: "ACCOUNT_LINKED_FUND_CODE", error: "Fund code must be 6 digits" },
+            { status: 400 },
+          );
+        }
+        if (rawCode) {
+          const holding = await prisma.fundHolding.findUnique({
+            where: { accountId_fundCode: { accountId: rawLinkedId, fundCode: rawCode } },
+            select: { fundCode: true },
+          });
+          if (!holding) {
+            return NextResponse.json(
+              { ok: false, code: "ACCOUNT_LINKED_FUND_CODE_NOT_FOUND", error: "Fund code not found in the linked money fund account" },
+              { status: 404 },
+            );
+          }
+        }
+        data.linkedFundAccountId = rawLinkedId;
+        data.linkedFundCode = rawCode || null;
+      }
+    } else if (body.linkedFundCode !== undefined) {
+      data.linkedFundCode = String(body.linkedFundCode ?? "").trim() || null;
+    }
     const rawNextIsConsumerLoan = data.isConsumerLoan === undefined ? existing.isConsumerLoan === true : data.isConsumerLoan === true;
     let nextIsConsumerLoan = false;
     if (nextKind === "loan") {
@@ -1019,6 +1098,16 @@ export async function PUT(req: NextRequest) {
         { deleteManualCycles: false },
       );
     }
+    // 关联/解绑货币基金会改变「这个钱包是否统计余额」（2026-11-18 用户裁定：关联后
+    // 钱包余额不再计入统计，避免和货基市值双计）。这里当场重算一次，让存储列立刻
+    // 落到 0（或解绑后折叠回真实值），不必等后台维护那一轮。
+    const linkedFundChanged =
+      data.linkedFundAccountId !== undefined
+      && String(data.linkedFundAccountId ?? "") !== String(existing.linkedFundAccountId ?? "");
+    if (linkedFundChanged) {
+      await recalcAndSaveAccountBalance(updated.id)
+        .catch(logger.catchLog("recalc wallet balance after linked fund change failed", "accounts/route.ts"));
+    }
     // 归属变化后两个父账户的折合余额都要重算：旧父少了一个子户、新父多了一个。
     // 失败不阻塞保存（余额列下次重算会自愈），但必须留日志。
     if (parentChanging) {
@@ -1232,7 +1321,7 @@ export async function GET(req: Request) {
     },
     orderBy: [{ kind: "asc" }, { name: "asc" }],
   });
-  const [investBalByAccountId, displayBalanceByAccountId, currentCreditCycles, insuranceDisplayBalanceByAccountId] = await Promise.all([
+  const [investBalByAccountId, displayBalanceByAccountId, creditBillGroup, insuranceDisplayBalanceByAccountId] = await Promise.all([
     computeInvestBalances(scope),
     getMaintainedAccountBalances(
       rows
@@ -1245,24 +1334,16 @@ export async function GET(req: Request) {
         })),
       scope.hidFilter,
     ),
-    prisma.creditCardCycle.findMany({
-      where: {
-        accountId: { in: rows.filter((account) => account.kind === AccountKind.bank_credit).map((account) => account.id) },
-        isCurrentCycle: true,
-      },
-      select: { accountId: true, effectiveBill: true, cumulativeRemain: true, cumulativeOverpaid: true },
-    }),
+    loadCreditCardBillGroupBalances(
+      rows.filter((account) => account.kind === AccountKind.bank_credit).map((account) => account.id),
+    ),
     computeInsuranceAccountDisplayBalances(
       rows.filter((account) => account.kind === AccountKind.insurance).map((account) => account.id),
       scope.hidFilter,
     ),
   ]);
-  const currentCreditBalanceByAccountId = new Map(
-    currentCreditCycles.map((cycle) => [
-      cycle.accountId,
-      creditCardDisplayBalanceFromCurrentCycle(cycle),
-    ]),
-  );
+  const currentCreditBalanceByAccountId = creditBillGroup.balanceByAccountId;
+  const creditBillStorageIdByAccountId = creditBillGroup.billStorageIdByAccountId;
 
   const accounts = rows
     .map((account) => ({
@@ -1283,11 +1364,19 @@ export async function GET(req: Request) {
       fixedAssetType: account.fixedAssetType,
       liabilityDirection: account.liabilityDirection,
       note: account.note,
+      accountGroup: account.accountGroup,
+      // 电子钱包 → 货基支付关联：支出弹窗据此显示「从关联货基支付」选项。
+      linkedFundAccountId: account.linkedFundAccountId,
+      linkedFundCode: account.linkedFundCode,
       currency: account.currency,
       groupName: account.kind === AccountKind.loan || account.kind === AccountKind.settlement ? "" : account.AccountGroup?.name ?? "",
       institutionName: account.Institution?.name ?? "",
       usageCount: account.usageCount,
       lastUsedAt: account.lastUsedAt ? account.lastUsedAt.toISOString() : null,
+      // 合并账单组的去重键：组内每张卡余额相同，客户端求和同键只应计一次。
+      creditBillStorageId: account.kind === AccountKind.bank_credit
+        ? creditBillStorageIdByAccountId.get(account.id) ?? account.id
+        : null,
     }))
     // Most frequently used accounts first, then alphabetical, so entry forms
     // (Web and Android) surface the accounts the user actually uses.

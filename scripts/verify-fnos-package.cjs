@@ -282,6 +282,35 @@ function expectPngSize(file, size) {
 }
 
 const buildScript = read(path.join(root, "scripts", "build-fnos-package.cjs"));
+// Single source of truth for the package's default service port: the historical
+// 7777, shared with Docker / SPK / desktop. A host that already runs something on
+// 7777 must be handled by probing forward on fresh install, not by moving the
+// default for everyone; existing installs keep the port stored in .port.
+const fnosDefaultPortMatch = buildScript.match(/const fnosDefaultPort = (\d+);/);
+const fnosDefaultPort = fnosDefaultPortMatch ? fnosDefaultPortMatch[1] : "";
+expect(Boolean(fnosDefaultPort), "fnOS build script must declare a numeric fnosDefaultPort constant.");
+expect(fnosDefaultPort === "7777", "fnOS default service port must stay 7777 like every other channel; a single host's port collision is resolved by probing, not by changing the default.");
+expect(buildScript.includes('probe_free_port "$start_port"'), "fnOS fresh installs must probe for a free port instead of binding a taken default.");
+expect(
+  buildScript.includes('start_port="\\${TRIM_SERVICE_PORT:-${fnosDefaultPort}}"'),
+  "fnOS fresh-install probe must start at fnosDefaultPort (or TRIM_SERVICE_PORT when the App Center passes one).",
+);
+expect(
+  buildScript.includes('write_env_file "$(prepare_install_port)"'),
+  "fnOS install/upgrade must resolve a usable port before writing settings: App Center checks the port before it ever runs cmd/main, so a leftover instance holding it (or another app on it) turns into START_FAILED_PORT_USAGE with no chance for the package to clean up.",
+);
+expect(
+  buildScript.includes("stop_own_payload_processes") && buildScript.includes("port_owner_desc"),
+  "fnOS install must clean its own orphaned server processes and log who holds the port if it is a foreign process.",
+);
+expect(
+  !buildScript.includes('tar -xzf "$tgz" -C "$dest"'),
+  "ensure_app_ready must not fall back to extracting the payload into the app root: it mixes server/ with cmd/ and manifest, and the root layout then short-circuits later extracts.",
+);
+expect(
+  buildScript.includes("function pruneSourceMaps(") && buildScript.includes('pruneSourceMaps(path.join(stageDir, "app", "server"))'),
+  "fnOS build must strip *.map from the staged server: pdfjs-dist / pdf-parse ship ~19 MB of source maps that nothing reads at runtime.",
+);
 const appBuildScript = read(path.join(root, "scripts", "build-fnos-app.cjs"));
 const schemaScript = read(path.join(root, "scripts", "generate-native-sqlite-schema.cjs"));
 const fnosReleaseWorkflow = read(path.join(root, ".github", "workflows", "fnos-release.yml"));
@@ -289,6 +318,9 @@ const fnosStageWorkflow = read(path.join(root, ".github", "workflows", "fnos-sta
 const prismaConfig = read(path.join(root, "prisma.config.ts"));
 const dbClient = read(path.join(root, "src", "lib", "db", "prisma.ts"));
 const systemUpdateRoute = read(path.join(root, "src", "app", "api", "v1", "settings", "system-update", "route.ts"));
+// 2026-11-16 起升级判定收敛到 service.ts，route.ts 只剩薄壳；断言要看实现文件，
+// 否则代码搬走后断言会以「功能缺失」的名义假红（2026-11-18 发布前遇到）。
+const systemUpdateService = read(path.join(root, "src", "lib", "server", "system-update", "service.ts"));
 const systemUpdatePage = read(path.join(root, "src", "app", "(sidebar)", "settings", "system-update", "page.tsx"));
 const authVerifyRoute = read(path.join(root, "src", "app", "api", "v1", "auth", "verify", "route.ts"));
 const backupSource = read(path.join(root, "src", "lib", "server", "backup.ts"));
@@ -331,6 +363,42 @@ expect(/function resolveStoreIntro\(\)/.test(buildScript), "fnOS manifest desc m
 expect(/"deploy", "fnos", "repository", "fnpack\.json"/.test(buildScript), "fnOS manifest desc must read the shared intro from deploy/fnos/repository/fnpack.json.");
 expect(/desc=\$\{externalNode \?[\s\S]{0,200}storeIntro\}/.test(buildScript), "fnOS manifest desc must use the shared store intro for the official App Center listing.");
 expect(/display_name=\$\{displayName\}/.test(buildScript) && /title:\s*displayName,/.test(buildScript), "fnOS manifest display_name and the app/ui/config entry title must come from the single displayName constant.");
+// 启动失败要给用户看得懂的原因，而不是只有 mmh.log 里两行英文：
+// 1) 守卫把中文原因写进 STARTUP-ERROR.txt；2) 启动失败时顶一张说明页；
+// 3) 安装阶段就校验 payload 版本和「迁移集 ⊇ 账本」，装错包当场失败。
+expect(/function assertSchemaNotNewerThanBinary/.test(buildScript) && /STARTUP-ERROR\.txt/.test(buildScript), "fnOS init-sqlite guard must write a human-readable STARTUP-ERROR.txt.");
+expect(/payload_ready_and_verified\(\)\s*\{/.test(buildScript) && /EXPECTED_PAYLOAD_VERSION=/.test(buildScript), "fnOS lifecycle must verify the extracted payload version against the package version.");
+expect(/verify_database_schema\(\)\s*\{/.test(buildScript) && /--verify-schema/.test(buildScript), "fnOS lifecycle must reject a package whose payload predates the migrations recorded in the ledger.");
+expect(/fs\.copyFileSync\([\s\S]{0,240}startup-error-page\.cjs/.test(buildScript), "fnOS package must ship the startup error page script.");
+expect(fs.existsSync(path.join(root, "scripts", "fnos", "startup-error-page.cjs")), "Startup error page source script must exist.");
+// external-node 不内置运行时，必须靠 fnOS 的 install_dep_apps 把「Node.js 22」依赖装上
+// （司农记账就是这么做的），否则用户得自己去应用中心找 Node.js，装漏了就是启动失败。
+// bundled 自带 bin/node，不能声明依赖。
+expect(
+  /externalNode \? "install_dep_apps=nodejs_v22/.test(buildScript),
+  "fnOS external-node manifest must declare install_dep_apps=nodejs_v22 so the App Center installs the Node.js 22 dependency automatically; bundled packages already ship bin/node and must not.",
+);
+expect(
+  /const payloadReadyFn = externalNode/.test(buildScript),
+  "fnOS app_payload_is_ready must be variant-aware: external-node payloads carry no bin/node, so the bundled check (bin/node + server.js) can never succeed for them.",
+);
+// external-node 启动前先探测 node 大版本。0.1.85 那版把这行写成了
+// `split(\".\")`（生成到脚本里就是一个反斜杠加引号），node 直接 SyntaxError，
+// NODE_MAJOR 恒为空，真机上每次启动都报 "detected unknown" 而拒绝启动。
+// 同时版本门槛必须与 select_node_bin 的 minimum 一致（>=22），不能钉死等号 22，
+// 否则用户自己装 Node 24 覆盖 MMH_NODE_BIN 时又会被这条检查挡回去。
+expect(
+  buildScript.includes('split(\\".\\")'),
+  'fnOS external-node node-major probe must emit split(".") verbatim (write split(\\".\\") in the JS source); a stray backslash makes it a JS SyntaxError and every start fails with "detected unknown".',
+);
+expect(
+  /-z \\"\$NODE_MAJOR\\" \] \|\| ! \[ \\"\$NODE_MAJOR\\" -ge 22 \]/.test(buildScript),
+  "fnOS external-node must accept Node.js >= 22 (matching select_node_bin's minimum), not just exactly 22, or MMH_NODE_BIN pointing at Node 24 breaks startup.",
+);
+expect(
+  /\/usr\/local\/bin\/node;\s*do/.test(buildScript),
+  "fnOS resolve_node_bin must try the App Center nodejs_v22 dependency before /usr/local/bin/node, otherwise external-node picks a user-installed Node that may not match the bundled better-sqlite3.",
+);
 expect(/mmhReleaseNotes/.test(buildScript), "fnOS package build must copy release notes into the runtime package.json.");
 expect(
   /runtimePkg\.mmhFnosManifestChangelog = manifestChangelog/.test(buildScript),
@@ -381,6 +449,7 @@ expect(fnosInitSqliteIndex !== -1 && fnosPidCheckIndex !== -1 && fnosInitSqliteI
 expect(/startsWith\("file:"\)/.test(scheduledTaskLock) && /if \(isSqliteDatabaseUrl\(\)\) return;/.test(scheduledTaskLock) && /pg_advisory_xact_lock/.test(scheduledTaskLock) && /catch \(error\)/.test(scheduledTaskLock), "Scheduled-task locks must skip PostgreSQL advisory-lock SQL on fnOS SQLite with defense-in-depth try-catch.");
 expect(/function isSqliteDatabaseUrl\(\)/.test(fundProfileSource) && /PRAGMA table_info\("FundProfile"\)/.test(fundProfileSource) && /information_schema\.columns/.test(fundProfileSource), "Fund profile column detection must use PRAGMA on fnOS SQLite before falling back to PostgreSQL information_schema.");
 expect(/20260812_account_note/.test(buildScript) && /addColumnIfMissing\(db, "Account", "note", "TEXT"\)/.test(buildScript), "fnOS SQLite migrations must add Account.note to existing databases without rebuilding tables.");
+expect(/20261113_add_account_group_label/.test(buildScript) && /addColumnIfMissing\(db, "Account", "accountGroup", "TEXT"\)/.test(buildScript) && /addColumnIfMissing\(db, "HouseholdPreference", "accountDropdownGroupBy", "TEXT NOT NULL DEFAULT 'owner'"\)/.test(buildScript), "fnOS SQLite migrations must add Account.accountGroup (user-defined grouping label) and HouseholdPreference.accountDropdownGroupBy for existing databases, otherwise the account list / sidebar hits \"no such column\".");
 expect(/20260812_user_session_days/.test(buildScript) && /addColumnIfMissing\(db, "UserSettings", "sessionDays", "INTEGER NOT NULL DEFAULT 30"\)/.test(buildScript), "fnOS SQLite migrations must add UserSettings.sessionDays to existing databases before restore writes user settings.");
 expect(/20260929_add_user_registration_principal/.test(buildScript) && /addColumnIfMissing\(db, "User", "registrationPrincipalId", "TEXT"\)/.test(buildScript), "fnOS SQLite migrations must add User.registrationPrincipalId for existing databases.");
 expect(/20261013_add_user_registration_email/.test(buildScript) && /addColumnIfMissing\(db, "User", "registrationEmail", "TEXT"\)/.test(buildScript), "fnOS SQLite migrations must add User.registrationEmail for existing databases, so the bound MMH account stays displayable after the local contact email is edited.");
@@ -544,7 +613,11 @@ expect(/MMH_SYSTEM_PASSWORD/.test(buildScript), "fnOS start script must export M
 expect(/mmh-system-password\.txt/.test(buildScript), "fnOS start script must persist generated system passwords in app data.");
 expect(/install_callback/.test(buildScript) && /write_env_file/.test(buildScript), "fnOS lifecycle callbacks must persist package runtime settings.");
 expect(/"run-as": "package"/.test(buildScript), "fnOS lifecycle scripts must run as the mmh package user.");
-expect(/service_port=7777/.test(buildScript), "fnOS manifest must expose the legacy HTTP service port.");
+expect(buildScript.includes(`service_port=\${fnosDefaultPort}`) && !/service_port=7777/.test(buildScript), "fnOS manifest must take service_port from fnosDefaultPort instead of hardcoding a number, so the wizard, manifest and script fallbacks can never drift apart.");
+expect(
+  buildScript.includes('MMH_LOCAL_TCP_PORT="\\${MMH_LOCAL_TCP_PORT:-\\${PORT:-') && !/MMH_LOCAL_TCP_PORT:-7777/.test(buildScript),
+  "fnOS cmd/main must default MMH_LOCAL_TCP_PORT to PORT: a hardcoded port keeps the gateway listening on it no matter which service port the user picks, so moving the port would never actually free the old one.",
+);
 expect(/checkport=true/.test(buildScript), "fnOS manifest must enable service-port checking.");
 expect(/gatewayPrefix:\s*"\/app\/mmh"/.test(buildScript) && /gatewaySocket:\s*"app\.sock"/.test(buildScript) && /type:\s*"url"/.test(buildScript), "fnOS entry must register the unified-gateway URL /app/mmh on the app.sock socket.");
 expect(/url:\s*"\/app\/mmh"/.test(buildScript), "fnOS entry must open the unified-gateway root path /app/mmh.");
@@ -569,7 +642,7 @@ expect(/verifySensitiveOperationPassword/.test(authVerifyRoute) && /getCurrentUs
 expect(!/process\.env\.(POSTGRES_PASSWORD|MMH_SYSTEM_PASSWORD)/.test(authVerifyRoute), "Sensitive operation verification must not rely on deployment database passwords.");
 expect(/FNOS_MANUAL_FPK/.test(buildScript), "fnOS package build should keep an explicit manual test FPK mode.");
 expect(/schema\.native\.prisma/.test(appBuildScript), "fnOS app build must generate and build against the SQLite schema.");
-expect(/MMH_DEPLOY_TARGET/.test(systemUpdateRoute), "System update API must detect fnOS by MMH_DEPLOY_TARGET.");
+expect(/MMH_DEPLOY_TARGET/.test(systemUpdateRoute + systemUpdateService), "System update API must detect fnOS by MMH_DEPLOY_TARGET.");
 expect(/!existsSync\(join\(projectRoot, "\.git"\)\)/.test(systemUpdateRoute), "System update API must not run git commands in package-managed runtimes without a .git directory.");
 expect(/isFnos/.test(systemUpdateRoute), "System update API must return an explicit isFnos flag.");
 expect(/remoteVersion/.test(systemUpdateRoute), "System update API must return the remote app version for update display.");
@@ -590,7 +663,7 @@ expect(
   /getPackageReleaseNotes/.test(systemUpdateRoute) && /mmhFnosManifestChangelog/.test(systemUpdateRoute),
   "System update API must show the shared mmhFnosManifestChangelog in the in-app 本版说明 instead of the long GitHub Release body (mmhReleaseNotes stays only as a fallback for older packages).",
 );
-expect(/readLocalPackageJson/.test(systemUpdateRoute) && /process\.argv\[1\]/.test(systemUpdateRoute), "System update API must fall back to the entry script directory when process.cwd() is not the app root (Synology starts the bundled server one level above app/server).");
+expect(/readLocalPackageJson/.test(systemUpdateRoute + systemUpdateService) && /process\.argv\[1\]/.test(systemUpdateService), "System update API must fall back to the entry script directory when process.cwd() is not the app root (Synology starts the bundled server one level above app/server).");
 expect(/githubProjectUrl/.test(systemUpdatePage) && /systemUpdate\.githubHome/.test(systemUpdatePage), "System update page must expose the GitHub project link for fnOS users.");
 // 共用更新说明的结尾是「完整说明见 GitHub Release v<ver>」，所以这行链接四个部署形态都要有；
 // 不能只在 packageManaged 下渲染（Docker / 独立同样需要入口）——标签行必须是普通 div，不是三元。
@@ -616,7 +689,22 @@ expect(/overwrite_files:\s*true/.test(fnosReleaseWorkflow), "fnOS workflow must 
 expect(/Verify built fnOS FPK/.test(fnosReleaseWorkflow) && /npm run check:fnos/.test(fnosReleaseWorkflow), "fnOS workflow must verify the built .fpk before upload.");
 const releaseUploadStep = (fnosReleaseWorkflow.split("Upload fnOS FPK to GitHub Release")[1] || "").split("- name:")[0];
 expect(/release-artifacts\/fnos\/mmh-fnos-v\*[^\n]*\.fpk/.test(releaseUploadStep), "fnOS workflow should upload .fpk files.");
-expect(/matrix\.package_variant == 'bundled'/.test(releaseUploadStep), "fnOS Release upload must be gated to matrix.package_variant == 'bundled', otherwise the four-leg matrix attaches the undocumented external-node FPKs to every release.");
+// 2026-11-18 用户裁定：公开 Release 只发布 nodejsless（external-node）变体。
+// 这条断言的方向与 2026-11-14 版相反——那时「不得 gate 到 bundled」是为了两变体都上线，
+// 现在 bundled 明确不许进 Release（它只是手动兜底），所以上传步骤必须显式 gate 到
+// external-node，否则一次 dispatch 之后的 release 事件会把 64MB 的 bundled 也挂上去。
+expect(/github\.event_name == 'release' && matrix\.package_variant == 'external-node'/.test(releaseUploadStep), "fnOS Release upload must gate to external-node only: since 2026-11-18 bundled is a manual-only fallback and must never become a release asset.");
+expect(!/matrix\.package_variant == 'bundled'/.test(releaseUploadStep), "fnOS Release upload must not reference the bundled variant at all.");
+expect(/matrix\.package_variant == 'external-node' && '-external-node' \|\| ''/.test(releaseUploadStep), "fnOS Release upload must suffix the external-node variant filename, otherwise the two variants clobber each other on the Release.");
+// 构建矩阵本身：release 事件只跑 external-node；bundled 必须留着手动入口（dispatch 选 bundled/all）。
+// 注意矩阵是前置 job 算出来的——`jobs.<id>.if` 引用 `matrix` 会被 GitHub 拒绝
+// （Unrecognized named-value: 'matrix'，2026-11-18 实测 dispatch 422），
+// 所以只能断言 prepare 的解析逻辑 + build-fpk 的 fromJSON 取矩阵。
+expect(/matrix:\s*\$\{\{\s*fromJSON\(needs\.prepare\.outputs\.matrix\)\s*\}\}/.test(fnosReleaseWorkflow), "fnOS build matrix must come from the prepare job output (job-level `if` cannot read `matrix`).");
+expect(/variant="external-node"/.test(fnosReleaseWorkflow) && /if \[ "\$EVENT" = "release" \]/.test(fnosReleaseWorkflow), "fnOS prepare job must force external-node on release events.");
+expect(/select\(\.package_variant == "external-node"\)/.test(fnosReleaseWorkflow) && /select\(\.package_variant == "bundled"\)/.test(fnosReleaseWorkflow), "fnOS prepare job must keep both variants selectable so bundled stays a manual fallback.");
+expect(/all\) matrix=\$\(echo "\$legs" \| jq -c '\{include: \.\}'\)/.test(fnosReleaseWorkflow), "fnOS prepare job must expand to all legs when package_variant=all.");
+expect(/package_variant:[\s\S]{0,400}?default:\s*"external-node"/.test(fnosReleaseWorkflow), "fnOS workflow_dispatch must default package_variant to external-node.");
 expect(/target_arch/.test(fnosReleaseWorkflow) && /arm64/.test(fnosReleaseWorkflow), "fnOS release workflow must build both x86 and arm64 packages.");
 expect(/linux-\$\{FNPACK_ARCH\}/.test(fnosReleaseWorkflow), "fnOS release workflow must download fnpack for the current runner architecture.");
 expect(/linux-\$\{NODE_ARCH\}/.test(fnosReleaseWorkflow), "fnOS release workflow must download the Node runtime for the package architecture.");
@@ -656,7 +744,7 @@ if (fs.existsSync(stageDir)) {
   const stageApplySettingsScript = read(path.join(stageDir, "cmd", "apply-settings"));
   expect(new RegExp(`arch\\s*=\\s*${verifyTarget.manifestArch}`).test(stageManifest), `fnOS ${verifyTarget.id} stage manifest must declare arch=${verifyTarget.manifestArch}.`);
   expect(new RegExp(`platform\\s*=\\s*${verifyTarget.manifestPlatform}`).test(stageManifest), `fnOS ${verifyTarget.id} stage manifest must declare platform=${verifyTarget.manifestPlatform}.`);
-  expect(/^service_port=7777$/m.test(stageManifest), `fnOS ${verifyTarget.id} stage manifest must declare service_port=7777.`);
+  expect(new RegExp(`^service_port=${fnosDefaultPort}$`, "m").test(stageManifest), `fnOS ${verifyTarget.id} stage manifest must declare service_port=${fnosDefaultPort}.`);
   expect(/^checkport=true$/m.test(stageManifest), `fnOS ${verifyTarget.id} stage manifest must enable service-port checking.`);
   expect(/^os_min_version=0\.9\.0$/m.test(stageManifest), `fnOS ${verifyTarget.id} stage manifest must require fnOS 0.9.0 or newer.`);
   assertManifestChangelogReadable(stageManifest, `fnOS ${verifyTarget.id} stage`);
@@ -760,6 +848,14 @@ if (fs.existsSync(stageDir)) {
   expect(/MMH_NODE_MAX_OLD_SPACE_MB=\$\{node_max_old_space\}/.test(stageApplySettingsScript), `fnOS ${verifyTarget.id} stage cmd/apply-settings must persist the Node old-space guardrail.`);
   expect(!fs.existsSync(path.join(stageDir, "wizard", "install")), `fnOS ${verifyTarget.id} stage must not include wizard/install; the FN soft-store client parses it and would block silent updates on user input.`);
   expect(fs.existsSync(path.join(stageDir, "wizard", "config")), `fnOS ${verifyTarget.id} stage must include wizard/config so the service port remains editable.`);
+  const stageConfigWizardPath = path.join(stageDir, "wizard", "config");
+  if (fs.existsSync(stageConfigWizardPath)) {
+    const stageConfigWizard = read(stageConfigWizardPath);
+    expect(
+      stageConfigWizard.includes("默认值是 7777") && !stageConfigWizard.includes("7788"),
+      `fnOS ${verifyTarget.id} stage wizard/config must advertise 7777 as the default service port; a 7788 default contradicts Docker/desktop and the probe-forward rule.`,
+    );
+  }
   const stageUninstallWizardPath = path.join(stageDir, "wizard", "uninstall");
   expect(fs.existsSync(stageUninstallWizardPath), `fnOS ${verifyTarget.id} stage must include wizard/uninstall so manual uninstalls offer a keep/delete-data choice.`);
   if (fs.existsSync(stageUninstallWizardPath)) {
@@ -791,7 +887,7 @@ if (process.env.FNOS_VERIFY_BUILT_FPK === "1") {
   expect(/version\s*=/.test(manifest), "Built fnOS .fpk manifest must include a version.");
   expect(new RegExp(`platform\\s*=\\s*${verifyTarget.manifestPlatform}`).test(manifest), `Built fnOS .fpk manifest must declare platform=${verifyTarget.manifestPlatform}.`);
   expect(new RegExp(`^arch\\s*=\\s*${verifyTarget.manifestArch}$`, "m").test(manifest), `Built fnOS .fpk manifest must declare arch=${verifyTarget.manifestArch}.`);
-  expect(/^service_port\s*=\s*7777$/m.test(manifest), "Built fnOS .fpk manifest must declare service_port=7777.");
+  expect(new RegExp(`^service_port\\s*=\\s*${fnosDefaultPort}$`, "m").test(manifest), `Built fnOS .fpk manifest must declare service_port=${fnosDefaultPort}.`);
   expect(/^checkport\s*=\s*true$/m.test(manifest), "Built fnOS .fpk manifest must enable service-port checking.");
   expect(/^os_min_version\s*=\s*0\.9\.0$/m.test(manifest), "Built fnOS .fpk manifest must require fnOS 0.9.0 or newer.");
   assertManifestChangelogReadable(manifest, "Built fnOS .fpk");
@@ -867,6 +963,11 @@ if (process.env.FNOS_VERIFY_BUILT_FPK === "1") {
   expect(
     appEntries.includes("server/node_modules/next/dist/compiled/webpack/webpack-lib.js"),
     "Built fnOS .fpk must include Next.js compiled webpack runtime modules required by its production server.",
+  );
+  const shippedSourceMaps = appEntries.filter((entry) => entry.endsWith(".map"));
+  expect(
+    shippedSourceMaps.length === 0,
+    `Built fnOS .fpk must not ship source maps (${shippedSourceMaps.length} found, e.g. ${shippedSourceMaps.slice(0, 3).join(", ")}); pdfjs-dist alone adds ~19 MB of dead weight.`,
   );
   const publicFiles = appEntries
     .filter((entry) => entry.startsWith("server/public/") && !entry.endsWith("/"))

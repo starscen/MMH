@@ -40,6 +40,13 @@ export const TRANSACTION_SOURCE_INSURANCE = "insurance" as const;
 const TRANSACTION_SOURCE_REGULAR_INVEST = "regular_invest" as const;
 export const TRANSACTION_SOURCE_REGULAR_INVEST_REFUND = "regular_invest_refund" as const;
 export const TRANSACTION_SOURCE_FUND_UNITS_RECONCILE = "fund_units_reconcile" as const;
+/**
+ * 货币基金每日收益结转（红利再投）写入的流水 source。
+ *
+ * 货基净值恒为 1，收益按监管口径只能红利再投：只增份额、没有现金流动，
+ * 因此明细要显示成「收益结转」而不是「买入」，统计也不能算成新增投入。
+ */
+export const TRANSACTION_SOURCE_MONEY_INCOME = "money_fund_income" as const;
 const TRANSACTION_SOURCE_SCHEDULED_TASK = "scheduled_task" as const;
 /**
  * 债券执行器（买入/付息/赎回）写入的流水 source。
@@ -47,6 +54,13 @@ const TRANSACTION_SOURCE_SCHEDULED_TASK = "scheduled_task" as const;
  * 因此「计划任务」页统计「已执行次数」时必须按 source 单独匹配。
  */
 export const TRANSACTION_SOURCE_BOND = "bond" as const;
+/**
+ * 贵金属提取实物（转固定资产/收藏品）写入的流水 source。
+ *
+ * 复用「赎回」子类型来减少克数与成本，但金额恰等于移出成本，已实现盈亏恒为 0；
+ * 明细层据此把这一行显示成「提取实物」而不是「卖出」，固定资产侧也用它标记来源。
+ */
+export const TRANSACTION_SOURCE_METAL_EXTRACT = "metal_extract" as const;
 
 export function isLicensedInsuranceEntry(entry: { source?: string | null; insuranceProductId?: string | null }) {
   return entry.source === TRANSACTION_SOURCE_INSURANCE || Boolean(entry.insuranceProductId);

@@ -9,6 +9,15 @@ on:
         description: "Optional package version. Leave blank to use package.json version."
         required: false
         default: ""
+      package_variant:
+        description: "Which variant to build. Release events always build external-node only."
+        required: true
+        default: "external-node"
+        type: choice
+        options:
+          - external-node
+          - bundled
+          - all
 
 permissions:
   contents: write
@@ -17,37 +26,46 @@ env:
   FNOS_FNPACK_VERSION: 1.2.1
 
 jobs:
+  # 2026-11-18: 公开 Release 只挂轻量变体（external-node，~21MB，运行时用应用中心装的
+  # Node.js 22）。bundled（内置 Node.js 22，~64MB）保留为手动兜底，只在 workflow_dispatch
+  # 且显式选 bundled/all 时才构建，且永不进 Release。
+  #
+  # 矩阵必须在 job 级算好：`jobs.<id>.if` 里引用 `matrix` 会被 GitHub 拒绝
+  # （Unrecognized named-value: 'matrix'，2026-11-18 dispatch 直接 422），所以用前置
+  # job 输出矩阵 JSON，再 `fromJSON` 喂给 build-fpk。
+  prepare:
+    name: Resolve build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          VARIANT: ${{ github.event.inputs.package_variant }}
+        run: |
+          set -euo pipefail
+          variant="${VARIANT:-external-node}"
+          if [ "$EVENT" = "release" ]; then
+            variant="external-node"
+          fi
+          legs='[{"target_arch":"x86","node_arch":"x64","fnpack_arch":"amd64","runner":"ubuntu-22.04","package_variant":"bundled","node_major":22},{"target_arch":"arm64","node_arch":"arm64","fnpack_arch":"arm64","runner":"ubuntu-22.04-arm","package_variant":"bundled","node_major":22},{"target_arch":"x86","node_arch":"x64","fnpack_arch":"amd64","runner":"ubuntu-22.04","package_variant":"external-node","node_major":22},{"target_arch":"arm64","node_arch":"arm64","fnpack_arch":"arm64","runner":"ubuntu-22.04-arm","package_variant":"external-node","node_major":22}]'
+          case "$variant" in
+            all) matrix=$(echo "$legs" | jq -c '{include: .}') ;;
+            bundled) matrix=$(echo "$legs" | jq -c '{include: [.[] | select(.package_variant == "bundled")]}') ;;
+            external-node) matrix=$(echo "$legs" | jq -c '{include: [.[] | select(.package_variant == "external-node")]}') ;;
+            *) echo "::error::unknown package_variant=$variant"; exit 1 ;;
+          esac
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "resolved variant=$variant (event=$EVENT) matrix=$matrix"
+
   build-fpk:
-    name: Build and upload fnOS SQLite FPK (${{ matrix.target_arch }})
+    name: Build and upload fnOS SQLite FPK (${{ matrix.target_arch }} / ${{ matrix.package_variant }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target_arch: x86
-            node_arch: x64
-            fnpack_arch: amd64
-            runner: ubuntu-22.04
-            package_variant: bundled
-            node_major: 22
-          - target_arch: arm64
-            node_arch: arm64
-            fnpack_arch: arm64
-            runner: ubuntu-22.04-arm
-            package_variant: bundled
-            node_major: 22
-          - target_arch: x86
-            node_arch: x64
-            fnpack_arch: amd64
-            runner: ubuntu-22.04
-            package_variant: external-node
-            node_major: 22
-          - target_arch: arm64
-            node_arch: arm64
-            fnpack_arch: arm64
-            runner: ubuntu-22.04-arm
-            package_variant: external-node
-            node_major: 22
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -156,16 +174,18 @@ jobs:
           if-no-files-found: error
 
       - name: Upload fnOS FPK to GitHub Release
-        # The documented release asset set is the two bundled FPKs. Without the
-        # variant gate every matrix leg ran this step -- and two of the four legs
-        # build the undocumented external-node variant -- so a published release
-        # would carry four fnOS assets instead of two.
-        # (`release: published` is the only event that reaches this step, which is
-        # why the never-published v0.1.67 draft still shows just two.)
-        if: github.event_name == 'release' && matrix.package_variant == 'bundled'
+        # Release asset set = x86/arm64 x external-node = 2 FPKs (2026-11-18).
+        # 轻量变体（~21MB，数据库仍是 SQLite，运行时用应用中心装的 Node.js 22）是
+        # 唯一公开形态：软仓 / FnDepot / VPS 直链全部指向它，bundled 不再随 Release 发布。
+        # bundled（内置 Node.js 22，~64MB）保留为手动兜底：只有 workflow_dispatch
+        # 选了 bundled/all 才构建，且永远不上传 Release —— 所以 2 支 FPK 是预期结果。
+        # (`release: published` is the only event that reaches this step; a
+        # workflow_dispatch only produces Actions artifacts.)
+        if: github.event_name == 'release' && matrix.package_variant == 'external-node'
         uses: softprops/action-gh-release@v2
         with:
           # Pin the filename instead of globbing `*.fpk`, so a stray build left
-          # in the workspace can never leak onto the release.
-          files: release-artifacts/fnos/mmh-fnos-v*-${{ matrix.target_arch == 'x86' && 'x86_64' || 'arm64' }}.fpk
+          # in the workspace can never leak onto the release. The suffix keeps the
+          # two variants from clobbering each other.
+          files: release-artifacts/fnos/mmh-fnos-v*-${{ matrix.target_arch == 'x86' && 'x86_64' || 'arm64' }}${{ matrix.package_variant == 'external-node' && '-external-node' || '' }}.fpk
           overwrite_files: true

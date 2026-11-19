@@ -93,10 +93,8 @@ type LoadCreditBillPageDataParams = {
   billStorageAccountId: string;
   billMonthParam: string;
   billPage: number;
-  billMonthsLimit: number;
   hideZeroBills: boolean;
   hideSettledBills: boolean;
-  showRecentBillCycles: boolean;
   view: string;
   t: (key: string) => string;
   forceCycleRefresh?: boolean;
@@ -153,10 +151,8 @@ export async function loadCreditBillPageData(params: LoadCreditBillPageDataParam
     billStorageAccountId,
     billMonthParam,
     billPage,
-    billMonthsLimit,
     hideZeroBills,
     hideSettledBills,
-    showRecentBillCycles,
     view,
     t,
     forceCycleRefresh = false,
@@ -244,10 +240,11 @@ export async function loadCreditBillPageData(params: LoadCreditBillPageDataParam
   // Bump this timestamp whenever the credit-bill flow calculation logic
   // changes (e.g. classifyCreditBillFlowSide). It forces persisted cycle
   // summaries to be recomputed with the new logic instead of reusing stale
-  // cached values. Last bumped: 2026-11-07 (consolidated bills are scoped to
-  // institution + owner now, so persisted cycles from the old cross-owner
-  // group must be recomputed under the new bill storage account).
-  const creditBillSummaryLogicUpdatedAt = new Date(Date.UTC(2026, 10, 7, 0, 0, 0));
+  // cached values. Last bumped: 2026-11-16 (`signedCreditBillAmountFromCardSide`
+  // now treats every row whose destination is the card as inflow with
+  // `Math.abs(amount)`, so refunds stored positive are no longer counted as
+  // outflow; every persisted cycle has to be recomputed).
+  const creditBillSummaryLogicUpdatedAt = new Date(Date.UTC(2026, 10, 16, 0, 0, 0));
   const latestBillingDayRuleUpdatedAt = billingDayRules.reduce<Date | null>(
     (latest, rule) => (!latest || rule.updatedAt > latest ? rule.updatedAt : latest),
     null,
@@ -284,7 +281,7 @@ export async function loadCreditBillPageData(params: LoadCreditBillPageDataParam
         )
       : { updatedEntries: 0, updatedPlans: 0 };
   if (normalizedCreditInstallments.updatedEntries > 0 || normalizedCreditInstallments.updatedPlans > 0) {
-    await invalidateCreditCardCycleCacheForAccountIds(billAccountIds);
+    await invalidateCreditCardCycleCacheForAccountIds(billAccountIds, { rebuild: false });
   }
 
   const isDisplayableBillMonth = (month: string) => !currentStatementMonth || month <= currentStatementMonth;
@@ -600,12 +597,7 @@ export async function loadCreditBillPageData(params: LoadCreditBillPageDataParam
       }
     }
 
-    const sortedMonths = Array.from(months).sort((a, b) => b.localeCompare(a));
-    const limitedMonths = sortedMonths.slice(0, billMonthsLimit);
-    if (showRecentBillCycles && selectedBillMonth && !limitedMonths.includes(selectedBillMonth)) {
-      limitedMonths.push(selectedBillMonth);
-    }
-    return limitedMonths;
+    return Array.from(months).sort((a, b) => b.localeCompare(a));
   })();
 
   const billMonthsForCumulative = (() => {
@@ -969,7 +961,7 @@ export async function loadCreditBillPageData(params: LoadCreditBillPageDataParam
     .filter((s) => hideZeroBills ? !(s.expenseAbs === 0 && s.income === 0 && s.bill === 0 && s.paid === 0 && !s.isCurrentCycle) : true)
     .filter((s) => hideSettledBills ? !isCreditBillSettled(s) : true);
 
-  const billListPageSize = 12;
+  const billListPageSize = 10;
   const totalPages = Math.ceil(displayBillRows.length / billListPageSize);
   const currentPage = Math.min(billPage, totalPages || 1);
   const creditBillSummaryRows: CreditBillSummaryRow[] = displayBillRows.map((s) => ({
@@ -1213,7 +1205,7 @@ export async function refreshCreditCardCycleCachesForAccountIds(params: {
   }
 
   for (const group of refreshGroups.values()) {
-    await invalidateCreditCardCycleCacheForAccountIds(group.billAccountIds);
+    await invalidateCreditCardCycleCacheForAccountIds(group.billAccountIds, { rebuild: false });
     await loadCreditBillPageData({
       householdId: params.householdId,
       selectedAccount: group.selectedAccount,
@@ -1222,10 +1214,8 @@ export async function refreshCreditCardCycleCachesForAccountIds(params: {
       billStorageAccountId: group.billStorageAccountId,
       billMonthParam: "",
       billPage: 1,
-      billMonthsLimit: 120,
       hideZeroBills: false,
       hideSettledBills: false,
-      showRecentBillCycles: false,
       view: "refresh",
       t: (key) => key,
       forceCycleRefresh: true,

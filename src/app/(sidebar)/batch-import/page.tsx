@@ -38,6 +38,11 @@ import {
   type StatementImportField,
 } from "@/lib/statement/header-catalog";
 import { routeAlipayFundBill } from "@/lib/statement/alipay-fund-bill";
+import {
+  stripTemplateRows,
+  TEMPLATE_GUIDE_TITLE_HINTS,
+  type TemplateGuideTitle,
+} from "@/lib/import-template-sample";
 import { excludeFundTradeRows } from "@/lib/statement/fund-trade-split";
 import { buildJdImportTemplate } from "@/lib/statement/jd-template";
 import { buildWechatImportTemplate } from "@/lib/statement/wechat-template";
@@ -51,7 +56,9 @@ import {
 import {
   inferSignedAmountInflowSign,
   isCreditCardCreditAdjustmentLikeText,
+  isCreditCardRepaymentKeywordText,
   isCreditCardRepaymentLikeText,
+  isCreditCardVoucherLikeText,
   isExpenseRefundLikeText,
   signedAmountDirection,
 } from "@/lib/statement/amount-direction";
@@ -323,7 +330,14 @@ function applyNumberExpression(currentValue: number, expression: string) {
 }
 
 function buildTemplates(t: (key: string, params?: Record<string, string | number>) => string): ImportTemplate[] {
-  const fundHeaders = FUND_CANONICAL_HEADERS.map((header) => t(FUND_FIELD_LABEL_KEYS[header]));
+  // 示例行一律标「样板行」列，导入时（见 stripTemplateRows）整行跳过；
+  // 用户下载模板后即便不删示例，也不会把示例数据记成真实流水。
+  const sampleHeader = t("settings.accounts.import.sampleRow");
+  const sampleYes = t("settings.accounts.import.sampleRowYes");
+  const fundHeaders = [
+    ...FUND_CANONICAL_HEADERS.map((header) => t(FUND_FIELD_LABEL_KEYS[header])),
+    sampleHeader,
+  ];
   const normalHeaders = [
     t("detail.column.date"),
     t("detail.column.postedAt"),
@@ -336,6 +350,7 @@ function buildTemplates(t: (key: string, params?: Record<string, string | number
     t("detail.column.counterparty"),
     t("detail.column.tags"),
     t("detail.column.remark"),
+    sampleHeader,
   ];
   return [
   {
@@ -348,12 +363,12 @@ function buildTemplates(t: (key: string, params?: Record<string, string | number
     sheetName: t("batchImport.sheet.template"),
     headers: normalHeaders,
     rows: [
-      ["2026-06-08", "2026-06-09", t("transaction.type.expense"), "32.50", "", t("viewImport.sampleAccountDebit"), "", t("viewImport.sampleCategoryDining"), t("viewImport.sampleMerchantFastFood"), t("viewImport.sampleTagLunch"), t("viewImport.sampleRemarkLunch")],
-      ["2026-06-08", "", t("transaction.type.income"), "", "1.28", t("viewImport.sampleAccountDebit"), "", t("viewImport.sampleCategoryInterestIncome"), t("viewImport.sampleAccountDebit"), t("viewImport.sampleTagInterest"), t("viewImport.sampleRemarkDemandInterest")],
-      ["2026-06-08", "2026-06-08 23:30", t("transaction.type.expense"), "2.00", "", t("viewImport.sampleAccountDebit"), "", t("viewImport.sampleCategoryInterestIncome"), t("viewImport.sampleAccountDebit"), t("viewImport.sampleTagInterest"), t("batchImport.template.normal.sample.accountFeeRemark")],
-      ["2026-06-08", "", t("transaction.type.transfer"), "1000.00", "", t("viewImport.sampleAccountDebit"), t("viewImport.sampleAccountCash"), "", "", t("viewImport.sampleAccountCash"), t("viewImport.sampleRemarkTransfer")],
-      ["2026-06-20", "2026-06-20", t("transaction.type.transfer"), "", "108.00", t("batchImport.template.normal.sample.creditCardAccount"), t("viewImport.sampleAccountDebit"), "", "", "", t("viewImport.sampleRemarkCreditCardRepayment")],
-      ["2026-06-05", "2026-06-06", t("transaction.type.expense"), "", "20.00", t("batchImport.template.normal.sample.creditCardAccount"), "", t("viewImport.sampleCategoryDining"), t("viewImport.sampleMerchantRestaurant"), "", t("viewImport.sampleRemarkCreditCardRefund")],
+      ["2026-06-08", "2026-06-09", t("transaction.type.expense"), "32.50", "", t("viewImport.sampleAccountDebit"), "", t("viewImport.sampleCategoryDining"), t("viewImport.sampleMerchantFastFood"), t("viewImport.sampleTagLunch"), t("viewImport.sampleRemarkLunch"), sampleYes],
+      ["2026-06-08", "", t("transaction.type.income"), "", "1.28", t("viewImport.sampleAccountDebit"), "", t("viewImport.sampleCategoryInterestIncome"), t("viewImport.sampleAccountDebit"), t("viewImport.sampleTagInterest"), t("viewImport.sampleRemarkDemandInterest"), sampleYes],
+      ["2026-06-08", "2026-06-08 23:30", t("transaction.type.expense"), "2.00", "", t("viewImport.sampleAccountDebit"), "", t("viewImport.sampleCategoryInterestIncome"), t("viewImport.sampleAccountDebit"), t("viewImport.sampleTagInterest"), t("batchImport.template.normal.sample.accountFeeRemark"), sampleYes],
+      ["2026-06-08", "", t("transaction.type.transfer"), "1000.00", "", t("viewImport.sampleAccountDebit"), t("viewImport.sampleAccountCash"), "", "", t("viewImport.sampleAccountCash"), t("viewImport.sampleRemarkTransfer"), sampleYes],
+      ["2026-06-20", "2026-06-20", t("transaction.type.transfer"), "", "108.00", t("batchImport.template.normal.sample.creditCardAccount"), t("viewImport.sampleAccountDebit"), "", "", "", t("viewImport.sampleRemarkCreditCardRepayment"), sampleYes],
+      ["2026-06-05", "2026-06-06", t("transaction.type.expense"), "", "20.00", t("batchImport.template.normal.sample.creditCardAccount"), "", t("viewImport.sampleCategoryDining"), t("viewImport.sampleMerchantRestaurant"), "", t("viewImport.sampleRemarkCreditCardRefund"), sampleYes],
     ],
     fields: [
       { name: normalHeaders[0], required: true, note: t("batchImport.template.normal.field.date") },
@@ -367,6 +382,7 @@ function buildTemplates(t: (key: string, params?: Record<string, string | number
       { name: normalHeaders[8], required: false, note: t("batchImport.template.normal.field.institution") },
       { name: normalHeaders[9], required: false, note: t("batchImport.template.normal.field.tags") },
       { name: normalHeaders[10], required: false, note: t("batchImport.template.normal.field.remark") },
+      { name: normalHeaders[11], required: false, note: t("batchImport.template.sampleRowNote") },
     ],
     guideNotes: [
       t("batchImport.guide.currentSupport"),
@@ -385,10 +401,10 @@ function buildTemplates(t: (key: string, params?: Record<string, string | number
     sheetName: t("batchImport.sheet.template"),
     headers: fundHeaders,
     rows: [
-      ["2026-06-03", t(FUND_ACTION_HEADERS.buy), t("batchImport.template.sample.cashAccount"), t("batchImport.template.sample.fundAccount"), "000001", "1000.00", "1", "", "1.3521", "738.99", "2026-06-04", "2026-06-04", ""],
-      ["2026-06-10", t(FUND_ACTION_HEADERS.redeem), t("batchImport.template.sample.cashAccount"), t("batchImport.template.sample.fundAccount"), "000001", "500.00", "", "0.50", "1.3889", "360.00", "2026-06-11", "2026-06-12", ""],
-      ["2026-06-15", t(FUND_ACTION_HEADERS.dividendCash), t("batchImport.template.sample.cashAccount"), t("batchImport.template.sample.fundAccount"), "000001", "300.00", "", "", "", "", "", "2026-06-16", ""],
-      ["2026-06-18", t(FUND_ACTION_HEADERS.dividendReinvest), "", t("batchImport.template.sample.fundAccount"), "000001", "", "", "", "1.4200", "210.00", "2026-06-18", "", ""],
+      ["2026-06-03", t(FUND_ACTION_HEADERS.buy), t("batchImport.template.sample.cashAccount"), t("batchImport.template.sample.fundAccount"), "000001", "1000.00", "1", "", "1.3521", "738.99", "2026-06-04", "2026-06-04", "", sampleYes],
+      ["2026-06-10", t(FUND_ACTION_HEADERS.redeem), t("batchImport.template.sample.cashAccount"), t("batchImport.template.sample.fundAccount"), "000001", "500.00", "", "0.50", "1.3889", "360.00", "2026-06-11", "2026-06-12", "", sampleYes],
+      ["2026-06-15", t(FUND_ACTION_HEADERS.dividendCash), t("batchImport.template.sample.cashAccount"), t("batchImport.template.sample.fundAccount"), "000001", "300.00", "", "", "", "", "", "2026-06-16", "", sampleYes],
+      ["2026-06-18", t(FUND_ACTION_HEADERS.dividendReinvest), "", t("batchImport.template.sample.fundAccount"), "000001", "", "", "", "1.4200", "210.00", "2026-06-18", "", "", sampleYes],
     ],
     footerRows: [
       [],
@@ -413,6 +429,7 @@ function buildTemplates(t: (key: string, params?: Record<string, string | number
       { name: "confirmDate", label: t("batchImport.template.fund.label.confirmDate"), required: false, note: t("batchImport.template.fund.field.confirmDate") },
       { name: "arrivalDate", label: t("batchImport.template.fund.label.arrivalDate"), required: false, note: t("batchImport.template.fund.field.arrivalDate") },
       { name: "remark", label: t("batchImport.template.fund.label.remark"), required: false, note: t("batchImport.template.fund.field.remark") },
+      { name: "sampleRow", label: sampleHeader, required: false, note: t("batchImport.template.sampleRowNote") },
     ],
     guideNotes: [(t("batchImport.guide.fundImportNotes") as unknown as string).split("\n")[0] ?? ""],
   },
@@ -586,6 +603,8 @@ function isExpenseRefundImportText(source: string) {
 }
 
 function inferBillType(source: string, inflow: number, outflow: number, counterAccount: string): ParsedItem["type"] {
+  // 先认补贴券：下面的 /还款/ 兜底正则会把「还款券」误判成转账。
+  if (isCreditCardVoucherLikeText(source)) return "income";
   if (isExpenseRefundImportText(source)) return "expense";
   if (/结息|利息|派息|收入|収入|工资|給与|报销|返现|返利|credit/i.test(source)) return "income";
   if (/转入|转进|他行转入|账户转入|转出|转账|转给|转到|汇款|跨行转账|取现|还款|振替|返済|repayment|payment/i.test(source)) return "transfer";
@@ -829,8 +848,12 @@ function normalRowsToItems(
   rows: string[][],
   importMode: BillImportMode,
   fieldHeaders: StatementFieldHeaders = STATEMENT_IMPORT_FIELD_HEADERS,
+  guideTitle: TemplateGuideTitle = "",
 ): ParsedItem[] {
-  const [headers = [], ...dataRows] = rows;
+  const [headers = [], ...rawDataRows] = rows;
+  // 模板自带的「样板行」与底部字段说明区都不是真实流水：所有导入通道统一在这里剔除，
+  // 否则用户把下载的模板（示例行还在）直接拖回来，示例数据会被记成真实流水。
+  const dataRows = stripTemplateRows(rawDataRows, headers, guideTitle);
   const headerReader = createStatementHeaderReader(headers, fieldHeaders);
   const readAny = (row: string[], keys: readonly string[]) => headerReader.readAliases(row, keys);
   // 微信模板在归一化行末尾追加了原文「交易类型」「交易对方」（其它账单没有这两列）。
@@ -925,7 +948,9 @@ function normalRowsToItems(
     const secondRemark = readAny(row, fieldHeaders.secondRemark);
     const rowText = row.join(" ");
     let source = `${majorTypeText} ${majorType ?? ""} ${explicitType} ${category} ${institution} ${remark} ${secondRemark} ${counterAccount} ${account} ${rowText}`;
-    const creditCardRepaymentLike = isCreditCardRepaymentLikeText(source) || /自动还款|自动扣款|银联转账|银联入账|云闪付|autopay/i.test(source);
+    const creditCardRepaymentLike = isCreditCardRepaymentLikeText(source)
+      || isCreditCardRepaymentKeywordText(source)
+      || /自动扣款|银联转账|银联入账|云闪付/i.test(source);
     if (importMode === "credit_card" && !counterAccount.trim() && creditCardRepaymentLike) {
       counterAccount = importCreditCardPaymentSourceHint(source);
       source = `${majorTypeText} ${majorType ?? ""} ${explicitType} ${category} ${institution} ${remark} ${secondRemark} ${counterAccount} ${account} ${rowText}`;
@@ -1310,9 +1335,11 @@ export default function BatchImportPage() {
       .then((data) => {
         if (cancelled || !Array.isArray(data.accounts)) return;
         const accounts = data.accounts as AccountOption[];
-        const activeAccounts = accounts.filter((account) => account.isActive !== false);
-        accountMatcherRef.current = createImportAccountMatcher(activeAccounts);
-        accountIdentityConflictRef.current = createImportAccountIdentityConflictChecker(activeAccounts);
+        // 停用账户也参与匹配（2026-11-18 用户裁定「停用不要阻止匹配」）：历史账单里的
+        // 老卡多数已停用，挡掉它们只会把流水推到「新建账户」上。歧义由 matcher 内部的
+        // 「启用优先」兜住——有启用候选时只在启用账户里定案。
+        accountMatcherRef.current = createImportAccountMatcher(accounts);
+        accountIdentityConflictRef.current = createImportAccountIdentityConflictChecker(accounts);
         setAccountOptions(accounts);
         postImportDebugLog(importTraceIdRef.current, "accounts_request_succeeded", {
           accountCount: data.accounts.length,
@@ -1386,9 +1413,16 @@ export default function BatchImportPage() {
     return formatAccountTableTitle(account, accountDisplayLabel(account), readAccountDisplaySettings());
   }, [accountDisplayLabel]);
 
-  const activeAccountOptions = useMemo(
-    () => accountOptions.filter((account) => account.isActive !== false),
-    [accountOptions],
+  // 下拉同样列全部账户（停用账户也能被匹配到、也要能被手选回来），
+  // 只是排序把启用账户放前面：「停用不要阻止匹配」（2026-11-18 用户裁定）。
+  const accountPickerOptions = useMemo(
+    () => accountOptions
+      .slice()
+      .sort((a, b) => {
+        const activeDiff = Number(b.isActive !== false) - Number(a.isActive !== false);
+        return activeDiff !== 0 ? activeDiff : accountDisplayLabel(a).localeCompare(accountDisplayLabel(b), "zh-Hans-CN");
+      }),
+    [accountDisplayLabel, accountOptions],
   );
   const getAccountIdentityConflict = useMemo(
     () => accountIdentityConflictRef.current,
@@ -1401,12 +1435,12 @@ export default function BatchImportPage() {
 
   const accountSmartSelectOptions = useMemo<SmartSelectOption[]>(
     () =>
-      activeAccountOptions.map((account) => ({
+      accountPickerOptions.map((account) => ({
         id: account.id,
         label: accountDisplayLabel(account),
         title: accountHoverTitle(account),
       })),
-    [accountDisplayLabel, accountHoverTitle, activeAccountOptions],
+    [accountDisplayLabel, accountHoverTitle, accountPickerOptions],
   );
   const accountById = useMemo(() => new Map(accountOptions.map((account) => [account.id, account])), [accountOptions]);
 
@@ -1418,14 +1452,14 @@ export default function BatchImportPage() {
   }, []);
 
   const accountSmartSelectOptionsByRole = useCallback((role: AccountPickerRole) =>
-    activeAccountOptions
+    accountPickerOptions
       .filter((account) => accountMatchesPickerRole(account, role))
       .map((account) => ({
         id: account.id,
         label: accountDisplayLabel(account),
         title: accountHoverTitle(account),
       } satisfies SmartSelectOption)),
-  [accountDisplayLabel, accountHoverTitle, accountMatchesPickerRole, activeAccountOptions]);
+  [accountDisplayLabel, accountHoverTitle, accountMatchesPickerRole, accountPickerOptions]);
 
   const matchedAccountForText = useCallback((value: string) => {
     const matchedId = findMatchedAccountId(value);
@@ -1706,7 +1740,12 @@ export default function BatchImportPage() {
         workbookDetail,
         traceLabel,
       ].filter(Boolean).join("\n"));
-      const parsedRows = normalRowsToItems(rows, importMode, statementFieldHeaders);
+      const parsedRows = normalRowsToItems(
+        rows,
+        importMode,
+        statementFieldHeaders,
+        [t("settings.accounts.import.sheetGuideTitle"), ...TEMPLATE_GUIDE_TITLE_HINTS],
+      );
       const parsed = alignStatementRecognitionToLedger(
         alignStatementIncomeRefunds(parsedRows.map(enrichKnownStatementMerchantForImport)),
         bookCategories,
@@ -2613,7 +2652,7 @@ export default function BatchImportPage() {
 
   const accountReplaceOptions = useMemo<BatchReplaceOption[]>(() => [
     { value: "", label: t("batchImport.unselected") },
-    ...activeAccountOptions.map((account) => {
+    ...accountPickerOptions.map((account) => {
       const label = accountDisplayLabel(account);
       return {
         value: account.id,
@@ -2621,7 +2660,7 @@ export default function BatchImportPage() {
         title: accountHoverTitle(account),
       };
     }),
-  ], [accountDisplayLabel, accountHoverTitle, activeAccountOptions, t]);
+  ], [accountDisplayLabel, accountHoverTitle, accountPickerOptions, t]);
 
   const replaceFields = useMemo<BatchReplaceFieldConfig<ReplaceField>[]>(() => [
     { value: "date", label: replaceFieldLabels.date, kind: "date" },

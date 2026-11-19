@@ -14,12 +14,15 @@ import { useAccountSSFilter } from "./accountSSFilter";
 import { buildCategoryTreeOptions, type CategorySource } from "./categorySmartSelect";
 import { institutionTypeLabel, isSettlementCounterpartyType, isInstitutionTypeOf, LOAN_DIALOG_INSTITUTION_TYPE_VALUES } from "@/lib/account-kinds";
 import { buildAccountDisplayOption, formatAccountHoverTitle } from "@/lib/account-display";
+import { institutionFullName } from "@/lib/institution-display";
 import { recordRecentAccounts, sortByAccountUsage, useAccountUsage } from "@/lib/client/recentAccounts";
 import { useCloseOnNavigation } from "@/lib/client/useCloseOnNavigation";
 /** 整窗外壳（遮罩 / 标题栏 / 宽度档位 / 表单 / FT 页签与卡片 / 窗口底按钮行）：规则集中在它。 */
 import { EntryModalShell } from "@/components/EntryModalShell";
+import { EntryConvertHeaderAction } from "@/components/EntryConvertHeaderAction";
 import type { FolderTabsCardItem } from "@/components/FolderTabsCard";
 import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
+import { isEntryConversionRequest } from "@/lib/client/entry-conversion";
 import { showConfirmDialog } from "@/lib/client/confirm-dialog";
 import { formatDateUtc as formatDateInput, parseDateInputToUtc as dateInputToUtcDate } from "@/lib/date-utils";
 import { formatAmountDraft } from "@/lib/format";
@@ -50,7 +53,7 @@ import {
 } from "@/lib/loan-repayment";
 import { formatLoanRecalculateSuccessMessage } from "@/lib/loan-repayment-recalculate-result";
 import { DEFAULT_LOAN_PREPAY_STRATEGY, type LoanPrepayStrategy } from "@/lib/loan-prepay-strategy";
-import { isHomeLoanType,  resolveLoanTypeValue, type LoanTypeValue } from "@/lib/loan-type";
+import { LOAN_TYPES, isHomeLoanType, normalizeLoanType, resolveLoanTypeValue, type LoanTypeValue } from "@/lib/loan-type";
 import { allowsLiabilityInterest, swapLiabilityFlowDirection } from "@/lib/liability";
 import {
   decodeScheduledTaskMemo,
@@ -166,11 +169,16 @@ function isFixedRepaymentMethodValue(method: string) {
   return FIXED_REPAYMENT_METHODS.has(normalizeLoanRepaymentMethod(method));
 }
 
+// 日历日一律按 UTC 午夜读写（项目日期契约）。旧实现用 `new Date(`${value}T00:00:00`)`
+// 按本地时区解析、再用 formatDateUtc 输出，在 +08:00 下会整体早一天
+// （2026-01-15 加一个月得到 2026-02-14），月末还要夹到目标月最后一天。
 function addMonthsInput(dateInput: string, months: number) {
-  const date = new Date(`${dateInput}T00:00:00`);
-  if (!Number.isFinite(date.getTime())) return dateInput;
-  date.setMonth(date.getMonth() + months);
-  return formatDateInput(date);
+  const base = dateInputToUtcDate(dateInput);
+  if (!base || !Number.isFinite(base.getTime())) return dateInput;
+  const target = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + months, 1));
+  const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  target.setUTCDate(Math.min(base.getUTCDate(), lastDay));
+  return formatDateInput(target);
 }
 
 function dateInputTime(value: string) {
@@ -388,7 +396,6 @@ function FixedAssetCreateDialog({
         width="sm"
         title={t("txForm.createFixedAsset")}
         onClose={onClose}
-        closeLabel={t("table.close")}
         onSubmit={(event) => {
           event.preventDefault();
           onSubmit();
@@ -561,6 +568,10 @@ export function LiabilityTransactionModal({
   const [open, setOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [editingEntryId, setEditingEntryId] = useState("");
+  // 「转换交易」的会话标识：新建成功后随 `<ns>:create:success` 回传（见 lib/client/entry-conversion.ts）。
+  const [requestId, setRequestId] = useState<string | null>(null);
+  /** 本次新建来自「转换交易」：保存后要删原记录，因此不提供「保存并再记一笔」。 */
+  const [conversionEntry, setConversionEntry] = useState(false);
   // True when the open/edit event already carried repayment-plan defaults
   // (liability-side edit); the plan fetch prefill then stays off.
   const planDefaultsFromEventRef = useRef(false);
@@ -667,7 +678,7 @@ export function LiabilityTransactionModal({
         .map((group: { id: string; name: string }) => ({ id: group.id, name: group.name })),
       institutionId: (data.institutions ?? []).map((institution: { id: string; name: string; shortName?: string | null; type?: string | null }) => ({
         id: institution.id,
-        name: institution.shortName?.trim() || institution.name,
+        name: institutionFullName(institution),
         type: institution.type ?? "",
       })),
       counterpartyId: (data.counterparties ?? []).map((counterparty: { id: string; name: string; shortName?: string | null; type?: string | null }) => ({
@@ -846,7 +857,7 @@ export function LiabilityTransactionModal({
         groupId: (data.groups ?? []).map((group) => ({ id: group.id, name: group.name })),
         institutionId: (data.institutions ?? []).map((institution) => ({
           id: institution.id,
-          name: institution.shortName?.trim() || institution.name,
+          name: institutionFullName(institution),
           type: institution.type ?? "",
         })),
         counterpartyId: (data.counterparties ?? []).map((counterparty) => ({
@@ -931,6 +942,8 @@ export function LiabilityTransactionModal({
       const editEventLoanType = editEventLiabilityAccount ? accountOptionLoanType(editEventLiabilityAccount) : null;
       const effectiveLoanType = detailLoanType ?? editEventLoanType;
       resetDraft();
+      setRequestId(detail?.requestId ?? null);
+      setConversionEntry(isEntryConversionRequest(detail?.requestId));
       fixedAssetLinkPrefilledRef.current = false;
       planDefaultsFromEventRef.current = !!(
         detail?.defaultRepaymentMethod ||
@@ -1454,7 +1467,7 @@ export function LiabilityTransactionModal({
       shouldPromptHistoricalRepayments({
         mode,
         isFixedRepaymentMethod,
-        firstRepaymentDate: isHomeLoanBorrow || autoDebit ? autoDebitFirstDate : firstRepaymentDate,
+        firstRepaymentDate: loanPlanFirstRepaymentDate,
         today,
         repaymentIntervalMonths,
       })
@@ -1519,7 +1532,7 @@ export function LiabilityTransactionModal({
     }
 
     const submittedAutoDebit = isHomeLoanBorrow || autoDebit;
-    const submittedFirstRepaymentDate = submittedAutoDebit ? autoDebitFirstDate : firstRepaymentDate;
+    const submittedFirstRepaymentDate = loanPlanFirstRepaymentDate;
     const submittedAutoDebitCashAccountId = isCollateralLoanBorrow ? autoDebitCashAccountId : cashAccountId;
     const submittedCashAccountId = isLoanBorrow
       ? submittedLoanFundingMode === "cash_disbursement"
@@ -1559,7 +1572,7 @@ export function LiabilityTransactionModal({
     formData.set("repaymentMethod", normalizeLoanRepaymentMethod(repaymentMethod));
     formData.set("repaymentIntervalMonths", repaymentIntervalMonths);
     formData.set("loanTotalRuns", loanTotalRuns);
-    formData.set("firstBillDate", isHomeLoanBorrow ? "" : firstBillDate);
+    formData.set("firstBillDate", isHomeLoanBorrow ? "" : loanPlanFirstBillDate);
     formData.set("firstRepaymentDate", submittedFirstRepaymentDate);
     formData.set("createRepaymentPlan", showBorrowPlan && isFixedRepaymentMethod && !isPlanlessOtherLoanBorrow ? "true" : "false");
     formData.set("autoDebit", submittedAutoDebit ? "true" : "false");
@@ -1639,6 +1652,12 @@ export function LiabilityTransactionModal({
       }
       recordRecentAccounts([cashAccountId, fixedAssetAccountId]);
       dispatchFinanceDataChanged({ reason: "liability-save" });
+      // 「转换交易」靠 requestId 把这次新建和原记录串起来（见 lib/client/entry-conversion.ts）。
+      if (!editingEntryId && requestId) {
+        window.dispatchEvent(new CustomEvent("mmh:settlement:create:success", { detail: { requestId } }));
+        setRequestId(null);
+        setConversionEntry(false);
+      }
       if (keepAdding) {
         // 保存并再记一笔：账户、利率、还款方式、日期保留，只清本笔金额类字段
         setPrincipal("");
@@ -1694,20 +1713,50 @@ export function LiabilityTransactionModal({
   }
   const flowTab = mode === "repay_out" || mode === "collect_in" ? "repay" : "borrow";
   /**
-   * 窗口页签 = 原来摆在表单中段的两组 `segment-button`，改由 FT 页签在卡片顶部显示：
-   *  - 贷款还款窗：正常还款 / 提前还款；
-   *  - 往来款窗：借入借出 / 还款收款（id 与 `flowTab` 同口径）；
-   *  - 贷款借入窗：只有一种流向，不给页签（卡片顶边直接贴窗口顶部）。
+   * 贷款类别页签项：优先用接口返回的类别（含用户自建类别），接口没回来（或失败）时
+   * 用内置四类兜底，页签照常可切 —— 不再用「只有一个『请选择』」的下拉。
    */
-  const liabilityTabs = useMemo<FolderTabsCardItem[]>(() => {
-    if (isLoanRepaymentMode) {
-      return (["repay_out", "prepay_out"] as const).map((item) => ({
-        id: item,
-        label: t(MODE_LABELS[item]),
-        disabled: !!editingEntryId && !canSwitchLiabilityEditMode(mode, item),
+  const loanCategoryTabItems = useMemo(() => {
+    if (loanCategoryOptions.length > 0) {
+      return loanCategoryOptions.map((category) => ({
+        id: category.id,
+        baseType: category.baseType,
+        label: category.isSystem ? t(`loan.type.${category.baseType}`) : category.name,
       }));
     }
-    if (isLoanDialog) return [];
+    return LOAN_TYPES.map((baseType) => ({
+      id: baseType as string,
+      baseType: baseType as LoanTypeValue,
+      label: t(`loan.type.${baseType}`),
+    }));
+  }, [loanCategoryOptions, t]);
+  // 当前页签：类别列表到位前用口径（activeLoanTab）兜底，避免首帧没有选中项。
+  const loanCategoryTabId = loanCategoryOptions.length > 0
+    ? loanCategoryId || loanCategoryOptions.find((item) => item.baseType === activeLoanTab)?.id || ""
+    : activeLoanTab;
+  /**
+   * 窗口页签 = 原来摆在表单中段的两组 `segment-button`，改由 FT 页签在卡片顶部显示：
+   *  - 贷款窗：贷款类别（房贷/消费/抵押/其他，含自建类别）+ 正常还款 / 提前还款；
+   *  - 往来款窗：借入借出 / 还款收款（id 与 `flowTab` 同口径）。
+   */
+  const liabilityTabs = useMemo<FolderTabsCardItem[]>(() => {
+    if (isLoanDialog) {
+      const locked = !!editingEntryId;
+      const categoryTabs: FolderTabsCardItem[] = loanCategoryTabItems.map((item) => ({
+        id: item.id,
+        label: item.label,
+        // 编辑既有贷款记录时不允许换类别：换类别会重置整张表单，也会影响已生成的还款计划。
+        disabled: locked,
+      }));
+      const repaymentTabs: FolderTabsCardItem[] = (["repay_out", "prepay_out"] as const).map((item) => ({
+        id: item,
+        label: t(MODE_LABELS[item]),
+        // 编辑还款记录时保留原来的「正常还款 / 提前还款」可互切；编辑贷款借入记录时把还款页签一并锁住
+        // （把一条借入记录切成还款会脱离它生成的还款计划）。
+        disabled: locked && !(isLoanRepaymentMode && canSwitchLiabilityEditMode(mode, item)),
+      }));
+      return [...categoryTabs, ...repaymentTabs];
+    }
     // 往来款窗的「借款/还款」在编辑态不置灰：用户可以把一条还款/收款记录改回借款/借出
     // （2026-11-04），由 handleModeSelect 与服务端 editEntryId 链路兜底。
     return [
@@ -1722,11 +1771,28 @@ export function LiabilityTransactionModal({
         disabled: false,
       },
     ];
-  }, [isLoanRepaymentMode, isLoanDialog, editingEntryId, mode, t]);
-  const liabilityActiveTabId = isLoanRepaymentMode ? mode : flowTab;
+  }, [isLoanDialog, isLoanRepaymentMode, loanCategoryTabItems, editingEntryId, mode, t]);
+  const liabilityActiveTabId = isLoanDialog
+    ? (isLoanRepaymentMode ? mode : loanCategoryTabId)
+    : flowTab;
+
   function handleLiabilityTabChange(id: string) {
-    if (isLoanRepaymentMode) {
-      handleModeSelect(id as LiabilityMode);
+    if (isLoanDialog) {
+      if (id === "repay_out" || id === "prepay_out") {
+        handleModeSelect(id);
+        return;
+      }
+      const category = loanCategoryOptions.find((item) => item.id === id);
+      if (category) {
+        setLoanCategoryId(category.id);
+        handleLoanTabSelect(category.baseType);
+        return;
+      }
+      // 兜底页签的 id 就是口径本身（home / consumer / mortgage / other）。
+      const fallbackTab = normalizeLoanType(id);
+      if (!fallbackTab) return;
+      setLoanCategoryId("");
+      handleLoanTabSelect(fallbackTab);
       return;
     }
     handleModeSelect(resolveFlowMode(id === "repay"));
@@ -1767,6 +1833,25 @@ export function LiabilityTransactionModal({
   // 编辑贷款借入记录：只允许改还款资金账户，其它字段只读回填。
   const isLoanBorrowEditLocked = isLoanBorrow && !!editingEntryId;
   const showHomeLoanLprFields = isHomeLoanBorrow && selectedLiabilityInstitutionType !== "provident_fund";
+  // 其他贷款的分期计划以「发生日期」为锚：放款日 + 1 个还款间隔 = 首期。
+  // 未勾自动扣款时表单上不渲染「首期账单日 / 首次还款日」输入框，若仍沿用
+  // resetDraft 里的「今天 + 1 个月」，预览和落库的计划都会凭空从今天起算（2026-11-17 用户反馈）。
+  const otherLoanPlanAnchorDate = useMemo(() => {
+    if (!isLoanBorrow || activeLoanTab !== "other") return "";
+    // 勾了自动扣款就有可见的「首期账单日 / 扣款日期」输入框，以用户填的为准；
+    // 编辑模式由已保存的计划回填，也不覆盖。
+    if (autoDebit || editingEntryId) return "";
+    if (!isValidDateInput(date)) return "";
+    const runs = Number.parseInt(loanTotalRuns || "0", 10);
+    if (!Number.isFinite(runs) || runs <= 0) return "";
+    const intervalMonths = Math.max(1, Number.parseInt(repaymentIntervalMonths || "1", 10) || 1);
+    return addMonthsInput(date, intervalMonths);
+  }, [activeLoanTab, autoDebit, date, editingEntryId, isLoanBorrow, loanTotalRuns, repaymentIntervalMonths]);
+  // 计划首期日期（预览 / 历史还款提示 / 提交共用同一口径）。
+  const loanPlanFirstRepaymentDate = isHomeLoanBorrow || autoDebit
+    ? autoDebitFirstDate
+    : otherLoanPlanAnchorDate || firstRepaymentDate;
+  const loanPlanFirstBillDate = otherLoanPlanAnchorDate || firstBillDate;
   // Status of the selected repayable loan account's current scheduled period.
   const selectedRepayableLoanRow = useMemo(
     () => (isLoanRepaymentMode ? repayableLoanAccountRows.find((item) => item.accountId === liabilityAccountId) : undefined),
@@ -2196,7 +2281,7 @@ export function LiabilityTransactionModal({
   const isFixedRepaymentMethod = isFixedRepaymentMethodValue(repaymentMethod);
   const loanSchedulePreview = useMemo(() => {
     if (!showBorrowPlan || !isFixedRepaymentMethod) return null;
-    const firstRunDate = dateInputToUtcDate(isHomeLoanBorrow || autoDebit ? autoDebitFirstDate : firstRepaymentDate);
+    const firstRunDate = dateInputToUtcDate(loanPlanFirstRepaymentDate);
     const principalAmount = parseAbsMoneyText(principal);
     const totalRuns = Number.parseInt(loanTotalRuns || "0", 10);
     const intervalMonths = Number.parseInt(repaymentIntervalMonths || "1", 10);
@@ -2248,6 +2333,7 @@ export function LiabilityTransactionModal({
     historicalRateRows,
     isFixedRepaymentMethod,
     isHomeLoanBorrow,
+    loanPlanFirstRepaymentDate,
     loanTotalRuns,
     principal,
     repaymentIntervalMonths,
@@ -2811,7 +2897,8 @@ export function LiabilityTransactionModal({
           open={open}
           heightKey="liability-tx"
           heightMode="natural"
-          width="md"
+          /* 贷款窗顶部有 6 个页签（4 个贷款类别 + 正常还款/提前还款），md 档会把「消费贷款」压成省略号。 */
+          width={isLoanDialog ? "xl" : "md"}
           title={editingEntryId
             ? (isLoanDialog ? t("liabilityTx.editLoan") : t("liabilityTx.editRepayment"))
             : isLoanDialog ? t("liabilityTx.loanTitle") : t("liabilityTx.title")}
@@ -2819,7 +2906,26 @@ export function LiabilityTransactionModal({
             setOpen(false);
             resetDraft();
           }}
-          closeLabel={t("table.close")}
+          headerExtra={(
+            <EntryConvertHeaderAction
+              source={editingEntryId ? {
+                entryId: editingEntryId,
+                date,
+                amount: principal,
+                note,
+                accountId: liabilityAccountId,
+                accountKind: isLoanDialog ? "loan" : "settlement",
+                accountIsSettlementAccount: !isLoanDialog,
+                cashAccountId,
+                // 借入 / 收回是钱进来，借出 / 还款是钱出去：转换菜单只列同向目标。
+                inflow: mode === "borrow_in" || mode === "collect_in",
+              } : null}
+              onBeforeConvert={() => {
+                setOpen(false);
+                resetDraft();
+              }}
+            />
+          )}
           onSubmit={onSubmit}
           tabs={liabilityTabs}
           activeTabId={liabilityActiveTabId}
@@ -2827,42 +2933,17 @@ export function LiabilityTransactionModal({
           rulerLabels={liabilityTabs.map((tab) => tab.label)}
           footer={(
             <>
-              <button type="button" className="secondary-button h-9 px-3" disabled={submitting} onClick={() => saveLiabilityTransaction(true)}>
-                {submitting ? t("txForm.saving") : t("txForm.saveAndRepeat")}
-              </button>
+              {!conversionEntry ? (
+                <button type="button" className="secondary-button h-9 px-3" disabled={submitting} onClick={() => saveLiabilityTransaction(true)}>
+                  {submitting ? t("txForm.saving") : t("txForm.saveAndRepeat")}
+                </button>
+              ) : null}
               <button type="submit" className="primary-button h-9 px-3" disabled={submitting}>
                 {submitting ? t("txForm.saving") : t("common.save")}
               </button>
             </>
           )}
         >
-                    {isLoanDialog ? (
-                      activeLoanTab === "repay_out" ? (
-                        <div className="text-sm font-semibold text-slate-700">{t("liabilityTx.loanMode.repayment")}</div>
-                      ) : (
-                        <label className="block space-y-1">
-                          <div className="form-label">{t("settings.accounts.loanCategory")}</div>
-                          <select
-                            value={loanCategoryId}
-                            disabled={isLoanBorrowEditLocked}
-                            onChange={(event) => {
-                              const nextId = event.target.value;
-                              const option = loanCategoryOptions.find((item) => item.id === nextId);
-                              setLoanCategoryId(nextId);
-                              if (option) handleLoanTabSelect(option.baseType);
-                            }}
-                            className="form-input"
-                          >
-                            <option value="">{t("txForm.selectPlaceholder")}</option>
-                            {loanCategoryOptions.map((option) => (
-                              <option key={option.id} value={option.id}>
-                                {option.isSystem ? t(`loan.type.${option.baseType}`) : option.name}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      )
-                    ) : null}
 
                     {isLoanBorrow ? (
                       <>
@@ -3092,7 +3173,6 @@ export function LiabilityTransactionModal({
                                       groupSelectOnDoubleClick: false,
                                       minDropdownWidth: 560,
                                       dropdownMaxHeight: 420,
-                                      density: "compact",
                                       expandedGroupColumns: 4,
                                     }}
                                   />
@@ -3199,7 +3279,10 @@ export function LiabilityTransactionModal({
                                       const checked = event.target.checked;
                                       setAutoDebit(checked);
                                       if (checked) {
-                                        setAutoDebitFirstDate(firstRepaymentDate || addMonthsInput(today, 1));
+                                        // 其他贷款的扣款日/账单日同样锚定发生日期，别弹回「今天 + 1 期」。
+                                        const anchorDate = otherLoanPlanAnchorDate;
+                                        setAutoDebitFirstDate(anchorDate || firstRepaymentDate || addMonthsInput(today, 1));
+                                        if (anchorDate) setFirstBillDate(anchorDate);
                                       } else {
                                         setFirstBillDate(firstBillDate || autoDebitFirstDate);
                                         setFirstRepaymentDate(firstRepaymentDate || autoDebitFirstDate);
@@ -3260,7 +3343,7 @@ export function LiabilityTransactionModal({
                                     setShowHistoricalRates(true);
                                     setHistoricalRateRows((prev) => prev.length > 0
                                       ? prev
-                                      : [createHistoricalRateRow((autoDebit ? autoDebitFirstDate : firstRepaymentDate) || date, annualRate)]);
+                                      : [createHistoricalRateRow(loanPlanFirstRepaymentDate || date, annualRate)]);
                                     setHistoricalRatesOpen(true);
                                   }}
                                 >
@@ -3306,8 +3389,8 @@ export function LiabilityTransactionModal({
                                         <tr key={`${row.period}-${row.date}`} className="border-t border-slate-100">
                                           <td className="px-2 py-1 text-slate-600">{row.period}/{loanTotalRuns}</td>
                                           <td className="px-2 py-1 text-slate-600">
-                                            {!isHomeLoanBorrow && isValidDateInput(firstBillDate)
-                                              ? addMonthsInput(firstBillDate, (row.period - 1) * loanSchedulePreview.intervalMonths)
+                                            {!isHomeLoanBorrow && isValidDateInput(loanPlanFirstBillDate)
+                                              ? addMonthsInput(loanPlanFirstBillDate, (row.period - 1) * loanSchedulePreview.intervalMonths)
                                               : row.date}
                                           </td>
                                           <td className="px-2 py-1 text-slate-600">{row.date}</td>
@@ -3380,7 +3463,6 @@ export function LiabilityTransactionModal({
         width="sm"
         title={t("liabilityTx.historyConfirmTitle")}
         onClose={() => setHistoryConfirmOpen(false)}
-        closeLabel={t("liabilityTx.back")}
         onSubmit={(event) => {
           event.preventDefault();
           void confirmHistoricalPrompt();
@@ -3403,7 +3485,7 @@ export function LiabilityTransactionModal({
         )}
       >
                   <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
-                    {t("liabilityTx.historyPrompt.warning", { date: firstRepaymentDate || "-" })}
+                    {t("liabilityTx.historyPrompt.warning", { date: loanPlanFirstRepaymentDate || "-" })}
                   </div>
 
                   <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2">
@@ -3492,7 +3574,6 @@ export function LiabilityTransactionModal({
         width="md"
         title={t("liabilityShell.rateAdjustment")}
         onClose={() => setHistoricalRatesOpen(false)}
-        closeLabel={t("table.close")}
         onSubmit={(event) => {
           event.preventDefault();
           if (historicalRateRows.length === 0) {

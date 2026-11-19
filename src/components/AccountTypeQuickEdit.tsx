@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useI18n } from "@/lib/i18n";
+import { X } from "lucide-react";
 import { ClearableNoteField } from "@/components/ClearableNoteField";
 import { CalcInput } from "@/components/CalcInput";
 import { DateStepper } from "@/components/DateStepper";
@@ -14,6 +15,7 @@ import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
 import { normalizeCurrency } from "@/lib/currency";
 import { supportsTradingCalendarForAccount, TRADING_CALENDARS } from "@/lib/fund/trading-calendar";
 import { isSettlementCounterpartyType } from "@/lib/account-kinds";
+import { institutionFullName } from "@/lib/institution-display";
 import {
   accountKindOptionsForEdit,
   accountRecordLockErrorKey,
@@ -35,6 +37,7 @@ import { EQUAL_PAYMENT_REPAYMENT_METHOD,
 } from "@/lib/loan-repayment";
 import { isCollateralLoanType, isHomeLoanType, type LoanTypeValue } from "@/lib/loan-type";
 import { CurrencySmartSelect } from "@/components/CurrencySmartSelect";
+import { AccountEditDialog } from "@/components/accounts/AccountEditDialog";
 import { formatAmountDraft } from "@/lib/format";
 
 type AccountKindValue = "cash" | "bank_debit" | "bank_credit" | "ewallet" | "deposit" | "investment" | "fixed_asset" | "settlement" | "loan" | "other";
@@ -116,6 +119,8 @@ export function AccountTypeQuickEdit({ account, accountLabel, openSignal = 0, sh
   const { t } = useI18n();
   const router = useRouter();
   const [open, setOpen] = useState(false);
+  // 普通账户编辑：就地渲染「设置 → 账户管理」那份唯一实现，不跳转设置页。
+  const [accountDialogOpen, setAccountDialogOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [groups, setGroups] = useState<Group[]>([]);
@@ -206,6 +211,14 @@ export function AccountTypeQuickEdit({ account, accountLabel, openSignal = 0, sh
   }, [account, loanDetails, loanDetailsIsCollateralLoan, loanDetailsIsHomeLoan]);
 
   const openEditor = useCallback(async () => {
+    // 账户编辑只有一套：就是「系统设置 → 账户管理」里的编辑界面（AccountEditDialog）。
+    // 视图表头双击就地渲染同一个组件，不跳转、也不再维护第二套表单。
+    // 只有负债侧编辑贷款资料（loanDetails）仍用本弹窗——设置页对贷款账户是只读的，
+    // 还款资金账户只能在负债明细里调。
+    if (!loanDetails) {
+      setAccountDialogOpen(true);
+      return;
+    }
     resetForm();
     setOpen(true);
     const [data, categoryResponse] = await Promise.all([
@@ -225,7 +238,7 @@ export function AccountTypeQuickEdit({ account, accountLabel, openSignal = 0, sh
         .filter((item) => item.isActive !== false && item.isPlaceholder !== true && !["loan", "settlement", "investment", "fixed_asset"].includes(item.kind ?? ""))
         .map((item) => ({ id: item.id, name: item.name })));
     }
-  }, [account.id, resetForm]);
+  }, [account.id, loanDetails, resetForm]);
 
   useEffect(() => {
     if (openSignal <= 0) return;
@@ -363,6 +376,33 @@ export function AccountTypeQuickEdit({ account, accountLabel, openSignal = 0, sh
     } finally { setSaving(false); }
   }
 
+  // 切类型不清空机构：借记卡→电子钱包、借记卡→信用卡这类只是换账户形态，
+  // 挂在同一家银行上，清掉机构用户得重新选一遍（2026-11-15 用户反馈「改类型后所属机构被清零」）。
+  // 口径与设置页 changeEditKind 对齐：新类型仍接受该机构类型就保留；
+  // 新类型本身不支持机构（现金/往来款/固定资产）或明确不兼容（如 payment 机构挂借记卡）才清空。
+  const changeAccountKind = (nextKind: AccountKindValue) => {
+    const nextProductType = nextKind === "investment" ? (form.investProductType || "fund") : nextKind === "fixed_asset" ? "property" : "";
+    const supportsNextInstitution = nextKind !== "settlement" && allowedInstitutionTypesForAccount(nextKind, nextProductType).length > 0;
+    const originalInstitutionId = form.institutionId || account.institutionId || "";
+    const selectedInstitution = institutions.find((institution) => institution.id === originalInstitutionId);
+    // 机构清单尚未加载时拿不到 type：此时保留原值，宁可保存时明确报「机构类型不符」，
+    // 也不把用户填好的机构静默丢掉。
+    const keepInstitution = supportsNextInstitution
+      && Boolean(originalInstitutionId)
+      && (!selectedInstitution || accountInstitutionTypeIsAllowed(nextKind, nextProductType, selectedInstitution.type));
+    setForm((current) => {
+      const nextLoanType = nextKind === "loan" ? (current.loanType || "home") : "";
+      return {
+        ...current,
+        kind: nextKind,
+        institutionId: keepInstitution ? (current.institutionId || originalInstitutionId) : "",
+        counterpartyId: nextKind === "settlement" ? (current.counterpartyId || account.counterpartyId || "") : "",
+        loanType: nextLoanType,
+        isConsumerLoan: nextKind === "loan" && nextLoanType === "consumer" ? "true" : "false",
+        investProductType: nextProductType,
+      };
+    });
+  };
   const setField = (key: string, value: string) => setForm((current) => ({ ...current, [key]: value }));
   const setLoanField = (key: string, value: string) => setLoanForm((current) => ({ ...current, [key]: value }));
   const inputClass = "h-8 w-full rounded-md border border-slate-200 bg-white px-2 text-sm text-slate-800 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100 disabled:bg-slate-100 disabled:text-slate-400";
@@ -372,34 +412,24 @@ export function AccountTypeQuickEdit({ account, accountLabel, openSignal = 0, sh
   return (
     <>
       {showTrigger ? (
-        <span className="page-title cursor-pointer" onDoubleClick={() => { void openEditor(); }} title={accountLabel || account.name}>{accountLabel || account.name}</span>
+        <span
+          className="page-title cursor-pointer"
+          onDoubleClick={() => { void openEditor(); }}
+          title={`${accountLabel || account.name} · ${t("accountTypeQuickEdit.openInSettingsHint")}`}
+        >{accountLabel || account.name}</span>
       ) : null}
       {open && typeof document !== "undefined" ? createPortal(
         <ModalLayer className="fixed inset-0 flex items-center justify-center overflow-y-auto bg-slate-950/30 p-4" onMouseDown={() => !saving && setOpen(false)}>
           <div className="max-h-[calc(100dvh-2rem)] w-[720px] max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-slate-200 bg-white p-4 shadow-xl" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="mb-3 flex items-center justify-between"><h2 className="text-sm font-semibold text-slate-800">{t("settings.accounts.editTitle", { name: account.name })}</h2><button type="button" className="h-8 rounded border border-slate-200 px-2 text-sm text-slate-600" onClick={() => setOpen(false)}>{t("table.close")}</button></div>
+            <div className="mb-3 flex items-center justify-between"><h2 className="text-sm font-semibold text-slate-800">{t("settings.accounts.editTitle", { name: account.name })}</h2><button type="button" className="secondary-button inline-flex h-8 w-8 items-center justify-center px-0 text-slate-600" onClick={() => setOpen(false)} title={t("common.close")} aria-label={t("common.close")}><X className="h-4 w-4" /></button></div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3">
               <Field label={t("settings.accounts.name")}><input value={form.name ?? ""} onChange={(event) => setField("name", event.target.value)} className={inputClass} /></Field>
-              <Field label={t("settings.accounts.type")}>{isFixedAssetAccount || loanAccountEditLocked ? <input value={isFixedAssetAccount ? t("txForm.fixedAssetToggle") : t(`account.kind.${kind}`)} readOnly className={`${inputClass} bg-slate-50 text-slate-500`} /> : <select value={kind} onChange={(event) => {
-                const nextKind = event.target.value;
-                setForm((current) => {
-                  const nextLoanType = nextKind === "loan" ? (current.loanType || "home") : "";
-                  return {
-                    ...current,
-                    kind: nextKind,
-                    institutionId: "",
-                    counterpartyId: nextKind === "settlement" ? (current.counterpartyId || account.counterpartyId || "") : "",
-                    loanType: nextLoanType,
-                    isConsumerLoan: nextKind === "loan" && nextLoanType === "consumer" ? "true" : "false",
-                    investProductType: nextKind === "investment" ? current.investProductType || "fund" : nextKind === "fixed_asset" ? "property" : "",
-                  };
-                });
-              }} disabled={kindSelectDisabled} className={inputClass}>{selectableAccountKinds.map((value) => <option key={value} value={value}>{t(`account.kind.${value}`)}</option>)}</select>}
+              <Field label={t("settings.accounts.type")}>{isFixedAssetAccount || loanAccountEditLocked ? <input value={isFixedAssetAccount ? t("txForm.fixedAssetToggle") : t(`account.kind.${kind}`)} readOnly className={`${inputClass} bg-slate-50 text-slate-500`} /> : <select value={kind} onChange={(event) => changeAccountKind(event.target.value as AccountKindValue)} disabled={kindSelectDisabled} className={inputClass}>{selectableAccountKinds.map((value) => <option key={value} value={value}>{t(`account.kind.${value}`)}</option>)}</select>}
               </Field>
               {kind === "loan" ? <Field label={t("settings.accounts.loanCategory")}><select value={form.loanCategoryId || loanCategories[0]?.id || ""} onChange={(event) => setField("loanCategoryId", event.target.value)} className={inputClass}>{loanCategories.map((category) => <option key={category.id} value={category.id}>{category.isSystem ? t(`loan.type.${category.baseType}`) : category.name}</option>)}</select></Field> : null}
               {isFixedAssetAccount && <Field label={t("fixedAssetEdit.assetType")}><select value={form.fixedAssetType || "property"} disabled={loanAccountEditLocked} onChange={(event) => setField("fixedAssetType", event.target.value)} className={inputClass}>{FIXED_ASSET_TYPES.map((value) => <option key={value} value={value}>{t(`fixedAsset.type.${value}`)}</option>)}</select></Field>}
               <Field label={t("settings.accounts.owner")}><select value={form.groupId ?? ""} disabled={loanAccountEditLocked} onChange={(event) => setField("groupId", event.target.value)} className={inputClass}><option value="">{t("settings.accounts.selectOwner")}</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></Field>
-              {supportsInstitution && !isFixedAssetAccount && <Field label={t("settings.accounts.institution")}><select value={form.institutionId ?? ""} disabled={loanAccountEditLocked} onChange={(event) => setField("institutionId", event.target.value)} className={inputClass}><option value="">{t("settings.accounts.selectInstitution")}</option>{filteredInstitutions.map((institution) => <option key={institution.id} value={institution.id}>{institution.shortName?.trim() || institution.name}</option>)}</select></Field>}
+              {supportsInstitution && !isFixedAssetAccount && <Field label={t("settings.accounts.institution")}><select value={form.institutionId ?? ""} disabled={loanAccountEditLocked} onChange={(event) => setField("institutionId", event.target.value)} className={inputClass}><option value="">{t("settings.accounts.selectInstitution")}</option>{filteredInstitutions.map((institution) => <option key={institution.id} value={institution.id}>{institutionFullName(institution)}</option>)}</select></Field>}
               {kind === "settlement" && account.agreementAnnualRate !== undefined && (
                 <>
                   <Field label={t("liabilityTx.agreementAnnualRate")}><input value={form.agreementAnnualRate ?? ""} onChange={(event) => setField("agreementAnnualRate", event.target.value)} inputMode="decimal" className={inputClass} /></Field>
@@ -416,6 +446,8 @@ export function AccountTypeQuickEdit({ account, accountLabel, openSignal = 0, sh
                     value={currentCurrency}
                     onChange={(val) => setField("currency", val)}
                     labelSystem={(code) => t(`entityForm.currency.${code.toLowerCase()}`, { defaultValue: code })}
+                    // 本面板其它字段都是 `inputClass` 的 h-8，货币下拉跟着走紧凑尺寸。
+                    density="compact"
                   />
                 )}
               </Field>
@@ -463,9 +495,12 @@ export function AccountTypeQuickEdit({ account, accountLabel, openSignal = 0, sh
               </section>
             ) : null}
             {error ? <p className="mt-3 text-sm text-red-600">{error}</p> : null}
-            <div className="mt-4 flex justify-end gap-2"><button type="button" className="rounded border border-slate-200 px-3 py-2 text-sm text-slate-600" onClick={() => setOpen(false)} disabled={saving}>{t("common.cancel")}</button><button type="button" className="rounded bg-blue-600 px-3 py-2 text-sm text-white disabled:opacity-50" onClick={save} disabled={saving}>{saving ? t("accountTypeQuickEdit.saving") : t("common.save")}</button></div>
+            <div className="mt-4 flex justify-end gap-2"><button type="button" className="rounded bg-blue-600 px-3 py-2 text-sm text-white disabled:opacity-50" onClick={save} disabled={saving}>{saving ? t("accountTypeQuickEdit.saving") : t("common.save")}</button></div>
           </div>
         </ModalLayer>, document.body,
+      ) : null}
+      {accountDialogOpen ? (
+        <AccountEditDialog accountId={account.id} onClose={() => { setAccountDialogOpen(false); }} />
       ) : null}
     </>
   );

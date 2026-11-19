@@ -15,6 +15,7 @@ import { EntryAttachmentWindow } from "./EntryAttachmentWindow";
 import { BasicDetailBatchDeleteButton,
   BasicDetailBatchReconcileButton,
   BasicDetailBatchReplaceButton,
+  BasicDetailConvertWatcher,
   BasicDetailReconcileLockButton,
   type BasicDetailBatchCategoryOption,
   useBasicDetailSelection,
@@ -43,6 +44,7 @@ import {
   isLicensedInsuranceEntry,
   isRegularInvestRefundEntry,
   TRANSACTION_SOURCE_INSURANCE,
+  TRANSACTION_SOURCE_MONEY_INCOME,
 } from "@/lib/transaction-semantics";
 import { normalizeSettlementTransferCategoryName } from "@/lib/settlement-category-name";
 import { advanceDialogAmount } from "@/lib/advance-transfer";
@@ -57,6 +59,7 @@ import { systemCategoryLabel } from "@/lib/system-category-labels";
 import { APP_PREFS_EVENT, getDateDisplayFormatPreference, getDetailDateBackgroundPreference, getTimeZonePreference, type DateDisplayFormat } from "@/lib/client/appPreferences";
 import { readAccountDisplaySettings } from "@/lib/client/account-display-settings";
 import { cashLedgerFlowAccountId, isAllCashDetailScope } from "@/lib/all-cash-entries";
+import { signedCreditBillAmountFromCardSide } from "@/lib/credit/billing";
 
 const LEGACY_BASIC_DETAIL_STORAGE_KEY = "mmh_basic_detail_table_v1";
 
@@ -175,6 +178,14 @@ export type DetailEntry = {
   id: string;
   cashEntryId?: string | null;
   businessTransactionId?: string | null;
+  /** 债券侧存单 id（单条详情才返回；逆回购编辑据此找存单）。 */
+  bondTransactionId?: string | null;
+  /** 债券侧品种：`repo` 表示逆回购借出行。 */
+  bondInstrumentKind?: string | null;
+  /** 逆回购存单已回款（编辑时锁金额与日期）。 */
+  bondRedeemed?: boolean;
+  bondTermDays?: number | null;
+  bondMaturityDate?: string | null;
   stockTransactionId?: string | null;
   stockTransaction?: {
     id: string;
@@ -662,6 +673,7 @@ function investmentCategoryLabel(
     if (subtype === "buy") return t("detailView.metalBuy");
   }
   if (productType === "fund" || productType === "money" || !productType) {
+    if (source === TRANSACTION_SOURCE_MONEY_INCOME) return t("fund.subtype.moneyIncome");
     if (subtype === "buy" && source === "regular_invest") return t("detailView.fundRegularInvest");
     if (subtype === "buy" && source === "dividend") return t("detailView.dividendInvest");
     if (subtype === "redeem") return t("detailView.fundRedeem");
@@ -704,10 +716,12 @@ export function DetailViewClient({
   showRunningBalance = true,
   runningBalanceDefaultHidden = false,
   enableAccountNavigation = false,
+  stickyRowActions = false,
   focusEntryId,
   scrollToRowKey,
   scrollToRowRequestId,
   reorderAccountIds,
+  billFlowAccountIds,
   sortable = true,
   onDisplayRowsChange,
   onRowsFitChange,
@@ -754,10 +768,18 @@ export function DetailViewClient({
   showRunningBalance?: boolean;
   runningBalanceDefaultHidden?: boolean;
   enableAccountNavigation?: boolean;
+  /** 行操作列钉在右侧，横向滚动时保持可见（报表下钻等列较宽的表格用）。 */
+  stickyRowActions?: boolean;
   focusEntryId?: string;
   scrollToRowKey?: string | null;
   scrollToRowRequestId?: number;
   reorderAccountIds?: string[];
+  /**
+   * 信用卡账单明细的卡片范围（账单账户组）。传了它，流入 / 流出就改走
+   * `signedCreditBillAmountFromCardSide`——与「账单统计」完全同一个函数，
+   * 保证统计的流出 / 流入恒等于明细各行合计（2026-11-16 报障：差 19.01）。
+   */
+  billFlowAccountIds?: string[];
   sortable?: boolean;
   onDisplayRowsChange?: (rows: DetailEntry[]) => void;
   onRowsFitChange?: (rows: number) => void;
@@ -900,6 +922,11 @@ export function DetailViewClient({
     () => new Set((reorderAccountIds?.length ? reorderAccountIds : (isAllCashDetailScope(accountId) ? [] : [accountId])).filter(Boolean)),
     [accountId, reorderAccountIds],
   );
+  /** 信用卡账单视图的卡片集合；只在账单明细传，其它视图为 null 走原账户口径。 */
+  const billFlowAccountIdSet = useMemo(
+    () => (billFlowAccountIds && billFlowAccountIds.length > 0 ? new Set(billFlowAccountIds.filter(Boolean)) : null),
+    [billFlowAccountIds],
+  );
   // 当前明细账户的类别：贷款 / 往来款要走本金口径（与服务端 SQL 一致）。
   const selectedAccountKind = useMemo(() => accountOptionById.get(accountId)?.kind ?? null, [accountOptionById, accountId]);
   const flowAccountIdOf = useCallback((entry: { accountId?: string | null; toAccountId?: string | null }) => {
@@ -942,11 +969,20 @@ export function DetailViewClient({
    * 其它视图沿用账户视角金额（不变）。
    */
   const detailFlowAmountOf = useCallback((entry: DetailEntry) => {
+    /**
+     * 信用卡账单明细：与「账单统计」共用 `signedCreditBillAmountFromCardSide`。
+     * 这里若另走 `effectiveAmountForAccount`，退款（卡是收款方、amount 为正）
+     * 会在统计里进流出、在明细里进流入，两处合计差一笔（2026-11-16 报障：差 19.01）。
+     */
+    if (billFlowAccountIdSet) {
+      const signed = signedCreditBillAmountFromCardSide(entry, billFlowAccountIdSet);
+      if (signed != null) return signed;
+    }
     if (isAllCashDetailScope(accountId)) {
       return effectiveAmountForAccount(entry, primaryAccountTarget(entry).id);
     }
     return effectiveAmountForAccount(entry, flowAccountIdOf(entry));
-  }, [accountId, flowAccountIdOf, primaryAccountTarget]);
+  }, [accountId, billFlowAccountIdSet, flowAccountIdOf, primaryAccountTarget]);
   /**
    * 明细「账户」列属于哪一侧。
    * - 全部交易记录：资金账户那一侧（见 `primaryAccountTarget`）。
@@ -1228,6 +1264,11 @@ export function DetailViewClient({
             depositSourceEntryId: e.depositSourceEntryId ?? null,
             fundFee: e.fundFee != null ? toNumber(e.fundFee) : undefined,
             fundProductType: entryFundProductType ?? undefined,
+            // 逆回购借出行的存单标识：编辑时分流到逆回购窗口并回填条款。
+            bondInstrumentKind: e.bondInstrumentKind ?? null,
+            bondRedeemed: Boolean(e.bondRedeemed),
+            bondTermDays: e.bondTermDays != null ? toNumber(e.bondTermDays) : null,
+            bondMaturityDate: e.bondMaturityDate ?? null,
             metalTypeId: e.metalTypeId ?? null,
             metalTypeName: e.metalTypeName ?? null,
             metalUnitId: e.metalUnitId ?? null,
@@ -2055,6 +2096,7 @@ export function DetailViewClient({
       }}
       rowActionsWidth={128}
       rowActionsMinWidth={104}
+      stickyRowActions={stickyRowActions}
       batchActionSlot={toolbarMode === "default" ? (
         <>
           <BasicDetailBatchReplaceButton fields={batchReplaceFields} accountOptions={resolvedBatchReplaceAccountOptions} categoryOptions={categoryOptions} tagOptions={tagOptions} categoryTypes={selectedCategoryTypes} contextAccountId={accountId} contextAccountIds={accountColumnScopeIdList} />
@@ -2100,6 +2142,7 @@ export function DetailViewClient({
       entryId={attachmentViewEntryId}
       onClose={() => setAttachmentViewEntryId(null)}
     />
+    <BasicDetailConvertWatcher />
     </>
   );
 }

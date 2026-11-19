@@ -4,7 +4,7 @@
 
 ## 中文（主文案，飞牛软仓详情页）
 
-MMH 家庭财务工作台（MoneyMoneyHome）是一个本地优先的家庭记账与全资产管理工具：程序和账本数据全部保存在你自己的飞牛 NAS 上，不经过第三方云端。支持 PC 与手机浏览器、Windows 桌面端、Android App 和开放 API 多端访问，支持多账本、多成员各自登录记账。
+MMH 记账（MoneyMoneyHome）是一个本地优先的家庭记账与全资产管理工具：程序和账本数据全部保存在你自己的飞牛 NAS 上，不经过第三方云端。支持 PC 与手机浏览器、Windows 桌面端、Android App 和开放 API 多端访问，支持多账本、多成员各自登录记账。
 日常记账覆盖支出、收入、转账，以及代付、借入、借出、还款等往来款场景；支持多币种与汇率换算、二级收支分类、标签、机构、家庭成员和往来对象管理。
 资产与负债可放进同一套账长期维护：信用卡账单周期、入账日期与分期计划；房贷等贷款的还款计划、LPR 利率调整、提前还款与还款重算；基金净值、持仓成本、确认到账与定投计划；股票买卖、分红、费用与持仓盈亏；存款与债券的产品 / 债单、存单、计息及收益记录；理财与贵金属；房产等固定资产的估值、装修投入与抵押关联；保险保单、缴费计划与现金价值。
 同时提供统计报表与余额校准对账、周期计划任务自动入账、账单导入导出（支付宝/微信 Excel、财智8 明细转换、邮箱/文本/PDF/截图 AI 识别、标准模板批量导入）、AI 助手（对话记账、查账、批量修改、恢复误删）、流水附件、误操作撤销与删除恢复、手动/自动备份。报销与差旅工作流正在开发中，已提供部分录入、查看和数据结构能力，尚未完工。界面支持中/英/日。适合希望把家庭财务数据掌握在自己手里的个人和家庭。
@@ -30,7 +30,7 @@ MMH（MoneyMoneyHome）は、ローカルファーストの家庭向け家計・
 
 ## 注意事项
 
-- VPS 自建源（`fnapp.floatingice.win`）的 `desc` 不会被 `sync.sh` 自动更新（sync 只同步 version/图标/FPK）。改完仓库副本后需手动同步到 VPS `/opt/fn-appstores-server/data/fn-appstores.json`，然后 `docker restart fn-appstores-server`（app.py 有 24 小时缓存）。
+- VPS 自建源（`fnapp.floatingice.win`）的 `desc` 由 `sync.sh` 自动同步：脚本从 `main/deploy/fnos/repository/api/apps` 取现成 desc（`REPO_DESC`），形态合格才整段替换，取不到就保留旧值并告警。所以改完仓库副本只需在 VPS 上 `bash /opt/fn-appstores-server/sync.sh --force`（脚本自己会等公告、重启两个容器），不用手改 `data/fn-appstores.json`。
 - **客户端换行渲染已按源码查证（2026-10-16，取代此前"未验证"的说法）**：`hhxs2025/fn-appstores-client` 的 `src/app/server/static/js/apps.js` 里，`:391` 是 `descEl.innerHTML = app.desc`（**按 HTML 渲染 → `<br>` 生效**），`:377-386` 会**去掉 HTML 标签后按真实 `\n` 拆行**、`lines.length >= 2` 就额外渲染一个与「应用介绍」重复的「更新内容」面板。**结论：条间/段间只能用 `<br>`，`desc` 里绝不允许出现真实换行。**
 - 当前 `desc` 形状：`【本版更新】<br>【功能改进】<br>• <条目><br>…<br>【Bug 修复】<br>• <条目><br>…<br>完整说明见 GitHub Release v<ver><br><br>【软件简介】<统一简介正文>`。更新说明段**从 `package.json.mmhReleaseNotesI18n["zh-CN"]` 派生**（`npm run sync:store-desc` 重写 4 处仓库副本，`npm run check:store-desc` 校验），不要手改；口径与校验见 `mmh-release` 技能的 `references/update-notes-surfaces.md` §2.5 / §3.3 / §3.4。
 - 简介正文的正典是 `deploy/app-intro-by-platform.md`（本文上面那几段是更早的多段式写法，逐字口径以正典为准）。

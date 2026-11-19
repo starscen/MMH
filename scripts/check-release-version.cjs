@@ -24,8 +24,13 @@ function findMmhApp(payload, key) {
   return apps.find((app) => app.id === "mmh");
 }
 
+// 2026-11-18 起公开 Release 只发布轻量变体（external-node），见 bump-release-version.cjs。
+// 按版本切换：0.1.86 及更早的清单仍指向 bundled（无后缀），否则复验历史发布会假红。
+const EXTERNAL_NODE_SINCE_PATCH = 87;
 function fnosFpkAssetName(version, assetSuffix) {
-  return `mmh-fnos-v${version}-${assetSuffix}.fpk`;
+  const patch = Number((/^0\.1\.(\d+)$/.exec(String(version)) || [])[1] ?? -1);
+  const variant = patch >= EXTERNAL_NODE_SINCE_PATCH ? "-external-node" : "";
+  return `mmh-fnos-v${version}-${assetSuffix}${variant}.fpk`;
 }
 
 function fnosVpsX86Url(version) {
@@ -73,8 +78,9 @@ expect(new RegExp(`完整说明见 GitHub Release v${version.replace(/\./g, "\\.
 expect(!/fn-appstores-client-2\.5\.2-x86\.fpk/.test(releaseNotes), "mmhReleaseNotes must not revive the retired FN 软仓客户端 2.5.2 x86 link.");
 expect(!/名称自定义/.test(releaseNotes), "mmhReleaseNotes must not revive the retired 名称自定义 dedicated-source phrasing.");
 expect(!/fn-appstores-client-2\.8\.4-x86\.fpk/.test(releaseNotes), "mmhReleaseNotes must not revive the retired FN 软仓客户端 2.8.4 x86 link (HTTP 404).");
-expect(!/fn-appstores-client-2\.9\.2-all\.fpk/.test(releaseNotes), "mmhReleaseNotes must not revive the retired FN 软仓客户端 2.9.2 all.fpk link (superseded by 2.9.5).");
-expect(/fn-appstores-client-2\.9\.5-all\.fpk/.test(releaseNotes), "mmhReleaseNotes must keep the FN 软仓客户端 2.9.5 all.fpk link.");
+expect(!/fn-appstores-client-2\.9\.2-all\.fpk/.test(releaseNotes), "mmhReleaseNotes must not revive the retired FN 软仓客户端 2.9.2 all.fpk link (superseded by 2.11.1).");
+expect(!/fn-appstores-client-2\.9\.5-all\.fpk/.test(releaseNotes), "mmhReleaseNotes must not revive the retired FN 软仓客户端 2.9.5 all.fpk link (superseded by 2.11.1).");
+expect(/fn-appstores-client-2\.11\.1-all\.fpk/.test(releaseNotes), "mmhReleaseNotes must keep the FN 软仓客户端 2.11.1 all.fpk link.");
 expect(/fnapp\.floatingice\.win:5660\//.test(releaseNotes), "mmhReleaseNotes dedicated source URL must keep the trailing slash.");
 
 // mmhReleaseNotesI18n 是**可选**的界面语言译文载体：应用内「本版说明」按界面语言取
@@ -147,8 +153,11 @@ for (const [file, key] of [
 // —— 因此 `desc` 里**一个真实换行都不能有**。这两条互为表里，少一条就把旧的重复故障带回来。
 const storeUpdateBlock = storeChangelog.softstoreUpdateBlock(version);
 const storeDescPrefix = `${storeUpdateBlock}${storeChangelog.HTML_SEPARATOR}${storeChangelog.HTML_SEPARATOR}${storeChangelog.INTRO_MARKER}`;
+// 两种落盘形态都要认：仓库根 `fn-appstores.json` 是 `{id,_manual:{desc}}` 旧形态，
+// `deploy/fnos/selfhosted-source/data/fn-appstores.json` 自 2.9/2.10 起由 sync.sh 写成
+// 扁平条目（desc 直接在条目上，没有 `_manual` 包装）。
 const mmhManualApps = (payload) =>
-  (Array.isArray(payload) ? payload : []).filter((item) => item.id === "mmh").map((item) => item._manual);
+  (Array.isArray(payload) ? payload : []).filter((item) => item.id === "mmh").map((item) => item._manual ?? item);
 for (const target of [
   { file: "deploy/fnos/repository/apps.example.json", field: "description", getApps: (payload) => payload.apps ?? [] },
   { file: "deploy/fnos/repository/api/apps", field: "desc", getApps: (payload) => payload.data ?? [] },

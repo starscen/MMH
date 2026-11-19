@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import Link, { useLinkStatus } from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useState, useEffect, useMemo, useRef, useCallback, startTransition } from "react";
 import {
@@ -66,7 +66,7 @@ import { useI18n } from "@/lib/i18n";
 import { sortByAccountUsage, useAccountUsage } from "@/lib/client/recentAccounts";
 import { accountUsageScore } from "@/lib/account-usage-score";
 import { UndoLastOperationButton } from "@/components/UndoLastOperationButton";
-import { getInvestmentAccountView, resolveLoanType } from "@/lib/account-kind-utils";
+import { getInvestmentAccountView, isLinkedFundWalletAccount, resolveLoanType } from "@/lib/account-kind-utils";
 import { FIXED_ASSET_TYPES } from "@/lib/fixed-asset";
 import { LOAN_TYPES, type LoanTypeValue } from "@/lib/loan-type";
 import { dispatchFirstUseGuideOpen } from "@/lib/client/onboardingGuide";
@@ -83,8 +83,15 @@ type AccountItem = {
   currency?: string | null;
   baseCurrency?: string | null;
   fxRateMissing?: boolean;
+  /**
+   * `ledger` = 关联了货基的电子钱包：这一行显示账面余额，但它**不计入统计**，
+   * 所以刷新要按 `ledger=1` 单独请求，且不能 seed 进总资产增量索引。
+   */
+  balanceScope?: "ledger" | null;
   kind: string;
   groupName?: string;
+  /** 账户自定义分组标签（2026-11-13），空 = 未分组。 */
+  accountGroup?: string;
   institution?: string;
   institutionId?: string | null;
   institutionType?: string | null;
@@ -99,6 +106,11 @@ type AccountItem = {
   parentId?: string | null;
   /** 聚合账户（父账户）：只参与统计，本身没有明细。 */
   isAggregate?: boolean | null;
+  /**
+   * 合并账单组（同机构 + 同所有人）的存储账户 id。
+   * 组内每张卡显示同一份账单余额，汇总时必须按它去重，否则负债会算成 N 倍。
+   */
+  creditBillStorageId?: string | null;
   /**
    * 多币种子账户。独立于 `children`：`children` 已被固定资产小类、
    * 往来款汇总行等「分组节点」占用，混用会把那些节点也当账户行渲染出来。
@@ -128,6 +140,7 @@ function normalizeSidebarItemKind(item: Pick<AccountItem, "kind" | "investProduc
   if (item.kind === "investment" && item.investProductType === "money") return "investment_money";
   if (item.kind === "investment" && (item.investProductType === "wealth" || item.investProductType === "advisor")) return "investment_wealth";
   if (item.kind === "investment" && item.investProductType === "bond") return "investment_bond";
+  if (item.kind === "investment" && item.investProductType === "metal") return "investment_metal";
   if (item.kind === "investment" && item.investProductType === "stock") return "investment_stock";
   if (item.kind === "investment" && item.investProductType === "property") return "investment_property";
   if (item.kind === "investment" && item.investProductType === "fund") return "investment_fund";
@@ -143,7 +156,7 @@ function normalizeSidebarAccountItem(item: AccountItem): AccountItem {
 
 const ASSET_KINDS = ["cash", "bank_debit", "ewallet", "deposit"];
 const CREDIT_KINDS = ["bank_credit"];
-const INVEST_KINDS = ["investment", "investment_fund", "investment_money", "investment_wealth", "investment_bond", "investment_stock"];
+const INVEST_KINDS = ["investment", "investment_fund", "investment_money", "investment_wealth", "investment_bond", "investment_stock", "investment_metal"];
 const FIXED_ASSET_SUMMARY_KIND = "fixed_asset_summary";
 const FIXED_ASSET_SUMMARY_ID = "__fixed_assets__";
 const FIXED_ASSET_SECTION = "fixed_assets";
@@ -181,6 +194,7 @@ const KIND_SORT_ORDER = new Map<string, number>([
   ["investment_bond", 531],
   ["investment_stock", 54],
   ["investment_property", 55],
+  ["investment_metal", 545],
   [FIXED_ASSET_SUMMARY_KIND, 56],
   ["insurance", 55],
   ["bank_credit", 60],
@@ -401,6 +415,7 @@ function getSidebarItemSignature(item: AccountItem): string {
     item.currency ?? "",
     item.baseCurrency ?? "",
     item.fxRateMissing ? "1" : "0",
+    item.balanceScope ?? "",
     item.kind,
     item.groupName ?? "",
     item.institution ?? "",
@@ -415,6 +430,7 @@ function getSidebarItemSignature(item: AccountItem): string {
     item.fixedAssetType ?? "",
     item.parentId ?? "",
     item.isAggregate ? "1" : "0",
+    item.creditBillStorageId ?? "",
     childSignature,
     subAccountSignature,
   ].join("\u0001");
@@ -445,6 +461,8 @@ function toSidebarAccountItem(a: any, t: (key: string, params?: Record<string, s
     currency: a.currency ?? null,
     baseCurrency: a.baseCurrency ?? null,
     fxRateMissing: !!a.fxRateMissing,
+    // `/internal` 给的是统计口径（关联钱包 0），这里只标记口径，真实数值由 ledger 补丁覆盖。
+    balanceScope: isLinkedFundWalletAccount(a) ? "ledger" : undefined,
     kind: a.kind,
     groupName: display.groupName || t("batchImport.ownerUnset"),
     institution: a.Institution?.name?.trim() || display.institutionName || undefined,
@@ -459,7 +477,27 @@ function toSidebarAccountItem(a: any, t: (key: string, params?: Record<string, s
     fixedAssetType: a.fixedAssetType ?? null,
     parentId: a.parentId ?? null,
     isAggregate: a.isAggregate === true,
+    creditBillStorageId: a.creditBillStorageId ?? null,
   };
+}
+
+/**
+ * 账户行的导航等待指示。
+ * 视图切换（尤其从报销/报表等全屏工作区点回账户视图）时，目标路由是动态渲染，
+ * 导航完成前地址栏和主体内容都不会变化，用户会误以为「点了没反应」并连续点击。
+ * 这里用 Link 的 pending 状态给出行内反馈；非 pending 时保留同样尺寸的占位，避免行内跳动。
+ */
+function SidebarLinkPending() {
+  const { pending } = useLinkStatus();
+  return (
+    <span
+      aria-hidden
+      data-sidebar-link-pending={pending ? "true" : "false"}
+      className={`ml-1 inline-flex h-3 w-3 shrink-0 items-center justify-center transition-opacity duration-150 ${pending ? "opacity-100" : "opacity-0"}`}
+    >
+      <span className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-slate-200 border-t-slate-500" />
+    </span>
+  );
 }
 
 export function SidebarClient({
@@ -481,7 +519,7 @@ export function SidebarClient({
     sidebarShowAllCashEntries: boolean;
     sidebarShowReimbursements: boolean;
     sidebarCollapsed: boolean;
-    sidebarGroupBy: "kind" | "institution";
+    sidebarGroupBy: "kind" | "institution" | "accountGroup";
   };
 }) {
   const router = useRouter();
@@ -519,7 +557,8 @@ export function SidebarClient({
   const [showAllCashEntries, setShowAllCashEntries] = useState(() => initialPreferences?.sidebarShowAllCashEntries ?? getSidebarShowAllCashEntriesPreference());
   const [showReimbursements, setShowReimbursements] = useState(() => initialPreferences?.sidebarShowReimbursements ?? getSidebarShowReimbursementsPreference());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => initialPreferences?.sidebarCollapsed ?? getSidebarCollapsedPreference());
-  const [sidebarGroupBy, setSidebarGroupBy] = useState<"kind" | "institution">(() => initialPreferences?.sidebarGroupBy ?? getSidebarGroupPreference());
+  const [sidebarGroupBy, setSidebarGroupBy] = useState<"kind" | "institution" | "accountGroup">(() => initialPreferences?.sidebarGroupBy ?? getSidebarGroupPreference());
+  const accountsScrollRef = useRef<HTMLDivElement | null>(null);
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
   const [collapsedAssetSubgroupKeys, setCollapsedAssetSubgroupKeys] = useState<Set<string>>(new Set());
   // 多币种子账户默认展开；收起状态按父账户 id 记忆（本会话内）。
@@ -657,6 +696,9 @@ export function SidebarClient({
   const sidebarRefreshBusy = useRef(false);
   const sidebarRefreshPending = useRef(false);
   const pendingScopedAccountIds = useRef<string[] | "full" | null>(null);
+  // 「账面口径」的账户（关联了货基的电子钱包）：侧栏显示真实余额，但统计口径是 0，
+  // 所以刷新时必须单独按 ledger 请求，否则会被统计口径的值覆盖成 0。
+  const ledgerScopedIdSet = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     startTransition(() => {
@@ -676,6 +718,38 @@ export function SidebarClient({
   }, [householdId]);
 
   useEffect(() => {
+    const ids = new Set<string>();
+    const walk = (list: readonly AccountItem[]) => {
+      for (const item of list) {
+        const id = item.id ? String(item.id) : "";
+        if (id && item.balanceScope === "ledger") ids.add(id);
+        if (item.children?.length) walk(item.children);
+        if (item.subAccounts?.length) walk(item.subAccounts);
+      }
+    };
+    walk(items);
+    ledgerScopedIdSet.current = ids;
+  }, [items]);
+
+  useEffect(() => {
+    const applyScopedRows = (rows: ScopedAccountBalance[]) => {
+      if (rows.length === 0) return;
+      startTransition(() => {
+        setItems((prev) => {
+          const patched = patchSidebarAccountBalances(prev, rows);
+          if (!patched.changed) return prev;
+          const next = normalizeSidebarItems(patched.next, t);
+          seedConvertedBalances(next);
+          return next;
+        });
+      });
+    };
+    // 账面口径的账户必须单独按 ledger 请求（`/internal` 与统计口径都会把它给成 0）。
+    const fetchLedgerRows = async (ids: string[]) => {
+      if (ids.length === 0) return [];
+      const scoped = await fetchScopedAccountBalances(ids, { ledger: true });
+      return scoped?.ok ? scoped.data : [];
+    };
     const debouncedRefresh = () => {
       if (sidebarRefreshTimer.current) clearTimeout(sidebarRefreshTimer.current);
       sidebarRefreshTimer.current = setTimeout(async () => {
@@ -688,17 +762,17 @@ export function SidebarClient({
         sidebarRefreshBusy.current = true;
         try {
           if (Array.isArray(pendingIds) && pendingIds.length > 0) {
-            const scoped = await fetchScopedAccountBalances(pendingIds);
-            if (scoped?.ok) {
-              startTransition(() => {
-                setItems((prev) => {
-                  const patched = patchSidebarAccountBalances(prev, scoped.data);
-                  if (!patched.changed) return prev;
-                  const next = normalizeSidebarItems(patched.next, t);
-                  seedConvertedBalances(next);
-                  return next;
-                });
-              });
+            const ledgerIds = ledgerScopedIdSet.current;
+            const statsIds = pendingIds.filter((id) => !ledgerIds.has(id));
+            const scopedLedgerOnly = pendingIds.filter((id) => ledgerIds.has(id));
+            const rows: ScopedAccountBalance[] = [];
+            if (statsIds.length > 0) {
+              const scoped = await fetchScopedAccountBalances(statsIds);
+              if (scoped?.ok) rows.push(...scoped.data);
+            }
+            rows.push(...(await fetchLedgerRows(scopedLedgerOnly)));
+            if (rows.length > 0) {
+              applyScopedRows(rows);
               return;
             }
           }
@@ -737,6 +811,8 @@ export function SidebarClient({
               });
             });
           }
+          // `/internal` 是统计口径（关联货基的钱包给 0）：兜底之后得把账面口径补回来。
+          applyScopedRows(await fetchLedgerRows(Array.from(ledgerScopedIdSet.current)));
         } catch {
         } finally {
           sidebarRefreshBusy.current = false;
@@ -769,6 +845,49 @@ export function SidebarClient({
       sidebarRefreshPending.current = false;
     };
   }, [householdId, t]);
+
+  // 客户端导航不会重新渲染 layout：侧边栏余额会一直停在首次 SSR 的数值上。
+  // 账期切换 / 账单 cycle 缓存刚重建时，账单页已经是新数字，左侧还是旧值（典型：0）。
+  // 每次导航后按「信用卡集合」做一次轻量校验，拿到新值走和记账后相同的 patch 路径。
+  const creditSidebarIdsKey = useMemo(() => {
+    const ids: string[] = [];
+    const walk = (list: readonly AccountItem[]) => {
+      for (const item of list) {
+        if (item.id && item.kind === "bank_credit") ids.push(String(item.id));
+        if (item.children?.length) walk(item.children);
+        if (item.subAccounts?.length) walk(item.subAccounts);
+      }
+    };
+    walk(items);
+    return Array.from(new Set(ids)).sort().join(",");
+  }, [items]);
+  const creditBalanceCheckRef = useRef(0);
+
+  useEffect(() => {
+    if (!creditSidebarIdsKey) return;
+    const now = Date.now();
+    if (now - creditBalanceCheckRef.current < 15_000) return;
+    creditBalanceCheckRef.current = now;
+    const ids = creditSidebarIdsKey.split(",");
+    let cancelled = false;
+    void fetchScopedAccountBalances(ids)
+      .then((scoped) => {
+        if (cancelled || !scoped?.ok) return;
+        startTransition(() => {
+          setItems((prev) => {
+            const patched = patchSidebarAccountBalances(prev, scoped.data);
+            if (!patched.changed) return prev;
+            const next = normalizeSidebarItems(patched.next, t);
+            seedConvertedBalances(next);
+            return next;
+          });
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [pathname, creditSidebarIdsKey, t]);
 
   useEffect(() => {
     const applyPrefs = () => {
@@ -847,20 +966,40 @@ export function SidebarClient({
   }
 
   function cycleSidebarGroupBy() {
-    const next = sidebarGroupBy === "kind" ? "institution" : "kind";
+    // 三档循环：类型 → 机构 → 分组标签 → 类型。
+    const next = sidebarGroupBy === "kind"
+      ? "institution"
+      : sidebarGroupBy === "institution"
+        ? "accountGroup"
+        : "kind";
     setSidebarGroupBy(next);
     setSidebarGroupPreference(next);
   }
 
+  /**
+   * 展开分区后把该分区的标题滚到账户区顶部。
+   * 否则分区标题停在账户区底部，展开后只有第一行账户冒出来（其余在可视区外），
+   * 用户点到的其实是滚动区外的行/背景，表现成「点账户没反应」。
+   */
+  function scrollSectionToTop(key: string) {
+    requestAnimationFrame(() => {
+      const node = accountsScrollRef.current?.querySelector<HTMLElement>(`[data-sidebar-section="${key}"]`);
+      node?.scrollIntoView({ block: "start" });
+    });
+  }
+
   function toggleSection(key: string) {
+    const willExpand = collapsedSections.has(key);
     setCollapsedSections(prev => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key); else next.add(key);
       return next;
     });
+    if (willExpand) scrollSectionToTop(key);
   }
 
   function openOnlySection(key: string) {
+    const willExpand = collapsedSections.has(key);
     setCollapsedSections(prev => {
       if (!prev.has(key)) {
         const next = new Set(prev);
@@ -869,6 +1008,7 @@ export function SidebarClient({
       }
       return new Set(sections.map((section) => section.kind).filter((sectionKey) => sectionKey !== key));
     });
+    if (willExpand) scrollSectionToTop(key);
   }
 
   const navItemCls = (href: string, forceActive = false) =>
@@ -901,6 +1041,19 @@ export function SidebarClient({
   }, [baseCurrency]);
   const displayBalanceValue = useCallback((item: AccountItem) => resolveSidebarBalance(item).value, [resolveSidebarBalance]);
   const displayBalance = useCallback((item: AccountItem) => displayBalanceValue(item) ?? 0, [displayBalanceValue]);
+  // 合并账单组内每张卡都显示同一份账单余额，节合计必须按账单组去重，
+  // 否则同一份欠款会被算成「卡张数 × 账单金额」。
+  const sumSectionBalance = useCallback((list: AccountItem[]) => {
+    const seen = new Set<string>();
+    let total = 0;
+    for (const item of list) {
+      const key = item.creditBillStorageId || item.id || `${item.kind}\u0000${item.label}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      total += displayBalance(item);
+    }
+    return total;
+  }, [displayBalance]);
   const formatSidebarBalance = useCallback((item: AccountItem) => {
     const resolved = resolveSidebarBalance(item);
     return resolved.value == null ? t("sidebar.balance.missingFxRate") : formatCurrencyMoney(resolved.value, resolved.currency);
@@ -939,6 +1092,7 @@ export function SidebarClient({
     if (kind === "investment_wealth") return t("sidebar.kind.wealth");
     if (kind === "investment_bond") return t("entry.kind.bond");
     if (kind === "investment_stock") return t("investment.product.stock");
+    if (kind === "investment_metal") return t("investment.product.metal");
     if (kind === "investment_property") return t("investment.product.property");
     if (kind === FIXED_ASSET_SUMMARY_KIND) return t("sidebar.section.fixedAssets");
     if (kind === "insurance") return t("sidebar.kind.insurance");
@@ -1054,7 +1208,7 @@ export function SidebarClient({
           key: loanSubgroupKey(loanType),
           label: t(`loan.type.${loanType}`),
           accounts,
-          total: accounts.reduce((sum, account) => sum + displayBalance(account), 0),
+          total: sumSectionBalance(accounts),
           href: `/?view=liability&loanType=${loanType}`,
         };
       }).filter((subgroup) => subgroup.accounts.length > 0);
@@ -1068,7 +1222,7 @@ export function SidebarClient({
           kind: LIABILITY_SECTION,
           label: LIABILITY_SECTION,
           accounts: sortAccountsByUsage(liabilityItems),
-          total: liabilityItems.reduce((sum, account) => sum + displayBalance(account), 0),
+          total: sumSectionBalance(liabilityItems),
           subgroups: [],
         });
       }
@@ -1077,36 +1231,44 @@ export function SidebarClient({
           kind: LOAN_SECTION,
           label: LOAN_SECTION,
           accounts: sortAccountsByUsage(loanItems),
-          total: loanItems.reduce((sum, account) => sum + displayBalance(account), 0),
+          total: sumSectionBalance(loanItems),
           subgroups: buildLoanSubgroups(loanItems),
         });
       }
       return liabilitySections;
     };
-    if (sidebarGroupBy === "institution") {
+    // 机构 / 自定义分组标签两档：都是「按一个字符串字段切节」，只是取值来源不同。
+    // 分组标签是用户自己起的名字（2026-11-13），空值归到「未分组」并排在最后。
+    if (sidebarGroupBy === "institution" || sidebarGroupBy === "accountGroup") {
+      const groupByLabel = sidebarGroupBy === "accountGroup";
+      const ungroupedLabel = groupByLabel ? t("sidebar.ungroupedAccounts") : t("insurance.noInstitution");
       const liabilityKinds = new Set(["loan", "loan_summary", REIMBURSEMENT_SUMMARY_KIND]);
       const map = new Map<string, SidebarSection>();
       for (const item of visibleItems) {
         if (liabilityKinds.has(item.kind)) continue;
         const label = item.kind === FIXED_ASSET_SUMMARY_KIND
           ? FIXED_ASSET_SECTION
-          : item.institution?.trim() || t("insurance.noInstitution");
-        const key = `institution:${label}`;
+          : groupByLabel
+            ? item.accountGroup?.trim() || ungroupedLabel
+            : item.institution?.trim() || ungroupedLabel;
+        const key = `${sidebarGroupBy}:${label}`;
         const existing = map.get(key);
         if (existing) {
           existing.accounts.push(item);
-          existing.total += displayBalance(item);
         } else {
           map.set(key, {
             kind: key,
             label,
             accounts: [item],
-            total: displayBalance(item),
+            total: 0,
             subgroups: [],
           });
         }
       }
-      const institutionSections = Array.from(map.values())
+      // 合计在收集完成后统一算：合并账单组内每张卡都显示同一份账单余额，
+      // 边遍历边累加会把同一份欠款按卡张数重复计入。
+      for (const section of map.values()) section.total = sumSectionBalance(section.accounts);
+      const fieldSections = Array.from(map.values())
         .map((section) => ({
           ...section,
           accounts: section.accounts.length >= SIDEBAR_USAGE_SORT_MIN_GROUP_SIZE
@@ -1117,8 +1279,14 @@ export function SidebarClient({
               })
             : section.accounts,
         }))
-        .sort((a, b) => a.label.localeCompare(b.label, "zh-Hans-CN"));
-      return [...institutionSections, ...buildLiabilitySections()];
+        .sort((a, b) => {
+          // 未分组的账户永远垫底，避免混在一堆用户自定义名字中间找。
+          const aUngrouped = a.label === ungroupedLabel;
+          const bUngrouped = b.label === ungroupedLabel;
+          if (aUngrouped !== bUngrouped) return aUngrouped ? 1 : -1;
+          return a.label.localeCompare(b.label, "zh-Hans-CN");
+        });
+      return [...fieldSections, ...buildLiabilitySections()];
     }
 
     const groups = [
@@ -1141,7 +1309,7 @@ export function SidebarClient({
                   key: subgroup.key,
                   label: subgroup.label,
                   accounts,
-                  total: accounts.reduce((sum, account) => sum + displayBalance(account), 0),
+                  total: sumSectionBalance(accounts),
                 };
               }).filter((subgroup) => subgroup.accounts.length > 0);
               const coveredKinds = new Set(ASSET_SUBGROUPS.flatMap((subgroup) => subgroup.kinds));
@@ -1151,7 +1319,7 @@ export function SidebarClient({
                   key: "other_asset",
                   label: "其他资产",
                   accounts: fallbackAccounts,
-                  total: fallbackAccounts.reduce((sum, account) => sum + displayBalance(account), 0),
+                  total: sumSectionBalance(fallbackAccounts),
                 });
               }
               return subgroupItems;
@@ -1161,11 +1329,11 @@ export function SidebarClient({
           : [];
       return {
         kind: g.label, label: g.label, accounts: sortAccountsByUsage(filtered),
-        total: filtered.reduce((s, a) => s + displayBalance(a), 0),
+        total: sumSectionBalance(filtered),
         subgroups,
       };
     }).filter(s => s.accounts.length > 0);
-  }, [visibleItems, sidebarGroupBy, accountUsage, displayBalance, t]);
+  }, [visibleItems, sidebarGroupBy, accountUsage, displayBalance, sumSectionBalance, t]);
 
   const selectedLiabilityPerson = (searchParams.get("liabilityPerson") ?? "").trim();
   const liabilityPersonKeyFor = (item: AccountItem) => item.id ? `account:${item.id}` : "";
@@ -1243,7 +1411,7 @@ export function SidebarClient({
   }
 
   function sidebarItemRowLabel(it: AccountItem) {
-    return sidebarGroupBy === "institution" && it.kind !== "loan_summary" && it.kind !== REIMBURSEMENT_SUMMARY_KIND
+    return sidebarGroupBy !== "kind" && it.kind !== "loan_summary" && it.kind !== REIMBURSEMENT_SUMMARY_KIND
       ? it.kind === FIXED_ASSET_SUMMARY_KIND
         ? it.label
         : it.kind === "insurance"
@@ -1632,11 +1800,11 @@ export function SidebarClient({
               <button
                 type="button"
                 onClick={closeAccountFilter}
-                className="flex h-4 w-4 shrink-0 items-center justify-center rounded text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
+                className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
                 title={t("sidebar.accountFilterClose")}
                 aria-label={t("sidebar.accountFilterClose")}
               >
-                <X size={12} />
+                <X className="h-3.5 w-3.5" />
               </button>
             </div>
           ) : (
@@ -1662,8 +1830,8 @@ export function SidebarClient({
           <div className="flex items-center gap-1">
             <button type="button"
               onClick={cycleSidebarGroupBy}
-              className={`rounded-md p-1 transition-colors ${sidebarGroupBy === "institution" ? "bg-slate-100 text-slate-600" : "text-slate-300 hover:bg-slate-50 hover:text-slate-500"}`}
-              title={`${t("sidebar.ownerFilterTitle")}：${sidebarGroupBy === "kind" ? t("sidebar.groupByKind") : t("sidebar.groupByInstitution")}`}
+              className={`rounded-md p-1 transition-colors ${sidebarGroupBy !== "kind" ? "bg-slate-100 text-slate-600" : "text-slate-300 hover:bg-slate-50 hover:text-slate-500"}`}
+              title={`${t("sidebar.ownerFilterTitle")}：${sidebarGroupBy === "kind" ? t("sidebar.groupByKind") : sidebarGroupBy === "institution" ? t("sidebar.groupByInstitution") : t("sidebar.groupByAccountGroup")}`}
             >
               <Repeat size={14} />
             </button>
@@ -1673,7 +1841,7 @@ export function SidebarClient({
           </div>
         </div>
 
-        <div className="flex-1 min-h-0 overflow-x-hidden overflow-y-scroll custom-scrollbar [scrollbar-gutter:stable]">
+        <div ref={accountsScrollRef} className="flex-1 min-h-0 overflow-x-hidden overflow-y-scroll custom-scrollbar [scrollbar-gutter:stable]">
           <nav className="space-y-1">
             <div className="space-y-2">
               {sections.map((sec) => {
@@ -1683,9 +1851,11 @@ export function SidebarClient({
                   ? sec.subgroups
                   : [{ key: `${sec.kind}_default`, label: "", accounts: sec.accounts, total: sec.total }];
                 return (
-                  <div key={sec.kind}>
+                  <div key={sec.kind} data-sidebar-section={sec.kind}>
+                    {/* 不用 sticky：吸顶的分区标题会盖住滚动到它下方的账户行，
+                        点击这些行会落到标题上（表现为「点账户没反应」或分区被收起）。 */}
                     <div
-                      className="sticky top-0 z-10 flex w-full items-center rounded-lg bg-white/92 px-3 py-2 backdrop-blur transition-all duration-200 hover:bg-white group"
+                      className="flex w-full items-center rounded-lg bg-white px-3 py-2 transition-all duration-200 group"
                     >
                       <button
                         type="button"
@@ -1807,6 +1977,7 @@ export function SidebarClient({
                                           <span className="text-fade-right block min-w-0" title={soloTitle}>{soloLabel}</span>
                                         </span>
                                         <span className={`shrink-0 pl-2 text-[11px] font-medium tabular-nums ${itemBalanceCls(soloChild)}`}>{formatSidebarBalance(soloChild)}</span>
+                                        <SidebarLinkPending />
                                       </Link>
                                     ) : subAccounts.length > 0 ? (
                                       <button
@@ -1838,6 +2009,7 @@ export function SidebarClient({
                                           <span className="text-fade-right block min-w-0" title={itemTitle}>{sidebarItemRowLabel(it)}</span>
                                         </span>
                                         <span className={`shrink-0 pl-2 text-[11px] font-medium tabular-nums ${itemBalanceCls(it)}`}>{formatSidebarBalance(it)}</span>
+                                        <SidebarLinkPending />
                                       </Link>
                                     )}
                                     {!soloChild && subAccounts.length > 0 && !subAccountsCollapsed

@@ -55,7 +55,7 @@ import { recalcPreciousMetalPositions } from "@/lib/metal/recalcPosition";
 import { calculateWealthCashDividendProfit, recalcWealthPositions } from "@/lib/wealth-position";
 import { computeInvestBalances } from "@/lib/invest-balance";
 import { computeInsuranceAccountDisplayBalances } from "@/lib/insurance/balance";
-import { normalizeFundUnitsDecimals, roundFundUnits } from "@/lib/fund/unit-precision";
+import { normalizeFundUnitsDecimals, resolveQuantityDecimals, roundFundUnits } from "@/lib/fund/unit-precision";
 import {
   applyEntryChangesToAccountBalances,
   BALANCE_ENTRY_SELECT,
@@ -63,7 +63,8 @@ import {
   type EntryBalanceChange,
 } from "@/lib/server/account-balance";
 import { createPlainLedgerEntry } from "@/lib/server/ledger-entry-create";
-import { creditBillEffectiveDate, creditCardDisplayBalanceFromCurrentCycle } from "@/lib/credit/billing";
+import { creditBillEffectiveDate } from "@/lib/credit/billing";
+import { loadCreditCardBillGroupBalances } from "@/lib/server/credit-card-display-balance";
 import { fundArrivalDate as computeFundArrivalDate, resolveFundDates } from "@/lib/fund/confirmDays";
 import { getFundFeeRateByDate } from "@/lib/fund/feeRate";
 import { toNumber, toStatementMonth, startOfDayUtc, formatDateUtc } from "@/lib/date-utils";
@@ -289,13 +290,9 @@ async function resolveAccountDisplayBalance(
   }
 
   if (account.kind === AccountKind.bank_credit) {
-    const cycle = await prisma.creditCardCycle.findFirst({
-      where: { accountId: account.id, isCurrentCycle: true },
-      select: { effectiveBill: true, cumulativeRemain: true, cumulativeOverpaid: true },
-    });
-    return cycle
-      ? creditCardDisplayBalanceFromCurrentCycle(cycle)
-      : toNumber(account.balance);
+    // 合并账单组内每张卡都要显示同一份账单余额（不只是主卡）。
+    const balances = await loadCreditCardBillGroupBalances([account.id]);
+    return balances.balanceByAccountId.get(account.id) ?? toNumber(account.balance);
   }
 
   return toNumber(account.balance);
@@ -1000,6 +997,26 @@ async function loadApiDetailRecord(entryId: string) {
     },
   });
   if (!entry) return null;
+  // 逆回购借出行在债券侧还有一条存单：编辑时要靠存单上的 instrumentKind 判断
+  // 走逆回购窗口（而不是债券窗），并回填期限/到期日。
+  const bondRow = entry.fundProductType === "bond" && entry.householdId
+    ? await prisma.bondTransaction.findFirst({
+        where: { householdId: entry.householdId, cashEntryId: entry.id, deletedAt: null },
+        select: { id: true, instrumentKind: true, action: true, termDays: true, maturityDate: true },
+      })
+    : null;
+  // 逆回购存单是否已回款：已回款时编辑窗要锁住金额/日期，否则会和入账的回款对不上。
+  const bondRedeemed = bondRow && bondRow.action === "buy"
+    ? Boolean(await prisma.bondTransaction.findFirst({
+        where: {
+          householdId: entry.householdId ?? undefined,
+          sourceBondTransactionId: bondRow.id,
+          action: "redeem",
+          deletedAt: null,
+        },
+        select: { id: true },
+      }))
+    : false;
   const linkedWealthTransactionId = linkedWealthTransactionIdOf(entry);
   const linkedWealthTransaction = linkedWealthTransactionId && entry.householdId
     ? await prisma.wealthTransaction.findFirst({
@@ -1069,6 +1086,11 @@ async function loadApiDetailRecord(entryId: string) {
     fundArrivalDate: entry.fundArrivalDate ? formatDateUtc(entry.fundArrivalDate) : null,
     fundArrivalAmount: entry.fundArrivalAmount ? toNumber(entry.fundArrivalAmount) : null,
     source: entry.source,
+    bondInstrumentKind: bondRow?.instrumentKind ?? null,
+    bondTransactionId: bondRow?.id ?? null,
+    bondRedeemed,
+    bondTermDays: bondRow?.termDays ?? null,
+    bondMaturityDate: bondRow?.maturityDate ? formatDateUtc(bondRow.maturityDate) : null,
     ...buildEntryBusinessLinkSummary(entry),
     ...(linkedWealthTransaction ? linkedWealthDetailFields(entry, linkedWealthTransaction) : {}),
     ...(linkedStockTransaction ? linkedStockDetailFields(linkedStockTransaction) : {}),
@@ -2571,7 +2593,7 @@ export async function POST(req: Request) {
           })
         : null;
       if (counterpartyInstitutionId && !counterpartyInstitution) {
-        return NextResponse.json({ ok: false, code: "INVALID_COUNTERPARTY_INSTITUTION", error: "收支机构只能选择银行或第三方支付机构" }, { status: 400 });
+        return NextResponse.json({ ok: false, code: "INVALID_COUNTERPARTY_INSTITUTION", error: "收支对向方不能选择往来人员、往来组织或家庭成员" }, { status: 400 });
       }
 
       await prisma.$transaction(async (tx) => {
@@ -2658,7 +2680,7 @@ export async function POST(req: Request) {
           })
         : null;
       if (counterpartyInstitutionId && !counterpartyInstitution) {
-        return NextResponse.json({ ok: false, code: "INVALID_COUNTERPARTY_INSTITUTION", error: "收支机构只能选择银行或第三方支付机构" }, { status: 400 });
+        return NextResponse.json({ ok: false, code: "INVALID_COUNTERPARTY_INSTITUTION", error: "收支对向方不能选择往来人员、往来组织或家庭成员" }, { status: 400 });
       }
 
       await prisma.$transaction(async (tx) => {
@@ -3337,7 +3359,7 @@ export async function POST(req: Request) {
               metalTypeName: metalType?.name ?? undefined,
               metalUnitId: metalUnit?.id ?? undefined,
               metalUnitName: metalUnit ? (metalUnit.symbol ? `${metalUnit.name}(${metalUnit.symbol})` : metalUnit.name) : undefined,
-              metalQuantity: isMetalProduct ? (metalQuantity != null ? roundFundUnits(metalQuantity, fundUnitsDecimals) : undefined) : undefined,
+              metalQuantity: isMetalProduct ? (metalQuantity != null ? roundFundUnits(metalQuantity, resolveQuantityDecimals("metal", fundUnitsDecimals)) : undefined) : undefined,
               metalUnitPrice: isMetalProduct ? metalUnitPrice ?? undefined : undefined,
               metalFee: isMetalProduct ? metalFee ?? undefined : undefined,
               insuranceProductId: insuranceProductId ?? undefined,
@@ -4015,7 +4037,7 @@ export async function PUT(req: Request) {
     const metalFeeInput = positiveNumber(body.metalFee ?? body.fundFee);
     const fundUnitsDecimals = normalizeFundUnitsDecimals(investAcc.fundUnitsDecimals);
     const roundedFundUnits = fundUnitsInput != null ? roundFundUnits(fundUnitsInput, fundUnitsDecimals) : null;
-    const roundedMetalQuantity = metalQuantityInput != null ? roundFundUnits(metalQuantityInput, fundUnitsDecimals) : roundedFundUnits;
+    const roundedMetalQuantity = metalQuantityInput != null ? roundFundUnits(metalQuantityInput, resolveQuantityDecimals("metal", fundUnitsDecimals)) : roundedFundUnits;
     const isMetalProduct = productType === "metal";
     const metalType = productType === "metal" && metalTypeIdInput
       ? await tx.preciousMetalType.findFirst({
@@ -4543,7 +4565,7 @@ return;
           })
         : null;
       if (counterpartyInstitutionId && !counterpartyInstitution) {
-        throw new Error("收支机构只能选择银行或第三方支付机构");
+        throw new Error("收支对向方不能选择往来人员、往来组织或家庭成员");
       }
       const keepFundDetail = body.keepFundDetail === true;
 

@@ -18,6 +18,11 @@ const prismaDb = fs.readFileSync(path.join(root, "src", "lib", "db", "prisma.ts"
 const prismaSchema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
 const standaloneStart = fs.readFileSync(path.join(root, "scripts", "start-standalone.cjs"), "utf8");
 const systemUpdateRoute = fs.readFileSync(path.join(root, "src", "app", "api", "v1", "settings", "system-update", "route.ts"), "utf8");
+// 2026-11-16 起升级判定收敛到 service.ts（route.ts 只剩薄壳）：镜像回退顺序、
+// /releases/latest 与 git ls-remote 都在 service 里。断言必须看实现文件，否则
+// 代码搬走后会以「用了 main 分支」的名义假红（2026-11-18 发布前遇到）。
+const systemUpdateService = fs.readFileSync(path.join(root, "src", "lib", "server", "system-update", "service.ts"), "utf8");
+const systemUpdateSource = systemUpdateRoute + "\n" + systemUpdateService;
 const updaterServer = fs.readFileSync(path.join(root, "scripts", "mmh-updater-server.mjs"), "utf8");
 const systemUpdatePage = fs.readFileSync(
   path.join(root, "src", "app", "(sidebar)", "settings", "system-update", "page.tsx"),
@@ -103,8 +108,16 @@ const appPartCopies = (
   dockerfile.match(/^COPY --chown=node:node --from=build \/app\/parts\/p\d+\/ \/app\//gm) || []
 ).length;
 expect(
-  appPartCopies === 12 && /-size \+3500k/.test(dockerfile) && /"\$sz" -gt 4096/.test(dockerfile),
-  "Dockerfile must split the changed files into 12 separate COPY layers and fail the build when a single file exceeds 3.5 MB or a part exceeds 4 MB: domestic mirrors drop 8.75 MB blobs.",
+  appPartCopies === 16 &&
+    // 0.1.87: pdf-parse 的 web/pdf.worker.mjs.map 单个 5.27 MB，直接越过单文件阈值，
+    // Build and push 在 diff 步骤 exit 1。源码映射运行时不加载，构建后必须删掉，
+    // 不要把 3.5 MB 上限放大到能装下 map。
+    /find \.next\/standalone \.next\/static -type f -name '\*\.map' -delete/.test(dockerfile) &&
+    /-size \+3500k/.test(dockerfile) &&
+    // 0.1.87 实测 1428 个变化文件共 64.4 MB，16 片每片约 4.03 MB；上限取 4608 KB
+    // （4.5 MB，镜站实测卡在 8.75 MB），4096 KB 会让每片差几十 KB 直接失败。
+    /"\$worst" -gt 4608/.test(dockerfile),
+  "Dockerfile must prune *.map from the standalone output, split the changed files into 16 separate COPY layers, and fail the build when a single file exceeds 3.5 MB or a part exceeds 4.5 MB: domestic mirrors drop 8.75 MB blobs.",
 );
 expect(
   !/prisma-split/.test(dockerfile) && !/standalone-split/.test(dockerfile) && !/studio-core\/dist\/ui/.test(dockerfile),
@@ -346,11 +359,11 @@ expect(/tags:\s*\n\s*-\s*"v\*"/.test(workflow), "Docker image workflow must run 
 expect(/type=raw,value=main,enable=\$\{\{\s*github\.event_name == 'push' &&\s*endsWith\(github\.ref,\s*'\/heads\/main'\)\s*\}\}/.test(workflow), "Docker workflow must publish main snapshots without moving latest.");
 
 expect(
-  /\/releases\/latest/.test(systemUpdateRoute) &&
-    /git ls-remote --tags/.test(systemUpdateRoute) &&
-    /IMAGE_FALLBACK_ORDER = \["fnvps", "dockerproxy", "nju", "ghcr", "daocloud", "custom"\]/.test(systemUpdateRoute) &&
-    !/raw\.githubusercontent\.com\/frankluise5220\/MMH\/main\/package\.json/.test(systemUpdateRoute) &&
-    !/refs\/heads\/main/.test(systemUpdateRoute),
+  /\/releases\/latest/.test(systemUpdateSource) &&
+    /git ls-remote --tags/.test(systemUpdateSource) &&
+    /IMAGE_FALLBACK_ORDER = \["fnvps", "dockerproxy", "nju", "ghcr", "daocloud", "custom"\]/.test(systemUpdateSource) &&
+    !/raw\.githubusercontent\.com\/frankluise5220\/MMH\/main\/package\.json/.test(systemUpdateSource) &&
+    !/refs\/heads\/main/.test(systemUpdateSource),
   "Docker update version checks must use the latest GitHub Release/tag and image mirrors, not the main branch.",
 );
 

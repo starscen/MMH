@@ -2,6 +2,7 @@ import { accountRenderSettings, buildAccountDisplayOption } from "@/lib/account-
 import { prisma } from "@/lib/db/prisma";
 import { toNumber } from "@/lib/date-utils";
 import { getHouseholdBaseCurrency } from "@/lib/server/fx-rates";
+import { defaultStockCurrencyForMarket } from "@/lib/stock/market";
 import type { HouseholdContext } from "@/lib/server/household-scope";
 
 export type StockHoldingReportRow = {
@@ -27,6 +28,13 @@ export type StockHoldingReportRow = {
   floatingPnLRate: number;
   historicalProfit: number;
   totalProfit: number;
+  /**
+   * 摊薄成本 = 剩余持仓成本 − 已实现盈亏（≈ 累计买入支出 − 累计卖出回款）。
+   * 券商/同花顺默认的「摊薄成本」口径把已实现盈亏摊回剩余股数，
+   * 所以它们的浮动盈亏等于本表的 totalProfit、浮亏率等于 totalPnLRate。
+   */
+  dilutedCost: number;
+  totalPnLRate: number;
   currency: string;
 };
 
@@ -38,6 +46,8 @@ export type StockHoldingReportTotals = {
   floatingPnLRate: number;
   historicalProfit: number;
   totalProfit: number;
+  dilutedCost: number;
+  totalPnLRate: number;
   holdingCount: number;
 };
 
@@ -95,6 +105,8 @@ export async function loadStockHoldingReport(
         floatingPnLRate: 0,
         historicalProfit: 0,
         totalProfit: 0,
+        dilutedCost: 0,
+        totalPnLRate: 0,
         holdingCount: 0,
       },
     };
@@ -129,6 +141,10 @@ export async function loadStockHoldingReport(
       const marketValue = roundMoney(toNumber(item.marketValue));
       const floatingPnL = roundMoney(marketValue - cost);
       const historicalProfit = roundMoney(toNumber(item.historicalProfit));
+      const totalProfit = roundMoney(floatingPnL + historicalProfit);
+      // 摊薄成本把已实现盈亏摊回剩余股数：亏损时成本更高、盈利时成本更低（甚至为负）。
+      // 券商的「浮动盈亏」正是这个口径（= 本表的综合盈亏），故另给一列便于核对。
+      const dilutedCost = roundMoney(cost - historicalProfit);
       return {
         id: item.id,
         accountId: item.accountId,
@@ -148,8 +164,13 @@ export async function loadStockHoldingReport(
         floatingPnL,
         floatingPnLRate: cost > 0 ? floatingPnL / cost : 0,
         historicalProfit,
-        totalProfit: roundMoney(floatingPnL + historicalProfit),
-        currency: account?.currency || "CNY",
+        totalProfit,
+        dilutedCost,
+        // 摊薄成本 ≤ 0 时（已回本）比例没有意义，保持 0 而不是 Infinity。
+        totalPnLRate: dilutedCost > 0 ? totalProfit / dilutedCost : 0,
+        // 市值 = 数量 × 该市场收盘价，币种必须跟着市场走。账户币种只是历史遗留的兜底：
+        // 老数据里有「CNY 账户记港股」，按账户打标签会把港币市值算成人民币资产。
+        currency: defaultStockCurrencyForMarket(item.market),
       };
     })
     .sort((left, right) => {
@@ -166,6 +187,8 @@ export async function loadStockHoldingReport(
       floatingPnLRate: 0,
       historicalProfit: roundMoney(sum.historicalProfit + row.historicalProfit),
       totalProfit: roundMoney(sum.totalProfit + row.totalProfit),
+      dilutedCost: roundMoney(sum.dilutedCost + row.dilutedCost),
+      totalPnLRate: 0,
       holdingCount: sum.holdingCount + 1,
     }),
     {
@@ -176,10 +199,13 @@ export async function loadStockHoldingReport(
       floatingPnLRate: 0,
       historicalProfit: 0,
       totalProfit: 0,
+      dilutedCost: 0,
+      totalPnLRate: 0,
       holdingCount: 0,
     },
   );
   totals.floatingPnLRate = totals.cost > 0 ? totals.floatingPnL / totals.cost : 0;
+  totals.totalPnLRate = totals.dilutedCost > 0 ? totals.totalProfit / totals.dilutedCost : 0;
 
   return { rows, totals };
 }

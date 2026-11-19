@@ -5,6 +5,7 @@ import { connection } from "next/server";
 import { cookies } from "next/headers";
 import { AccountKind,   TransactionType, FundSubtype, RegularInvestStatus } from "@prisma/client";
 import { institutionTypeLabel, isSettlementCounterpartyType, isInstitutionTypeOf, LOAN_DIALOG_INSTITUTION_TYPE_VALUES } from "@/lib/account-kinds";
+import { institutionFullName } from "@/lib/institution-display";
 import { getServerAccountDropdownRestrictType } from "@/lib/server/account-dropdown-restrict";
 import { TransactionFormModal } from "@/components/TransactionFormModal";
 import { MobileTransactionForm } from "@/components/mobile/MobileTransactionForm";
@@ -37,6 +38,7 @@ import { ResizableVerticalSplit } from "@/components/ResizableVerticalSplit";
 import { calculateWealthCashDividendProfit, recalcWealthPositions } from "@/lib/wealth-position";
 import { computeDepositCashValueByAccount } from "@/lib/server/deposit-lot-balance";
 import { computeDepositNonCertificateBalances, getMaintainedAccountBalances } from "@/lib/server/account-balance";
+import { resolveStockFundingAccount } from "@/lib/server/brokerage-cash-account";
 import { computeLiabilityDisplaySummary } from "@/lib/server/liability-display-summary";
 import {
   applyLiabilityRowEntryMetrics,
@@ -45,10 +47,12 @@ import {
   buildLiabilityRowsViewData,
 } from "@/lib/server/liability-view-data";
 import { loadCreditBillPageData } from "@/lib/server/credit-bill-page-data";
+import { readableTagWhere } from "@/lib/server/tag-scope";
 import { prepareEntryUndo, saveEntryUndo } from "@/lib/server/entry-undo";
 import { getCreditBillAccountIds } from "@/lib/server/credit-card-institution-settings";
 import { formatCurrencyMoney, formatMoney } from "@/lib/format";
 import { pnlClassFromRedUp } from "@/lib/client/colors";
+import { getServerAccountDropdownGroupBy } from "@/lib/server/account-dropdown-group-by";
 import { LiveAccountBalance } from "@/components/LiveAccountBalance";
 import { AccountFxRateInline } from "@/components/AccountFxRateInline";
 import { createFundTransactionWithCashFlows, detachFundTransactionCashFlow, findFundTransactionForEntryId, syncFundTransactionsFromTxRecords, upsertFundTransactionRefundCashFlow, type FundCashFlowInput } from "@/lib/fund/transactions";
@@ -83,12 +87,13 @@ import { SIDEBAR_CREDIT_CARD_LABEL_TEMPLATE,
   normalizeCreditCardLabelTemplate,
   resolveAccountTableLabel,
   stripVisibleHoverParts, accountRenderSettings } from "@/lib/account-display";
-import { getInvestmentAccountView, isCashLedgerAccount, isDepositAccount, isIncomeExpensePostingAccount, isIncomeExpensePostingOrDepositAccount, isLoanOrSettlementAccountKind, isPureInvestmentAccount,  isTransferDropdownAccount } from "@/lib/account-kind-utils";
+import { getInvestmentAccountView, isCashLedgerAccount, isDepositAccount, isIncomeExpensePostingAccount, isIncomeExpensePostingOrDepositAccount, isLinkedFundWalletAccount, isLoanOrSettlementAccountKind, isPureInvestmentAccount,  isTransferDropdownAccount } from "@/lib/account-kind-utils";
 import { ALL_CASH_DETAIL_SCOPE_ID, cashLedgerAccountIdsOf, cashLedgerFlowAccountId } from "@/lib/all-cash-entries";
 import { normalizeLoanType, resolveLoanTypeValue } from "@/lib/loan-type";
-import { normalizeFundUnitsDecimals } from "@/lib/fund/unit-precision";
+import { resolveQuantityDecimals } from "@/lib/fund/unit-precision";
 import { regularInvestFormAction } from "@/lib/server/sidebar-actions/regular-invest-actions";
 import { fillFundNavFromCache } from "@/lib/server/sidebar-actions/fund-actions";
+import { extractMetalToFixedAsset } from "@/lib/server/sidebar-actions/metal-actions";
 import { createLiabilityTransaction } from "@/lib/server/sidebar-actions/liability-actions";
 import {
   createReimbursement,
@@ -360,10 +365,11 @@ export default async function Home({
     accountId?: string;
     tagId?: string;
     view?: string;
+    /** 股票视图页签：`repo` = 直接落在逆回购页签（胶囊菜单入口用）。 */
+    stockTab?: string;
     billMonth?: string;
     hideZeroBills?: string;
     hideSettledBills?: string;
-    billMonthsLimit?: string;
     billPage?: string;
     pageSize?: string;
     detailPage?: string;
@@ -520,6 +526,9 @@ export default async function Home({
   const fundPageParam = typeof params?.fundPage === "string" ? parseInt(params.fundPage, 10) : 1;
   const fundPage = Number.isFinite(fundPageParam) && fundPageParam >= 1 ? fundPageParam : 1;
   const showCleared = params?.showCleared === "1";
+  // 胶囊菜单「股票」直接落在逆回购界面：URL 用 `stockTab=repo` 表达这个页签状态，
+  // 由 `StockHoldingsPanel` 在首屏读它（并在切页签时同步回 URL，见该组件 switchToRepo）。
+  const stockTabRepo = params?.stockTab === "repo";
 
   // Read the up/down color scheme.
   const colorScheme = (cookieStore.get("colorScheme")?.value ?? "red_up_green_down") as "red_up_green_down" | "green_up_red_down";
@@ -530,7 +539,6 @@ export default async function Home({
   );
   const creditBillHideZeroPref = cookieStore.get("mmh_credit_hide_zero_bills")?.value;
   const creditBillHideSettledPref = cookieStore.get("mmh_credit_hide_settled_bills")?.value;
-  const creditBillRecentCyclesPref = cookieStore.get("mmh_credit_recent_cycles")?.value;
   const hideZeroBills =
     typeof params?.hideZeroBills === "string"
       ? params.hideZeroBills === "1"
@@ -539,13 +547,6 @@ export default async function Home({
     typeof params?.hideSettledBills === "string"
       ? params.hideSettledBills === "1"
       : creditBillHideSettledPref === "1" || creditBillHideSettledPref === "true";
-  const showRecentBillCycles =
-    typeof params?.billMonthsLimit === "string"
-      ? params.billMonthsLimit !== "all"
-      : creditBillRecentCyclesPref == null
-        ? true
-        : creditBillRecentCyclesPref === "1" || creditBillRecentCyclesPref === "true";
-  const billMonthsLimit = showRecentBillCycles ? 10 : 9999;
   const isRedUp = colorScheme === "red_up_green_down";
   const ctx = await getCachedHouseholdScope();
   const { hidFilter, householdId } = ctx;
@@ -573,7 +574,10 @@ export default async function Home({
   });
   // selectedAccount: per-account, deduplicated at request level.
   const selectedAccount = await loadSelectedAccount(accountId || undefined, hidFilter);
-  const fundUnitsDecimals = normalizeFundUnitsDecimals(selectedAccount?.fundUnitsDecimals, 2);
+  const fundUnitsDecimals = resolveQuantityDecimals(
+    selectedAccount?.investProductType,
+    selectedAccount?.fundUnitsDecimals,
+  );
   const isBillAccount =
     (selectedAccount?.kind === AccountKind.bank_credit || selectedAccount?.kind === AccountKind.loan) ||
     !!selectedAccount?.billingDay;
@@ -1153,6 +1157,10 @@ export default async function Home({
     }
   }
 
+  // 账户下拉的分组维度（2026-11-13，owner / accountGroup / institution）。
+  // 本页是服务端组件，只能从 cookie 镜像里读，不能在渲染中碰客户端偏好模块。
+  const accountDropdownGroupBy = await getServerAccountDropdownGroupBy();
+
   const accountOptions = accounts
     .filter(a => a.name !== "未指定账户")
     .map((a) => {
@@ -1184,6 +1192,8 @@ export default async function Home({
       tableHoverTitle: display.tableHoverTitle,
       groupId: display.groupId,
       groupName: display.groupName,
+      // 自定义分组标签（2026-11-13）：首页账户下拉「按分组标签」维度靠它切节。
+      accountGroupName: display.accountGroupName,
       institutionName: display.institutionName,
       institutionId: a.institutionId ?? "",
       institutionType: a.Institution?.type ?? "",
@@ -1194,6 +1204,7 @@ export default async function Home({
       isSettlementAccount: a.kind === AccountKind.settlement || (a.kind === AccountKind.loan && !!a.counterpartyId),
       isConsumerLoan: a.isConsumerLoan === true,
       investProductType: a.investProductType,
+      fixedAssetType: a.fixedAssetType ?? null,
       liabilityDirection: a.liabilityDirection ?? null,
       billingDay: a.billingDay ?? null,
       subLabel: display.subLabel,
@@ -1204,12 +1215,15 @@ export default async function Home({
       // 账户层级父 id（与下拉分组头的 parentId 无关）：转账表单靠它认出
       // 「转入账户已经是子账户」，避免再问「是否创建子账户」（2026-10-18）。
       accountParentId: a.parentId ?? null,
+      // 电子钱包 → 货基支付关联：支出弹窗据此显示「从关联货基支付」。
+      linkedFundAccountId: a.linkedFundAccountId ?? null,
+      linkedFundCode: a.linkedFundCode ?? null,
     };
   });
 
   // Build hierarchical SmartSelect options: grouped by AccountGroup (isHeader),
   // ungrouped accounts shown flat with institution as subLabel
-  type SSOpt = { id: string; label: string; subLabel?: string; title?: string; isHeader?: boolean; isGroup?: boolean; parentId?: string; kind?: string | null; investProductType?: string | null; liabilityDirection?: string | null; institutionId?: string | null; institutionType?: string | null; counterpartyId?: string | null; counterpartyName?: string | null; isSettlementAccount?: boolean | null; isConsumerLoan?: boolean | null; billingDay?: number | null; currency?: string | null; isAggregate?: boolean | null };
+  type SSOpt = { id: string; label: string; subLabel?: string; title?: string; isHeader?: boolean; isGroup?: boolean; parentId?: string; kind?: string | null; investProductType?: string | null; liabilityDirection?: string | null; institutionId?: string | null; institutionType?: string | null; counterpartyId?: string | null; counterpartyName?: string | null; isSettlementAccount?: boolean | null; isConsumerLoan?: boolean | null; billingDay?: number | null; currency?: string | null; isAggregate?: boolean | null; linkedFundAccountId?: string | null; linkedFundCode?: string | null };
   const joinSSSubLabel = (parts: Array<string | null | undefined>) => {
     const result: string[] = [];
     const seen = new Set<string>();
@@ -1223,6 +1237,47 @@ export default async function Home({
   };
   function buildAccountSSOptions(filter?: (a: typeof accountOptions[number]) => boolean): SSOpt[] {
     const filtered = filter && restrictAccountTypes ? accountOptions.filter(filter) : accountOptions;
+
+    // 2026-11-13：分组维度可切换（设置 → 显示 → 账户下拉分组）。owner 保持历史行为，
+    // 另外两档按自定义分组标签 / 机构切节，未设置该维度的账户排到列表尾部（无表头）。
+    const dropdownGroupBy = accountDropdownGroupBy;
+    if (dropdownGroupBy !== "owner") {
+      const headerPrefix = dropdownGroupBy === "accountGroup" ? "group:ag:" : "group:in:";
+      const headerOf = (a: typeof accountOptions[number]) =>
+        (dropdownGroupBy === "accountGroup" ? a.accountGroupName : a.institutionName).trim();
+      const headerLabels = Array.from(new Set(filtered.map(headerOf).filter(Boolean)))
+        .sort((x, y) => x.localeCompare(y, "zh-Hans-CN"));
+      const items: SSOpt[] = [...filtered]
+        .sort((x, y) => (headerOf(x) + x.label).localeCompare(headerOf(y) + y.label, "zh-Hans-CN"))
+        .map(a => ({
+          id: a.id,
+          label: a.label,
+          subLabel: joinSSSubLabel(
+            [a.groupName, a.subLabel].filter(part => !!part && !a.label.includes(part)),
+          ),
+          title: stripVisibleHoverParts(a.hoverTitle, [a.groupName]),
+          parentId: headerOf(a) ? `${headerPrefix}${headerOf(a)}` : undefined,
+          kind: a.kind,
+          investProductType: a.investProductType ?? null,
+          liabilityDirection: a.liabilityDirection ?? null,
+          institutionId: a.institutionId || null,
+          institutionType: a.institutionType || null,
+          counterpartyId: a.counterpartyId || null,
+          counterpartyName: a.counterpartyName || null,
+          isSettlementAccount: a.isSettlementAccount ?? null,
+          isConsumerLoan: a.isConsumerLoan ?? null,
+          billingDay: a.billingDay ?? null,
+          currency: a.currency ?? null,
+          isAggregate: a.isAggregate === true,
+          linkedFundAccountId: a.linkedFundAccountId ?? null,
+          linkedFundCode: a.linkedFundCode ?? null,
+        }));
+      return [
+        ...headerLabels.map(label => ({ id: `${headerPrefix}${label}`, label, isHeader: true })),
+        ...items,
+      ];
+    }
+
     const grouped = filtered.filter(a => a.groupId);
     const ungrouped = filtered.filter(a => !a.groupId);
 
@@ -1260,6 +1315,8 @@ export default async function Home({
         billingDay: a.billingDay ?? null,
         currency: a.currency ?? null,
         isAggregate: a.isAggregate === true,
+        linkedFundAccountId: a.linkedFundAccountId ?? null,
+        linkedFundCode: a.linkedFundCode ?? null,
       }));
 
     // Build ungrouped account entries (no parentId)
@@ -1282,6 +1339,8 @@ export default async function Home({
       billingDay: a.billingDay ?? null,
       currency: a.currency ?? null,
       isAggregate: a.isAggregate === true,
+      linkedFundAccountId: a.linkedFundAccountId ?? null,
+      linkedFundCode: a.linkedFundCode ?? null,
     }));
 
     return [...groupHeaders, ...groupedItems, ...ungroupedItems];
@@ -1415,6 +1474,16 @@ export default async function Home({
     : accountOptions.filter((a) => isTransferDropdownAccount(a));
   const stockAccountSSOptions = buildAccountSSOptions(a => a.kind === "investment" && a.investProductType === "stock");
   const propertyAccountSSOptions = buildAccountSSOptions(a => a.kind === "investment" && a.investProductType === "property");
+  // 提取实物的目标账户只能是「贵金属实物」固定资产账户（fixedAssetType=collectible，
+  // 与 extractMetalToFixedAsset 落库口径一致），房产 / 汽车 / 设备等账户不能接收实物。
+  // 「限制账户类型」设置关掉时 buildAccountSSOptions 会忽略 filter，所以再按 id 兜底过滤一次。
+  const metalPropertyAccountIds = new Set(
+    accountOptions
+      .filter(a => a.kind === "investment" && a.investProductType === "property" && a.fixedAssetType === "collectible")
+      .map(a => a.id),
+  );
+  const metalPropertyAccountSSOptions = buildAccountSSOptions(a => metalPropertyAccountIds.has(a.id))
+    .filter(option => !option.isHeader && metalPropertyAccountIds.has(option.id));
   const liabilityTransferAccountSSOptions = buildAccountSSOptions(a => a.isAggregate !== true && (a.kind === "bank_debit" || a.kind === "cash" || a.kind === "ewallet" || a.kind === "bank_credit"));
   // 不是所有往来对象都能当「往来款对象」—— 常用商户（merchant）排除
   const liabilityCounterpartyOptions = counterparties.filter((counterparty) => isSettlementCounterpartyType(counterparty.type));
@@ -1434,7 +1503,7 @@ export default async function Home({
         { id: "loan-institution-source-header", label: t("liabilityTx.loanInstitutionHeader"), isHeader: true },
         ...loanSourceInstitutions.map((institution) => ({
           id: `institution:${institution.id}`,
-          label: institution.shortName?.trim() || institution.name,
+          label: institutionFullName(institution),
           subLabel: institutionTypeLabel(institution.type ?? null, t),
         })),
       ]
@@ -1515,6 +1584,31 @@ export default async function Home({
       ),
       currency: a.currency,
     }));
+  // 开放式基金与货币基金是两套口径（净值涨跌 vs 每万份收益），账户不能互串：
+  // 货基视图只给货基账户、开放式基金视图只给开放式基金账户。
+  // `investProductType` 为空的历史账户两类都放行，否则老数据会在下拉里凭空消失。
+  const fundFamilyViewProductType: "fund" | "money" | null =
+    view === "investmoney" ? "money" : view === "investfund" ? "fund" : null;
+  const inFundFamilyView = (account: { kind: string; investProductType?: string | null }) =>
+    // 存款账户也躺在 investmentAccountList 里（kind=deposit、investProductType 为空），
+    // 基金视图必须剔掉，否则「无类型放行」会把定期存款也漏成基金账户。
+    !isDepositAccount(account) &&
+    (!fundFamilyViewProductType || !account.investProductType || account.investProductType === fundFamilyViewProductType);
+  const fundViewInvestmentAccountOptions = fundFamilyViewProductType
+    ? investmentAccountOptions.filter(inFundFamilyView)
+    : investmentAccountOptions;
+  const fundViewInvestmentAccounts = fundFamilyViewProductType
+    ? investmentAccountList.filter(inFundFamilyView)
+    : investmentAccountList;
+  const fundViewInvestmentAccountIds = new Set(fundViewInvestmentAccounts.map((account) => account.id));
+  const fundViewInvestmentAccountSSOptions = fundFamilyViewProductType
+    ? (() => {
+        // 小类被过滤掉的分组表头也要一起去掉，不然下拉里会留下点不动的空分组。
+        const options = investmentAccountSSOptions.filter((option) => option.isHeader || fundViewInvestmentAccountIds.has(option.id));
+        const usedParents = new Set(options.map((option) => option.parentId).filter(Boolean));
+        return options.filter((option) => !option.isHeader || usedParents.has(option.id));
+      })()
+    : investmentAccountSSOptions;
   // NestedAddModal fieldData for groups & institutions
   const nestedFieldData = {
     groupId: groups.filter(g => g.name !== "未指定").map(g => ({ id: g.id, name: g.name })),
@@ -1684,6 +1778,7 @@ export default async function Home({
             categoryId: true,
             categoryName: true,
             counterpartyInstitutionId: true,
+            postedAt: true,
             note: true,
             toNote: true,
             principalAmount: true,
@@ -1697,12 +1792,25 @@ export default async function Home({
             fundArrivalDate: true,
             EntryTag: { select: { tagId: true } },
           },
-          orderBy: [{ date: "desc" }, { createdAt: "desc" }],
+          // 末位补 id：同一天、且 createdAt 相同的流水（批量导入/批量建账常见）
+          // 若不给出稳定的 tie-break，Postgres 的返回顺序会随执行计划变化，明细行序
+          // 就会和余额折叠顺序（compareDetailEntriesAsc）打架。口径与
+          // detail-entry-order 的降序比较器一致。
+          orderBy: [{ date: "desc" }, { createdAt: "desc" }, { id: "desc" }],
           // 负债流水随自动扣款/账单逐月增长（默认账本已 4500+ 条），上限过低会按日期截断最老历史，
           // 导致还款计划表早期期次「消失」（2026-09-14 实证：3000 条只覆盖到 2018-12，期次 1-19 不显示）。
           take: 50000,
         })
       : [];
+  // 往来明细的「标签」列与批量改标签要显示同一个名字：Tag 表很小，按账本一次取全。
+  const liabilityTagNameById = new Map<string, string>();
+  if (liabilityEntriesRaw.length > 0) {
+    const liabilityTags = await prisma.tag.findMany({
+      where: readableTagWhere(householdId),
+      select: { id: true, name: true },
+    });
+    for (const tag of liabilityTags) liabilityTagNameById.set(tag.id, tag.name);
+  }
   // 往来款明细要标出「这笔已被报销单关联」：关联表本身很小，按账本一次取全，
   // 避免拿 5 万条流水 id 去拼 IN 查询。
   const reimbursementLinkByEntryId = new Map<string, { id: string; title: string; stage: "submitted" | "approved" | "paid" }>();
@@ -1791,6 +1899,7 @@ export default async function Home({
     accountFactsById,
     displayAccountId: accountId,
     reimbursementLinkByEntryId,
+    tagNameById: liabilityTagNameById,
   });
 
   // Query the most recently used cash account.
@@ -1833,10 +1942,8 @@ export default async function Home({
     billStorageAccountId,
     billMonthParam,
     billPage,
-    billMonthsLimit,
     hideZeroBills,
     hideSettledBills,
-    showRecentBillCycles,
     view,
     t,
     categoryLabels,
@@ -1848,14 +1955,28 @@ export default async function Home({
     selectedAccount?.kind === AccountKind.bank_credit &&
     !creditBillingDay;
 
+  // 关联了货基的电子钱包「不统计余额，但表头还是要有数字」（2026-11-18 用户裁定）：
+  // 统计口径（总资产/侧栏/合计）给 0，这里单独按账面口径折叠出真实余额给表头用。
+  const selectedAccountLedgerBalance = selectedAccount && isLinkedFundWalletAccount(selectedAccount)
+    ? (await getMaintainedAccountBalances(
+        [{
+          id: selectedAccount.id,
+          kind: selectedAccount.kind,
+          investProductType: selectedAccount.investProductType,
+          billingDay: selectedAccount.billingDay,
+        }],
+        hidFilter,
+        { countLinkedFundWallets: true },
+      )).get(selectedAccount.id)
+    : undefined;
   const selectedAccountRawBalanceValue = selectedAccount
-    ? isPureInvestmentAccount(selectedAccount)
+    ? selectedAccountLedgerBalance ?? (isPureInvestmentAccount(selectedAccount)
       ? investBalByAccountId.get(selectedAccount.id)?.marketValue ?? toNumber(selectedAccount.balance)
       : selectedAccount.kind === AccountKind.bank_credit
         ? creditBillBalanceValue
       : isLoanOrSettlementAccountKind(selectedAccount.kind)
         ? liabilityDisplaySummary.balanceByAccountId.get(selectedAccount.id) ?? cashDisplayBalanceByAccountId.get(selectedAccount.id) ?? toNumber(selectedAccount.balance)
-        : cashDisplayBalanceByAccountId.get(selectedAccount.id) ?? toNumber(selectedAccount.balance)
+        : cashDisplayBalanceByAccountId.get(selectedAccount.id) ?? toNumber(selectedAccount.balance))
     : 0;
   const selectedAccountFxRate = selectedAccount ? fxRateByCurrency.get(normalizeCurrency(selectedAccount.currency)) : null;
   const selectedAccountCurrency = selectedAccount ? normalizeCurrency(selectedAccount.currency) : baseCurrency;
@@ -1966,9 +2087,13 @@ export default async function Home({
         const positions = investpropertyData.positions.filter(
           (position) => (position.assetType ?? "property") === fixedAssetTypeParam,
         );
+        // 历史持有页签也要按子类型过滤，否则在「车辆」下会看到已出售的房产。
+        const clearedPositions = investpropertyData.clearedPositions.filter(
+          (position) => (position.assetType ?? "property") === fixedAssetTypeParam,
+        );
         const totalMarketValue = positions.reduce((sum, row) => sum + row.marketValue, 0);
         const totalCost = positions.reduce((sum, row) => sum + row.cost, 0);
-        return { ...investpropertyData, positions, totalMarketValue, totalCost };
+        return { ...investpropertyData, positions, clearedPositions, totalMarketValue, totalCost };
       })()
     : investpropertyData;
   const investfundData = view === "investfund" && accountId
@@ -2890,7 +3015,7 @@ export default async function Home({
       cashAccountId: lot.cashAccountId,
     }));
   const selectedAccountDisplayValue = selectedAccount
-    ? accountDisplayValueById.get(selectedAccount.id) ?? selectedAccountRawBalanceValue
+    ? selectedAccountLedgerBalance ?? accountDisplayValueById.get(selectedAccount.id) ?? selectedAccountRawBalanceValue
     : selectedAccountRawBalanceValue;
   const selectedViewHeaderAmount = view === "liability"
     ? liabilityDisplaySummaryValue
@@ -2939,22 +3064,21 @@ export default async function Home({
     return latestBuy?.accountId ?? "";
   })();
   const defaultInvestCashAccountId = lastInvestBuyCashAccountId || defaultCashAccountForSelectedInstitution;
-  const defaultStockCashAccountId = (() => {
-    const stockAccount = stockAccountOptions.find((account) => account.id === defaultStockInvestmentAccountId) ?? null;
-    const stockOwnerGroupId = (stockAccount?.groupId ?? "").trim();
-    if (stockAccount?.institutionId) {
-      const sameOwnerCash = (account: typeof cashAccountList[number]) =>
-        (!stockOwnerGroupId || (account.groupId ?? "") === stockOwnerGroupId);
-      const cashAccount = cashAccountList.find((account) =>
-        account.institutionId === stockAccount.institutionId && account.institutionType === "brokerage" && sameOwnerCash(account))
-        ?? cashAccountList.find((account) =>
-          account.institutionId === stockAccount.institutionId && sameOwnerCash(account))
-        ?? null;
-      return cashAccount?.id ?? defaultCashAccountForSelectedInstitution;
-    }
-    return defaultCashAccountForSelectedInstitution;
-  })();
-  const defaultStockCashAccountName = cashAccountList.find((account) => account.id === defaultStockCashAccountId)?.label ?? null;
+  // 记账默认资金账户 = 表头显示的那只：股票视图直接用服务端算好的，其余情况问同一个解析函数。
+  const defaultStockAccountOption = stockAccountOptions.find((account) => account.id === defaultStockInvestmentAccountId) ?? null;
+  const defaultStockCashAccountId = investstockData?.cashAccountId
+    ?? (defaultStockAccountOption
+      ? (await resolveStockFundingAccount(prisma, {
+        id: defaultStockAccountOption.id,
+        householdId,
+        groupId: defaultStockAccountOption.groupId ?? "",
+        institutionId: defaultStockAccountOption.institutionId ?? null,
+        currency: defaultStockAccountOption.currency ?? "CNY",
+      }))?.id
+      : null)
+    ?? defaultCashAccountForSelectedInstitution;
+  // 记账弹窗的默认资金账户和表头「资金余额」读同一只账户，不再各猜一次。
+  const stockCashFundingAccount = cashAccountList.find((account) => account.id === defaultStockCashAccountId) ?? null;
   const defaultStockTransferFromAccountId = (() => {
     const stockAccount = stockAccountOptions.find((account) => account.id === defaultStockInvestmentAccountId) ?? null;
     const stockOwnerGroupId = (stockAccount?.groupId ?? "").trim();
@@ -3028,6 +3152,7 @@ export default async function Home({
                   displayMultiplier={selectedAccount.kind === AccountKind.bank_credit ? -1 : 1}
                   baseCurrency={selectedAccountCurrency}
                   accountDisplayMode="original"
+                  balanceScope={isLinkedFundWalletAccount(selectedAccount) ? "ledger" : "statistics"}
                 />
               )}
               {view === "deposit" && selectedAccount && Math.abs(depositNonCertificateAmount) > 0.005 ? (
@@ -3047,6 +3172,16 @@ export default async function Home({
                       amount: formatCurrencyMoney(Math.abs(depositNonCertificateAmount), selectedAccountCurrency),
                     },
                   )}
+                </span>
+              ) : null}
+              {/* 关联了货基的电子钱包不统计余额（2026-11-18 用户裁定）：头部显示 0，
+                  这里说明原因，别让用户以为钱"消失了"。 */}
+              {selectedAccount && isLinkedFundWalletAccount(selectedAccount) ? (
+                <span
+                  className="text-xs text-slate-500"
+                  title={t("settings.accounts.linkedFund.balanceNotCounted")}
+                >
+                  {t("settings.accounts.linkedFund.balanceUncountedShort")}
                 </span>
               ) : null}
               {showSelectedAccountFxInline ? (
@@ -3115,6 +3250,10 @@ export default async function Home({
                       : (selectedAccount?.id ?? accountId ?? ""),
                   defaultTransferToAccountId: isBillAccount ? (selectedAccount?.id ?? accountId ?? "") : "",
                   defaultInvestmentAccountId: currentFundInvestmentAccountId,
+                  // 货基账户里点「记一笔」要打开货基记账窗，不能一律按开放式基金。
+                  defaultInvestmentProductType: isFundLikeInvestView
+                    ? (selectedAccount?.investProductType ?? "")
+                    : "",
                   defaultStockAccountId: defaultStockInvestmentAccountId,
                   defaultStockCashAccountId,
                   defaultStockTransferFromAccountId,
@@ -3159,7 +3298,16 @@ export default async function Home({
                       { key: "fx-sell", label: t("entry.kind.fxSell") },
                     ],
                   },
-                  { key: "investment", label: t("entry.kind.investment") },
+                  {
+                    key: "investment",
+                    label: t("entry.kind.investment"),
+                    // 基金分两类产品：开放式基金按净值/份额，货币基金净值恒为 1、收益红利再投。
+                    // 子项用 productType 锁定弹窗的产品类型，不受当前账户/视图影响。
+                    children: [
+                      { key: "investment", label: t("investment.product.fund"), productType: "fund" },
+                      { key: "investment", label: t("investment.product.money"), productType: "money" },
+                    ],
+                  },
                   {
                     key: "stock",
                     label: t("entry.kind.stock"),
@@ -3172,8 +3320,30 @@ export default async function Home({
                       { key: "stock-repo", label: t("repoForm.title") },
                     ],
                   },
-                  { key: "property", label: t("entry.kind.property") },
-                  { key: "metal", label: t("entry.kind.metal") },
+                  {
+                    key: "property",
+                    label: t("entry.kind.property"),
+                    children: [
+                      // 固定资产只有一个动作：资产变动。购入 / 产值变动 / 出售都在同一个页面里，
+                      // 由「选了哪项资产」和「变动后产值」推断，不再分页签或子项。
+                      { key: "property", label: t("propertyForm.title.assetChange") },
+                      // 物业费/税费这类挂在固定资产上的费用化支出仍走通用支出表单。
+                      { key: "property-expense", label: t("propertyForm.action.expense") },
+                    ],
+                  },
+                  {
+                    key: "metal",
+                    label: t("entry.kind.metal"),
+                    children: [
+                      { key: "metal", label: t("stockPanel.action.buy") },
+                      // 提取实物（贵金属 → 固定资产）是独立动作，入口就在这里（2026-11-13 用户裁定）。
+                      {
+                        key: "metal-extract",
+                        label: t("metalExtract.entryButton"),
+                        disabled: !defaultMetalInvestmentAccountId,
+                      },
+                    ],
+                  },
                   { key: "wealth", label: t("entry.kind.wealth") },
                   {
                     key: "bond",
@@ -3283,10 +3453,12 @@ export default async function Home({
                 stockAccountSSOptions={stockAccountSSOptions}
                 cashAccounts={cashAccountList}
                 cashAccountSSOptions={cashAccountSSOptions}
+                editInvestmentAction={editInvestment}
               />
               <PropertyFormModal
                 defaultPropertyAccountId={defaultPropertyInvestmentAccountId}
                 defaultCashAccountId={defaultCashAccountForSelectedInstitution}
+                defaultAssetType={fixedAssetTypeParam || selectedAccount?.fixedAssetType || null}
                 propertyAccounts={propertyAccountOptions}
                 propertyAccountSSOptions={propertyAccountSSOptions}
                 cashAccounts={cashAccountList}
@@ -3295,6 +3467,9 @@ export default async function Home({
                   id: position.propertyAssetId ?? position.fundCode,
                   name: position.name,
                   marketValue: position.marketValue,
+                  // 处置页签要拿账面成本算「处置损失」。
+                  cost: position.cost ?? null,
+                  accountId: position.accountId ?? null,
                 })) ?? []}
               />
               <InvestmentFormModal
@@ -3333,6 +3508,8 @@ export default async function Home({
                   amount: e.amount != null ? Number(e.amount) : 0,
                 })) ?? undefined}
                 createAction={createTransaction}
+                propertyAccounts={metalPropertyAccountSSOptions}
+                extractAction={extractMetalToFixedAsset}
                 fundUnitsDecimals={fundUnitsDecimals}
               />
               <InvestmentFormModal
@@ -3462,7 +3639,8 @@ export default async function Home({
                 accountId={selectedAccount?.id ?? investmentAccountOptions[0]?.id ?? ""}
                 accountLabel={selectedAccountLabel}
                 cashAccounts={cashAccountList}
-                investmentAccounts={investmentAccountOptions.map((item) => ({ id: item.id, name: item.label, label: item.label }))}
+                investmentAccounts={fundViewInvestmentAccountOptions.map((item) => ({ id: item.id, name: item.label, label: item.label }))}
+                defaultInvestProductType={selectedAccount?.investProductType ?? null}
                 transferTargetAccounts={accountOptions}
                 insuranceProductOptions={[]}
                 cashAccountSSOptions={cashAccountSSOptions}
@@ -3593,7 +3771,6 @@ export default async function Home({
                       settledBillMonth={settledBillMonth}
                       hideZeroBills={hideZeroBills}
                       hideSettledBills={hideSettledBills}
-                      showRecentBillCycles={showRecentBillCycles}
                       fillHeight
                     />
                   ) : (
@@ -3605,6 +3782,7 @@ export default async function Home({
                   <CreditBillDetailPanel
                     accountId={selectedAccount?.id ?? ""}
                     reorderAccountIds={billAccountIds}
+                    billAccountIds={billAccountIds}
                     showCardColumn
                     entries={creditBillDetailEntries}
                     initialPage={detailPage}
@@ -3695,6 +3873,7 @@ export default async function Home({
               accountLabel={selectedAccountLabel}
               institutionName={selectedAccount.Institution?.name ?? ""}
               institutionId={selectedAccount.institutionId ?? null}
+              initialShowCleared={showCleared}
               holdings={insuranceHoldings}
               entries={insuranceEntries}
               cashAccounts={cashAccountList}
@@ -3729,15 +3908,17 @@ export default async function Home({
               selectedAccountLabel={selectedAccountLabel}
               accountOptions={accountOptions}
               cashAccounts={cashAccountList}
-              investmentAccounts={investmentAccountList}
+              investmentAccounts={fundViewInvestmentAccounts}
               cashAccountSSOptions={cashAccountSSOptions}
-              investmentAccountSSOptions={investmentAccountSSOptions}
+              investmentAccountSSOptions={fundViewInvestmentAccountSSOptions}
               wealthHoldingOptions={wealthHoldingOptions}
               metalTypes={metalTypes}
               metalUnits={metalUnits}
               nestedFieldData={nestedFieldData}
               createAction={createTransaction}
               editAction={editInvestment}
+              propertyAccounts={metalPropertyAccountSSOptions}
+              extractAction={extractMetalToFixedAsset}
               fillNavAction={fillFundNavFromCache}
               regularInvestFormAction={regularInvestFormAction}
               lastUsedCashAccount={lastUsedCashAccount}
@@ -3786,6 +3967,8 @@ export default async function Home({
               nestedFieldData={nestedFieldData}
               createAction={createTransaction}
               editAction={editInvestment}
+              propertyAccounts={metalPropertyAccountSSOptions}
+              extractAction={extractMetalToFixedAsset}
               fillNavAction={fillFundNavFromCache}
               regularInvestFormAction={regularInvestFormAction}
               lastUsedCashAccount={lastUsedCashAccount}
@@ -3799,6 +3982,8 @@ export default async function Home({
               currency={selectedAccount?.currency ?? baseCurrency}
               baseCurrency={baseCurrency}
               positions={JSON.parse(JSON.stringify(investpropertyFilteredData.positions))}
+              clearedPositions={JSON.parse(JSON.stringify(investpropertyFilteredData.clearedPositions))}
+              initialShowCleared={showCleared}
               entries={JSON.parse(JSON.stringify(investpropertyEntries))}
               totalMarketValue={investpropertyFilteredData.totalMarketValue}
               totalCost={investpropertyFilteredData.totalCost}
@@ -3810,19 +3995,21 @@ export default async function Home({
             />
           ) : view === "investstock" && investstockData ? (
             <StockHoldingsPanel
-              key={`investstock-${accountId}`}
+              key={`investstock-${accountId}-${stockTabRepo ? "repo" : "pos"}`}
               accountId={accountId}
               accountLabel={selectedAccountLabel}
               currency={selectedAccount?.currency ?? baseCurrency}
               positions={JSON.parse(JSON.stringify(investstockData.positions))}
               clearedPositions={JSON.parse(JSON.stringify(investstockData.clearedPositions))}
               initialShowCleared={showCleared}
+              initialRepoOpen={stockTabRepo}
               cashBalance={investstockData.cashBalance ?? 0}
               totalMarketValue={investstockData.totalMarketValue}
               totalCost={investstockData.totalCost}
               isRedUp={isRedUp}
               stockCashAccountId={defaultStockCashAccountId}
-              stockCashAccountName={defaultStockCashAccountName}
+              stockCashAccountName={stockCashFundingAccount?.label ?? null}
+              stockCashAccountHoverTitle={stockCashFundingAccount?.hoverTitle ?? null}
               accountOptions={accountOptions}
               repo={stockRepo}
             />
@@ -3846,14 +4033,16 @@ export default async function Home({
               selectedAccountLabel={selectedAccountLabel}
               accountOptions={accountOptions}
               cashAccounts={cashAccountList}
-              investmentAccounts={investmentAccountList}
+              investmentAccounts={fundViewInvestmentAccounts}
               cashAccountSSOptions={cashAccountSSOptions}
-              investmentAccountSSOptions={investmentAccountSSOptions}
+              investmentAccountSSOptions={fundViewInvestmentAccountSSOptions}
               metalTypes={metalTypes}
               metalUnits={metalUnits}
               nestedFieldData={nestedFieldData}
               createAction={createTransaction}
               editAction={editInvestment}
+              propertyAccounts={metalPropertyAccountSSOptions}
+              extractAction={extractMetalToFixedAsset}
               fillNavAction={fillFundNavFromCache}
               regularInvestFormAction={regularInvestFormAction}
               lastUsedCashAccount={lastUsedCashAccount}

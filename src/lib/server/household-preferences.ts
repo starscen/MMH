@@ -47,10 +47,10 @@ export function preferenceRowData(prefs: AppPreferences) {
     creditCardSidebarLabelTemplate: prefs.creditCardSidebarLabelTemplate,
     creditBillHideZero: prefs.creditBillHideZero,
     creditBillHideSettled: prefs.creditBillHideSettled,
-    creditBillShowRecentCycles: prefs.creditBillShowRecentCycles,
     displayLanguage: prefs.displayLanguage,
     dateDisplayFormat: prefs.dateDisplayFormat,
     sidebarGroupBy: prefs.sidebarGroupBy,
+    accountDropdownGroupBy: prefs.accountDropdownGroupBy,
     sidebarHideZero: prefs.sidebarHideZero,
     sidebarHideInitialData: prefs.sidebarHideInitialData,
     sidebarShowFixedAssets: prefs.sidebarShowFixedAssets,
@@ -62,6 +62,7 @@ export function preferenceRowData(prefs: AppPreferences) {
     accountLabelFields: serializeAccountLabelFields(prefs.accountLabelFields),
     accountDropdownRestrictType: prefs.accountDropdownRestrictType,
     accountUsageSortEnabled: prefs.accountUsageSortEnabled,
+    repoOccupiedDaysMode: prefs.repoOccupiedDaysMode,
   };
 }
 

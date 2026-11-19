@@ -11,6 +11,7 @@ import { CurrencySmartSelect } from "./CurrencySmartSelect";
 import { DateStepper } from "./DateStepper";
 import { EntityCreateForm, NestedAddModal } from "./EntityCreateForm";
 import { EntryAttachmentButton, uploadEntryAttachmentFiles } from "./EntryAttachmentPanel";
+import { EntryConvertMenu, type ConvertSourceEntry } from "./BasicDetailSelection";
 import { EntryModalShell } from "./EntryModalShell";
 import type { FolderTabsCardItem } from "./FolderTabsCard";
 import { SmartSelect, SmartSelectOption } from "./SmartSelect";
@@ -20,9 +21,11 @@ import { isSettlementCounterpartyType, kindLabel } from "@/lib/account-kinds";
 import { restrictAccountsByType } from "@/lib/client/account-dropdown-filter";
 import { getCashTargetOperation, isAdvanceFundingAccount, isDepositAccount, isDepositPostingCategoryAllowed,  isIncomeExpensePostingOrDepositAccount, isLoanOrSettlementAccountKind, isTransferDropdownAccount } from "@/lib/account-kind-utils";
 import { buildAccountDisplayOption, buildGroupedAccountOptions, counterpartyQualifiedAccountName, formatAccountHoverTitle } from "@/lib/account-display";
+import { institutionFullName } from "@/lib/institution-display";
 import { recordRecentAccounts, sortByAccountUsage, useAccountUsage } from "@/lib/client/recentAccounts";
 import { useResetEntryModalReconciledReadOnlyOnClose } from "@/lib/client/entryModalLock";
 import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
+import { isEntryConversionRequest } from "@/lib/client/entry-conversion";
 /** 必填字段红框（统一实现，见该模块注释）。 */
 import { REQUIRED_FIELD_CLASS } from "@/lib/client/required-field";
 import type { DepositLotOption } from "@/lib/server/deposit-lot-options";
@@ -50,10 +53,16 @@ import {
   type CreditCardInstallmentRateType,
 } from "@/lib/credit/installment";
 import { formatAmountDraft } from "@/lib/format";
-import { filterIncomeExpenseInstitutions } from "@/lib/institution-rules";
+import { filterIncomeExpenseInstitutions, INCOME_EXPENSE_INSTITUTION_TYPES } from "@/lib/institution-rules";
 import { buildCategoryParentOptions, buildCategoryTreeOptions } from "@/components/categorySmartSelect";
-import { buildCategoryQuickPickGroups, useCategoryUsage } from "@/lib/client/category-usage";
+import {
+  buildCategoryQuickPickGroups,
+  invalidateCategoryUsage,
+  recordRecentCategory,
+  useCategoryUsage,
+} from "@/lib/client/category-usage";
 import { readAccountDisplaySettings } from "@/lib/client/account-display-settings";
+import { getAccountDropdownGroupByPreference } from "@/lib/client/appPreferences";
 import { normalizeOptionalCurrency } from "@/lib/currency";
 
 type TxType = "expense" | "income" | "advance" | "transfer" | "fx" | "investment";
@@ -88,6 +97,9 @@ type AccountOption = {
   accountParentId?: string | null;
   /** 多币种父账户（聚合账户）标记：它自己不能记账。 */
   isAggregate?: boolean | null;
+  /** 电子钱包 → 货基支付关联：选中后支出弹窗出现「从关联货基支付」。 */
+  linkedFundAccountId?: string | null;
+  linkedFundCode?: string | null;
 };
 
 type CategoryOption = {
@@ -101,7 +113,8 @@ type CategoryOption = {
 
 type AiPrefillItem = {
   rawText?: string;
-  type?: "expense" | "income" | "transfer" | "fx" | "investment";
+  /** `advance`（代付）来自明细页「转换交易」；文本解析不会产出它。 */
+  type?: "expense" | "income" | "advance" | "transfer" | "fx" | "investment";
   date?: string;
   amount?: number;
   account?: string;
@@ -316,7 +329,8 @@ function settingsAccountToOption(account: SettingsAccountRecord): AccountOption 
 function buildGroupedOptionsFromSettingsAccounts(accounts: SettingsAccountRecord[]): SmartSelectOption[] {
   const displayOptions = accounts.map((account) => buildAccountDisplayOption(account as Parameters<typeof buildAccountDisplayOption>[0], undefined, readAccountDisplaySettings()));
   const metaById = new Map(accounts.map((account) => [account.id, settingsAccountToOption(account)]));
-  return buildGroupedAccountOptions(displayOptions).map((option) => (
+  // 分组维度跟随「设置 → 显示 → 账户下拉分组」（owner / 分组标签 / 机构），默认按所有人。
+  return buildGroupedAccountOptions(displayOptions, getAccountDropdownGroupByPreference()).map((option) => (
     option.isHeader || option.isGroup ? option : { ...option, ...metaById.get(option.id) }
   ));
 }
@@ -415,6 +429,8 @@ export function TransactionFormModal({
   const [stockCashAccountId, setStockCashAccountId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [requestId, setRequestId] = useState<string | null>(null);
+  /** 本次新建来自「转换交易」：保存后要删原记录，因此不提供「保存并再记一笔」。 */
+  const [conversionEntry, setConversionEntry] = useState(false);
   const [editEntryId, setEditEntryId] = useState<string | null>(null);
   const [editEntryOriginalType, setEditEntryOriginalType] = useState<TxType | null>(null);
   const [editEntryHasFundDetail, setEditEntryHasFundDetail] = useState(false);
@@ -509,7 +525,10 @@ export function TransactionFormModal({
     groupName?: string,
   ) {
     const next = [...(base ?? [])];
-    const headerId = groupId ? `group:${groupId}` : "";
+    // 只有「按所有人」分组时，新建账户才有确定的表头。按分组标签 / 按机构时
+    // 新账户还没有这个维度（分组标签是用户之后填的），直接排到列表尾部，
+    // 否则会挂到一个列表里不存在的 parentId 上。
+    const headerId = getAccountDropdownGroupByPreference() === "owner" && groupId ? `group:${groupId}` : "";
     if (headerId && groupName?.trim() && !next.some((item) => item.id === headerId)) {
       next.push({ id: headerId, label: groupName.trim(), isHeader: true });
     }
@@ -532,7 +551,7 @@ export function TransactionFormModal({
             groupId: (data.groups ?? []).filter((group: { name: string }) => group.name !== "未指定").map((group: { id: string; name: string }) => ({ id: group.id, name: group.name })),
             institutionId: (data.institutions ?? []).map((institution: { id: string; name: string; shortName?: string | null; type?: string | null }) => ({
               id: institution.id,
-              name: institution.shortName?.trim() || institution.name,
+              name: institutionFullName(institution),
               type: institution.type ?? "",
             })),
             counterpartyId: (data.counterparties ?? [])
@@ -743,6 +762,9 @@ export function TransactionFormModal({
     });
   }, [depositLotOptions, depositLotsLoading, editEntryId, open, showDepositLotSelect]);
   const [fixedAssetLinked, setFixedAssetLinked] = useState(false);
+  // 电子钱包 ↔ 货基联动：支出从关联货基赎付，转入自动申购成关联货基。默认关闭。
+  const [payFromLinkedFund, setPayFromLinkedFund] = useState(false);
+  const [autoBuyLinkedFund, setAutoBuyLinkedFund] = useState(false);
   const [fixedAssetAccountId, setFixedAssetAccountId] = useState("");
   const [fixedAssetAssetId, setFixedAssetAssetId] = useState("");
   const [fixedAssetLinkLocked, setFixedAssetLinkLocked] = useState(false);
@@ -824,7 +846,7 @@ export function TransactionFormModal({
         groupId: (data.groups ?? []).map((group) => ({ id: group.id, name: group.name })),
         institutionId: (data.institutions ?? []).map((institution) => ({
           id: institution.id,
-          name: institution.shortName?.trim() || institution.name,
+          name: institutionFullName(institution),
           type: institution.type ?? "",
         })),
         counterpartyId: (data.counterparties ?? []).map((counterparty) => ({
@@ -1214,7 +1236,7 @@ export function TransactionFormModal({
   // 窗口底按钮行：在 FT 卡片**外面**（卡片按内容高度收在备注下面），由 `FolderTabsCard` 贴窗口底边。
   const entryFooter = (
     <>
-      {!editEntryId ? (
+      {!editEntryId && !conversionEntry ? (
         <button
           type="button"
           className="secondary-button h-9 px-3 border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100"
@@ -1528,6 +1550,8 @@ export function TransactionFormModal({
     setCategoryId("");
     setEditCategoryFallback(null);
     setFixedAssetLinked(false);
+    setPayFromLinkedFund(false);
+    setAutoBuyLinkedFund(false);
     setFixedAssetAccountId("");
     setFixedAssetAssetId("");
     setFixedAssetLinkLocked(false);
@@ -1546,6 +1570,7 @@ export function TransactionFormModal({
     setSelectedTagIds([]);
     setPendingAttachmentFiles([]);
     setRequestId(null);
+    setConversionEntry(false);
     setEditEntryId(null);
     setEditEntryOriginalType(null);
     setEditEntryHasFundDetail(false);
@@ -1557,6 +1582,32 @@ export function TransactionFormModal({
     setOpen(false);
     resetDraft();
   });
+
+  /**
+   * 编辑窗标题栏的「转换」：与明细表头那颗按钮同一个组件（`EntryConvertMenu`）。
+   * 源记录用**原类型** + 表单当前值（含尚未保存的日期/金额/备注），
+   * 转换结果与从表头转换完全一致：目标窗保存成功后由明细页的 Watcher 删掉原记录。
+   */
+  const convertSourceEntry = useMemo<ConvertSourceEntry | null>(() => {
+    if (!open || !editEntryId) return null;
+    const originalType = editEntryOriginalType ?? txType;
+    const isTransferLike = originalType === "transfer";
+    const signedAmount = Number(amount) || 0;
+    return {
+      id: editEntryId,
+      type: originalType,
+      date,
+      amount: signedAmount,
+      bookAmount: signedAmount,
+      note,
+      accountId: isTransferLike ? fromAccountId : accountId,
+      toAccountId: isTransferLike ? toAccountId : "",
+      cashAccountId: isTransferLike ? fromAccountId : accountId,
+      // 转账记录的方向取决于这一行属于哪个账户（行账户 = 流入侧 → 这笔是收款），
+      // 转换菜单据此决定列「赎回」还是「买入」。取原记录的行账户，不受窗口里改账户影响。
+      rowAccountId: isTransferLike ? String(editOriginalRef.current?.accountId ?? "") : "",
+    };
+  }, [open, editEntryId, editEntryOriginalType, txType, amount, date, note, accountId, fromAccountId, toAccountId]);
 
   /**
    * 保存并再记一笔：记账类型、账户、分类、日期、备注、标签保留（同一天连记多笔是常态，日期不动）；
@@ -1573,6 +1624,7 @@ export function TransactionFormModal({
     setInstallmentAmountEdited(false);
     setPendingAttachmentFiles([]);
     setRequestId(null);
+    setConversionEntry(false);
     setEditEntryId(null);
     setEditEntryOriginalType(null);
     setEditEntryHasFundDetail(false);
@@ -1634,12 +1686,14 @@ export function TransactionFormModal({
       setTxCurrency("");
       setLocalAmount("");
       setFixedAssetLinked(false);
+      setPayFromLinkedFund(false);
       setFixedAssetAccountId("");
       setFixedAssetAssetId("");
       setFixedAssetLinkLocked(false);
       setFixedAssetAccountNestedOpen(false);
       setFixedAssetAccountAutoOpen(false);
     }
+    if (nextType !== "income" && nextType !== "transfer") setAutoBuyLinkedFund(false);
   }
 
   function handleCategoryChange(nextCategoryId: string) {
@@ -1661,17 +1715,20 @@ export function TransactionFormModal({
       const mappedType: TxType =
         item.type === "income"
           ? "income"
-          : item.type === "transfer"
-            ? "transfer"
-            : item.type === "fx"
-              ? "fx"
-            : item.type === "investment"
-              ? "investment"
-              : "expense";
+          : item.type === "advance"
+            ? "advance"
+            : item.type === "transfer"
+              ? "transfer"
+              : item.type === "fx"
+                ? "fx"
+              : item.type === "investment"
+                ? "investment"
+                : "expense";
       const effectiveType = detail.lockedType ?? mappedType;
       const effectiveFxDirection: FxDirection = detail.fxDirection === "sell" ? "sell" : "buy";
 
       setRequestId(detail.requestId);
+      setConversionEntry(isEntryConversionRequest(detail.requestId));
       setOpen(true);
       setLockedType(detail.lockedType ?? null);
       setStockTransferMode(detail.stockTransferMode === true);
@@ -1746,7 +1803,7 @@ export function TransactionFormModal({
         setCategoryId("");
         setAccountId("");
       } else {
-        setAccountId(findAccountIdByLabel(item.account, accounts) || (defaultAccountId ?? ""));
+        setAccountId(findAccountIdByLabel(item.account, accounts) || detail.defaultAccountId || (defaultAccountId ?? ""));
 
         const rawCat = (item.category ?? "").trim();
         const withTypePrefix = rawCat ? `支出.${rawCat}` : "";
@@ -1758,7 +1815,7 @@ export function TransactionFormModal({
             || findCategoryIdByLabel(rawCat, expenseCategories);
         setCategoryId(nextCatId);
 
-        setFromAccountId(defaultAccountId ?? "");
+        setFromAccountId(detail.defaultAccountId || (defaultAccountId ?? ""));
         setToAccountId("");
       }
     }
@@ -1833,6 +1890,12 @@ export function TransactionFormModal({
         originalAmount?: number | null;
       }>).detail;
       if (!detail?.requestId || !detail.entryId) return;
+      // 编辑既有记录永远不是「从某账户锁定类型」的入口：上一次新建留下的 lockedType /
+      // 股票转出模式必须清掉，否则编辑窗顶部会只剩一个灰页签，收支代转就没法切了
+      // （而切页签正是这四类之间唯一的转换方式，2026-11-17）。
+      setLockedType(null);
+      setStockTransferMode(false);
+      setStockCashAccountId("");
       setRequestId(detail.requestId);
       setEditEntryId(detail.entryId);
       setEditEntryOriginalType(detail.type);
@@ -2365,6 +2428,7 @@ export function TransactionFormModal({
         formData.set("fromAccountId", fromAccountId);
         // 外币转账可能刚自动建了币种子账户，落账要用子账户 id。
         formData.set("toAccountId", transferToAccountId);
+        formData.set("autoBuyLinkedFund", autoBuyLinkedFund ? "true" : "false");
         if (showDepositLotSelect) formData.set("depositSourceEntryId", depositLotId);
         } else if (txType === "income") {
           formData.set("accountId", accountId);
@@ -2408,6 +2472,11 @@ export function TransactionFormModal({
             formData.set("fixedAssetAccountId", fixedAssetAccountId);
             if (fixedAssetAssetId) formData.set("fixedAssetAssetId", fixedAssetAssetId);
           }
+          if (txType === "expense") {
+            formData.set("payFromLinkedFund", payFromLinkedFund ? "true" : "false");
+          } else if (txType === "income") {
+            formData.set("autoBuyLinkedFund", autoBuyLinkedFund ? "true" : "false");
+          }
           formData.set("locationId", locationId);
       }
       formData.set("tagIds", JSON.stringify(selectedTagIds));
@@ -2419,6 +2488,9 @@ export function TransactionFormModal({
         formData.set("installmentRate", installmentRate);
       }
     }
+    // 「最近使用」按这次保存用到的分类记：编辑旧记录时入账日期不会前移，只靠服务端
+    // 按 TxRecord.date 的聚合永远进不了第一排，所以保存成功后本地再记一份。
+    const savedCategoryId = String(formData.get("categoryId") ?? "").trim();
     setSubmitting(true);
     try {
       const res = editEntryId ? await (editAction ?? action)(formData) : await action(formData);
@@ -2442,6 +2514,8 @@ export function TransactionFormModal({
           new CustomEvent(editEntryId ? "mmh:transaction:edit:success" : "mmh:create-transaction:success", { detail: { requestId } }),
         );
       }
+      recordRecentCategory(savedCategoryId);
+      invalidateCategoryUsage();
       requestAnimationFrame(() => {
         const refreshDetail = currentFinanceRefreshDetail();
         recordRecentAccounts(refreshDetail.accountIds ?? []);
@@ -2501,6 +2575,18 @@ export function TransactionFormModal({
           title={txType === "fx"
             ? (fxDirection === "sell" ? t("txForm.fxSellTitle") : t("txForm.fxBuyTitle"))
             : editEntryId ? t("txForm.editEntry") : t("txForm.addEntry")}
+          headerExtra={convertSourceEntry ? (
+            <EntryConvertMenu
+              entry={convertSourceEntry}
+              cashAccountId={convertSourceEntry.cashAccountId}
+              onBeforeConvert={() => {
+                // 转换要先让出窗口：目标窗与编辑窗共用同一份表单状态，
+                // 与「切换到投资/理财等录入窗」的既有做法一致（先关窗清草稿，再派发）。
+                setOpen(false);
+                resetDraft();
+              }}
+            />
+          ) : undefined}
           onClose={() => {
             setOpen(false);
             resetDraft();
@@ -2895,6 +2981,22 @@ export function TransactionFormModal({
                         }
                       }} placeholder={txType === "expense" ? t("txForm.amountPlaceholderExpense") : t("txForm.amountPlaceholderIncome")} label={t("txForm.amount")} precision={2} />
                     </div>
+                    {(() => {
+                      const target = accountMetaById.get(accountId);
+                      if (!target?.linkedFundAccountId) return null;
+                      const inflow = txType !== "expense";
+                      return (
+                        <label className="flex items-center gap-2 text-xs text-slate-600">
+                          <input
+                            type="checkbox"
+                            checked={inflow ? autoBuyLinkedFund : payFromLinkedFund}
+                            onChange={(e) => inflow ? setAutoBuyLinkedFund(e.target.checked) : setPayFromLinkedFund(e.target.checked)}
+                          />
+                          <span>{t(inflow ? "txForm.autoBuyLinkedFund" : "txForm.fromLinkedFund")}</span>
+                          {target.linkedFundCode ? <span className="text-slate-400">{target.linkedFundCode}</span> : null}
+                        </label>
+                      );
+                    })()}
                     {showPostedAmount ? (
                       <>
                         <div className="min-w-0 space-y-1">
@@ -3341,6 +3443,17 @@ export function TransactionFormModal({
                     <div className="form-label">{t("txForm.amount")}</div>
                     <CalcInput ref={amountInputRef} value={amount} onChange={setAmount} placeholder={t("txForm.amountExample")} label={t("txForm.amount")} precision={2} />
                   </div>
+                  {(() => {
+                    const target = accountMetaById.get(toAccountId);
+                    if (!target?.linkedFundAccountId) return null;
+                    return (
+                      <label className="flex items-center gap-2 text-xs text-slate-600">
+                        <input type="checkbox" checked={autoBuyLinkedFund} onChange={(e) => setAutoBuyLinkedFund(e.target.checked)} />
+                        <span>{t("txForm.autoBuyLinkedFund")}</span>
+                        {target.linkedFundCode ? <span className="text-slate-400">{target.linkedFundCode}</span> : null}
+                      </label>
+                    );
+                  })()}
 
                   {/* Row 5: note + attachment */}
                   <div className="space-y-1">
@@ -3563,7 +3676,7 @@ export function TransactionFormModal({
         title={t("txForm.addInstitution")}
         nameLabel={t("txForm.institutionName")}
         namePlaceholder={t("txForm.institutionNamePlaceholder")}
-        allowedInstitutionTypes={["bank", "payment"]}
+        allowedInstitutionTypes={[...INCOME_EXPENSE_INSTITUTION_TYPES]}
         existingNames={incomeExpenseInstitutionOptions.map((item) => item.name)}
         onCreated={(id, name, extra) => {
           const next = { id, name, type: extra?.type ?? "payment" };

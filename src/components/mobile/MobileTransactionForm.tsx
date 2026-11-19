@@ -13,12 +13,18 @@ import { CalcInput } from "@/components/CalcInput";
 import { DateStepper } from "@/components/DateStepper";
 import { EntryAttachmentButton, uploadEntryAttachmentFiles } from "@/components/EntryAttachmentPanel";
 import { buildCategoryTreeOptions } from "@/components/categorySmartSelect";
-import { buildCategoryQuickPickGroups, useCategoryUsage } from "@/lib/client/category-usage";
+import {
+  buildCategoryQuickPickGroups,
+  invalidateCategoryUsage,
+  recordRecentCategory,
+  useCategoryUsage,
+} from "@/lib/client/category-usage";
 import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
 import { recordRecentAccounts } from "@/lib/client/recentAccounts";
 import { REQUIRED_FIELD_CLASS } from "@/lib/client/required-field";
 import { useI18n } from "@/lib/i18n";
 import { readAccountDisplaySettings } from "@/lib/client/account-display-settings";
+import { getAccountDropdownGroupByPreference } from "@/lib/client/appPreferences";
 import { todayDateLocalYmd } from "@/lib/date-utils";
 import { formatAmountDraft } from "@/lib/format";
 
@@ -73,6 +79,8 @@ export function MobileTransactionForm({ accounts, categories, defaultAccountId =
       accounts
         .filter((account) => isIncomeExpensePostingOrDepositAccount(account))
         .map((account) => buildAccountDisplayOption(account, undefined, readAccountDisplaySettings())),
+      // 分组维度跟随「设置 → 显示 → 账户下拉分组」，默认按所有人。
+      getAccountDropdownGroupByPreference(),
     ),
     [accounts],
   );
@@ -82,6 +90,7 @@ export function MobileTransactionForm({ accounts, categories, defaultAccountId =
           accounts
             .filter((account) => isTransferDropdownAccount(account))
             .map((account) => buildAccountDisplayOption(account, undefined, readAccountDisplaySettings())),
+          getAccountDropdownGroupByPreference(),
         )
       : postingAccountOptions),
     [accounts, draft.type, postingAccountOptions],
@@ -281,6 +290,8 @@ export function MobileTransactionForm({ accounts, categories, defaultAccountId =
       setOpen(false);
       const savedAccountIds = [draft.accountId, draft.toAccountId].filter((id): id is string => Boolean(id));
       recordRecentAccounts(savedAccountIds);
+      recordRecentCategory(body.categoryId);
+      invalidateCategoryUsage();
       dispatchFinanceDataChanged({
         reason: "mobile-transaction-save",
         accountIds: savedAccountIds,

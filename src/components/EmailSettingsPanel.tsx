@@ -21,9 +21,7 @@ import {
   importPreviewFlowAmountTextFor,
 } from "@/lib/client/colors";
 import { createImportTraceId, postImportDebugLog } from "@/lib/client/importDebugLog";
-import { showChoiceDialog } from "@/lib/client/confirm-dialog";
 import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
-import { guardStatementDuplicateImport } from "@/lib/client/statement-import-duplicates";
 import {
   fetchEmailAccounts,
   fetchEmailImportKeyword,
@@ -33,6 +31,7 @@ import {
   setEmailImportKeyword,
 } from "@/lib/client/settingsCache";
 import { DEFAULT_EMAIL_IMPORT_KEYWORD, normalizeEmailImportKeyword } from "@/lib/mail/email-import-settings";
+import { buildStatementMailContent } from "@/lib/mail/statement-content";
 import { inferKnownStatementMerchant } from "@/lib/statement/merchant-inference";
 import {
   formatStatementMoneyAmount as formatMoneyAmount,
@@ -42,6 +41,7 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { formatAmountDraft } from "@/lib/format";
 import { readAccountDisplaySettings } from "@/lib/client/account-display-settings";
+import { getAccountDropdownGroupByPreference } from "@/lib/client/appPreferences";
 
 type I18nT = (key: string, params?: Record<string, string | number>) => string;
 
@@ -360,6 +360,11 @@ export function EmailSettingsPanel({
   const [imapSecure, setImapSecure] = useState(true);
   const [password, setPassword] = useState("");
   const [mailbox, setMailbox] = useState("INBOX");
+  // 邮箱里到底有哪些文件夹，只有连上去才知道：把列表拉下来让用户点选，避免裸填文件夹名。
+  const [mailboxOptions, setMailboxOptions] = useState<string[]>([]);
+  const [loadingMailboxOptions, setLoadingMailboxOptions] = useState(false);
+  const [mailboxPickerOpen, setMailboxPickerOpen] = useState(false);
+  const [mailboxPickerNote, setMailboxPickerNote] = useState("");
   const [smtpHost, setSmtpHost] = useState("");
   const [smtpPort, setSmtpPort] = useState("465");
   const [smtpSecure, setSmtpSecure] = useState(true);
@@ -489,6 +494,7 @@ export function EmailSettingsPanel({
   function resetForm() {
     setEditingId(null); setProviderKey(""); setLabel(""); setUsername(""); setImapHost(""); setImapPort("993");
     setImapSecure(true); setPassword(""); setMailbox("INBOX");
+    setMailboxOptions([]); setMailboxPickerOpen(false); setMailboxPickerNote("");
     setSmtpHost(""); setSmtpPort("465"); setSmtpSecure(true); setSmtpFrom("");
     setTestResult("");
     setAccountTested(false);
@@ -531,6 +537,9 @@ export function EmailSettingsPanel({
     setImapSecure(account.imapSecure);
     setPassword("");
     setMailbox(account.mailbox || "INBOX");
+    setMailboxOptions([]);
+    setMailboxPickerOpen(false);
+    setMailboxPickerNote("");
     setSmtpHost(account.smtpHost ?? "");
     setSmtpPort(String(account.smtpPort ?? 465));
     setSmtpSecure(account.smtpPort == null ? true : account.smtpPort === 465);
@@ -618,6 +627,52 @@ export function EmailSettingsPanel({
       setAccountTested(true);
     } catch (e) { setError(e instanceof Error ? e.message : t("settings.passwordRecovery.networkError")); }
     finally { setTesting(false); }
+  }
+
+  /**
+   * 列出邮箱里真实存在的文件夹。
+   *
+   * 这个输入框以前只能靠用户自己记住 IMAP 文件夹名（INBOX / 收件箱 / 账单 …），
+   * 填错只会得到「文件夹打开失败」。这里直接把服务器的文件夹列表拉下来点选。
+   */
+  async function toggleMailboxPicker() {
+    if (mailboxPickerOpen) {
+      setMailboxPickerOpen(false);
+      return;
+    }
+    setMailboxPickerOpen(true);
+    setMailboxPickerNote("");
+    if (!imapHost.trim() || !username.trim()) {
+      setMailboxOptions([]);
+      setMailboxPickerNote(t("settings.email.mailboxNeedConfig"));
+      return;
+    }
+    setLoadingMailboxOptions(true);
+    try {
+      const res = await fetch("/api/v1/email/imap/mailboxes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountId: editingId ?? undefined,
+          host: imapHost.trim(),
+          port: Number(imapPort) || 993,
+          secure: imapSecure,
+          user: username.trim(),
+          password: password.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error ?? t("settings.email.mailboxEmpty"));
+      const raw = Array.isArray(data.mailboxes) ? (data.mailboxes as unknown[]) : [];
+      const list = Array.from(new Set(raw.filter((item): item is string => typeof item === "string" && item.trim().length > 0)));
+      setMailboxOptions(list);
+      if (!list.length) setMailboxPickerNote(t("settings.email.mailboxEmpty"));
+    } catch (e) {
+      setMailboxOptions([]);
+      setMailboxPickerNote(e instanceof Error ? e.message : t("settings.email.mailboxEmpty"));
+    } finally {
+      setLoadingMailboxOptions(false);
+    }
   }
 
   async function saveMailKeyword() {
@@ -760,13 +815,9 @@ export function EmailSettingsPanel({
   }
 
   function buildStatementParseContent(mail: MailDetail | null, fallbackContent = "") {
-    const attachmentText = mail?.attachments
-      ?.filter((attachment) => attachment.text?.trim())
-      .map((attachment) => `\u3010\u9644\u4ef6\uff1a${attachment.filename || "\u672a\u547d\u540d PDF"}\u3011\n${attachment.text!.trim()}`)
-      .join("\n\n");
-    return [mail?.html?.trim() || fallbackContent.trim(), attachmentText]
-      .filter((part) => part && part.trim())
-      .join("\n\n");
+    // 附件文字优先且独占：把邮件 HTML 一起塞进去会让识别器改走 HTML 分支，
+    // 认不出表头就整段放弃，最后只剩一条 amount=0 的兜底记录。
+    return buildStatementMailContent(mail) || fallbackContent.trim();
   }
 
   async function fetchMail(uid: number, autoParse = false) {
@@ -912,12 +963,7 @@ export function EmailSettingsPanel({
           })
       : parsedItems;
     if (!sourceItems.length) return;
-    // 同一份账单重复导入（同日期、同笔数、同金额）先问是否覆盖，再走落账。
-    const duplicateChoice = await guardStatementDuplicateImport(
-      sourceItems as unknown as Array<Record<string, unknown>>,
-      t,
-    );
-    if (duplicateChoice === "cancel") return;
+    // 重复交易检测统一在预览弹窗确认时做（StatementImportPreviewDialog.confirmSelected）。
     const selectedAccountIds = confirmedItems?.length
       ? Array.from(new Set(confirmedItems.flatMap((item) => [
           parseImportAccountId(item.account),
@@ -950,43 +996,11 @@ export function EmailSettingsPanel({
       selectedCount: sourceItems.length,
     });
     try {
-      let conflictPolicy: "overwrite" | "keep" | undefined;
-      let res: Response | null = null;
-      let data: any = null;
-      // The import API pre-checks manual records in the same statement period.
-      // On MANUAL_RECORD_CONFLICT, ask the user to overwrite or keep; cancel aborts.
-      for (;;) {
-        res = await fetch("/api/v1/statement/import", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ items: sourceItems, autoCreateAccounts: false, mailSource, manualRecordConflictPolicy: conflictPolicy }),
-        });
-        data = await res.json();
-        if (data.ok || data.code !== "MANUAL_RECORD_CONFLICT") break;
-        postImportDebugLog(traceId, "email_import_manual_conflict", {
-          ...mailDebugDetails(selectedMail, selectedId),
-          conflictCount: Number(data.conflict?.total ?? 0),
-        });
-        const conflictCount = Number(data.conflict?.total ?? 0);
-        setImporting(false);
-        const choice = await showChoiceDialog<"overwrite" | "keep">({
-          title: t("settings.email.manualConflictTitle"),
-          message: t("settings.email.manualConflictMessage", { count: conflictCount }),
-          choices: [
-            { value: "keep", label: t("settings.email.manualConflictKeep") },
-            { value: "overwrite", label: t("settings.email.manualConflictOverwrite"), tone: "danger" },
-          ],
-          cancelLabel: t("common.cancel"),
-        });
-        if (!choice) {
-          postImportDebugLog(traceId, "email_import_cancelled", {
-            ...mailDebugDetails(selectedMail, selectedId),
-            reason: "manual_record_conflict_cancelled",
-          });
-          return;
-        }
-        conflictPolicy = choice;
-        setImporting(true);
-      }
+      const res = await fetch("/api/v1/statement/import", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: sourceItems, autoCreateAccounts: false, mailSource }),
+      });
+      const data: any = await res.json();
       if (data.ok) {
         const lockedAccountIds = Array.isArray(data.lockedStatementBills)
           ? data.lockedStatementBills.flatMap((item: any) => Array.isArray(item.billAccountIds) ? item.billAccountIds : [item.accountId]).filter(Boolean)
@@ -994,19 +1008,15 @@ export function EmailSettingsPanel({
         const refreshAccountIds = Array.from(new Set([...(targetAccountId ? [targetAccountId] : []), ...lockedAccountIds]));
         const createdCount = data.createdCount ?? 0;
         const skippedCount = data.skippedCount ?? 0;
-        const deletedManualCount = Number(data.deletedManualRecordCount ?? 0);
         postImportDebugLog(traceId, "email_import_succeeded", {
           ...mailDebugDetails(selectedMail, selectedId),
           selectedCount: sourceItems.length,
           createdCount,
           skippedCount,
-          deletedManualRecordCount: deletedManualCount,
           importBatchId: data.importBatchId ?? null,
           durationMs: Math.round(performance.now() - startedAt),
         });
-        setInfo(deletedManualCount > 0
-          ? t("settings.email.importCompleteWithOverwrite", { created: createdCount, skipped: skippedCount, deleted: deletedManualCount })
-          : t("settings.email.importCompleteInfo", { created: createdCount, skipped: skippedCount }));
+        setInfo(t("settings.email.importCompleteInfo", { created: createdCount, skipped: skippedCount }));
         if ((data.skippedCount ?? 0) > 0) {
           const firstError = Array.isArray(data.errors) ? data.errors[0]?.error : "";
           setError(firstError ? t("settings.email.skippedWithError", { count: data.skippedCount, error: firstError }) : t("settings.email.skippedCheck", { count: data.skippedCount }));
@@ -1055,6 +1065,13 @@ export function EmailSettingsPanel({
     setParsedItems([]);
     setImportPreview(null);
     setImportComplete(null);
+    // 导入已经落库、成功提示也要收起，整个「预览 + 导入」会话到此结束。
+    // 必须在这里通知外层（CreditBillMailImportDialog）：它靠 previewOpen 把窗口渲染成
+    // `opacity-0 + pointer-events-none` 的隐形遮罩（为了让预览窗口压在它上面）。
+    // 导入成功时 importItems 是直接 setImportPreview(null) 收掉预览的，走不到预览窗
+    // 自己的 onClose，于是外层永远停在隐形状态 —— 用户看到的现象就是：导入成功一单后，
+    // 再点「邮箱导入」什么窗口都不弹（其实窗口一直在，只是透明且点不到）。
+    onStatementPreviewClosed?.();
     dispatchFinanceDataChanged({ reason: "email-bill-import", accountIds: targetAccountId ? [targetAccountId] : undefined });
     if (targetAccountId) {
       const account = bookAccounts.find((item) => item.id === targetAccountId);
@@ -1510,7 +1527,7 @@ export function EmailSettingsPanel({
     () => {
       if (!hasImportPreview) return [];
       const displayById = new Map(previewDebitAccountDisplayOptions.map((account) => [account.id, account]));
-      return buildGroupedAccountOptions(previewDebitAccountDisplayOptions).map((option) => {
+      return buildGroupedAccountOptions(previewDebitAccountDisplayOptions, getAccountDropdownGroupByPreference()).map((option) => {
         if (option.isHeader) return option;
         const account = displayById.get(option.id);
         return {
@@ -2628,7 +2645,7 @@ export function EmailSettingsPanel({
                 {t("entityForm.accountTypeLabel")}
                 <select className="mt-1 h-9 w-full rounded-md border border-slate-200 bg-white px-3 text-sm outline-none" value={accountDraft.kind} onChange={(e) => setAccountDraft((current) => current ? { ...current, kind: e.target.value as AccountCreateDraft["kind"] } : current)}>
                   <option value="bank_credit">{t("account.kind.bank_credit")}</option>
-                  <option value="bank_debit">{t("account.kind.bank_savings")}</option>
+                  <option value="bank_debit">{t("account.kind.bank_debit")}</option>
                   <option value="ewallet">{t("account.kind.ewallet")}</option>
                   <option value="cash">{t("account.kind.cash")}</option>
                   <option value="other">{t("account.kind.other")}</option>
@@ -2688,7 +2705,6 @@ export function EmailSettingsPanel({
             </div>
 
             <div className="mt-4 flex items-center justify-end gap-2">
-              <button className="h-9 px-4 rounded-md border border-slate-300 text-sm hover:bg-slate-50" onClick={() => setAccountDraft(null)}>{t("common.cancel")}</button>
               <button className="h-9 px-4 rounded-md bg-blue-600 text-white text-sm hover:bg-blue-700 disabled:opacity-50" onClick={createAccountFromDraft} disabled={savingAccountDraft || !accountDraft.name.trim()}>
                 {savingAccountDraft ? t("settings.email.creating") : t("settings.email.createAndUse")}
               </button>
@@ -2724,8 +2740,32 @@ export function EmailSettingsPanel({
                 </label>
               </div>
               <input className="h-9 rounded-md border border-slate-200 bg-white px-3 text-sm outline-none" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={editingId ? t("settings.email.passwordPlaceholderEdit") : t("settings.email.passwordPlaceholder")} type="password" autoComplete="new-password" />
-              <input className="h-9 rounded-md border border-slate-200 bg-white px-3 text-sm outline-none" value={mailbox} onChange={(e) => setMailbox(e.target.value)} placeholder={t("settings.email.mailboxPlaceholder")} />
+              <div className="relative">
+                <div className="flex gap-2">
+                  <input className="h-9 min-w-0 flex-1 rounded-md border border-slate-200 bg-white px-3 text-sm outline-none" value={mailbox} onChange={(e) => setMailbox(e.target.value)} placeholder={t("settings.email.mailboxPlaceholder")} />
+                  <button type="button" className="h-9 shrink-0 rounded-md border border-slate-300 px-3 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50" onClick={toggleMailboxPicker} disabled={loadingMailboxOptions}>
+                    {loadingMailboxOptions ? t("settings.email.mailboxLoading") : t("settings.email.mailboxPick")}
+                  </button>
+                </div>
+                {mailboxPickerOpen && (
+                  <div className="absolute left-0 top-full z-30 mt-1 max-h-56 w-full overflow-auto rounded-md border border-slate-200 bg-white p-1 shadow-lg">
+                    {mailboxPickerNote && <div className="px-2 py-1 text-xs leading-5 text-amber-600">{mailboxPickerNote}</div>}
+                    {["INBOX", ...mailboxOptions.filter((box) => box.toUpperCase() !== "INBOX")].map((box) => (
+                      <button
+                        key={box}
+                        type="button"
+                        title={box}
+                        className={`block w-full truncate rounded px-2 py-1 text-left text-sm ${box === mailbox ? "bg-blue-50 text-blue-700" : "text-slate-700 hover:bg-slate-100"}`}
+                        onClick={() => { setMailbox(box); setMailboxPickerOpen(false); }}
+                      >
+                        {box}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
+            <div className="mt-2 text-xs leading-5 text-slate-500">{t("settings.email.mailboxHint")}</div>
 
             <div className="mt-3 pt-3 border-t border-slate-100">
               <div className="text-xs font-medium text-slate-500 mb-2">{t("settings.email.smtpSection")}</div>
@@ -2740,7 +2780,6 @@ export function EmailSettingsPanel({
             </div>
 
             <div className="mt-4 flex items-center justify-end gap-2">
-              <button className="h-9 px-4 rounded-md border border-slate-300 text-sm hover:bg-slate-50" onClick={closeAccountModal}>{t("common.cancel")}</button>
               <button className="h-9 px-4 rounded-md border border-slate-300 text-sm hover:bg-slate-50 disabled:opacity-50" onClick={testConnection} disabled={testing}>{testing ? t("settings.email.testing") : t("settings.email.testConnection")}</button>
               <button className="h-9 px-4 rounded-md bg-blue-600 text-white text-sm hover:bg-blue-700 disabled:opacity-50" onClick={saveAccount} disabled={saving}>{saving ? t("settings.email.saving") : editingId ? t("settings.email.saveChanges") : t("common.save")}</button>
             </div>

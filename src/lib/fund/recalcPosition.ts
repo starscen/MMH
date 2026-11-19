@@ -5,6 +5,7 @@ import { FundCashFlowKind, FundSubtype, type Prisma } from "@prisma/client";
 import { toNumber } from "@/lib/date-utils";
 import { allocateBuyFailedRefunds, getEffectiveBuyUnits } from "@/lib/fund/refund-link";
 import { normalizeFundUnitsDecimals, roundFundUnits } from "@/lib/fund/unit-precision";
+import { MONEY_FUND_NAV } from "@/lib/fund/moneyFund";
 import { isFundUnitsReconcileEntry } from "@/lib/transaction-semantics";
 
 function toNum(v: unknown): number {
@@ -123,7 +124,9 @@ function calcByMovingAvg(entries: FundPositionEntryLike[], fundUnitsDecimals: nu
     if (subtype === "buy") {
       const costBasis = buyEntryCostBasis(e, amount);
       const u = e.units ?? 0;
-      if (u === 0) rec.pendingCost += pendingBuyAmount(e, amount);
+      // 负收益结转（货基某日万份收益为负）：只减份额、不动成本，不能当买入去加成本。
+      if (u < 0) rec.units = roundFundUnits(rec.units + u, fundUnitsDecimals);
+      else if (u === 0) rec.pendingCost += pendingBuyAmount(e, amount);
       else { rec.cost += costBasis; rec.units = roundFundUnits(rec.units + u, fundUnitsDecimals); }
     } else if (subtype === "dividend_cash") {
       rec.historicalProfit += e.realizedProfit != null ? toNum(e.realizedProfit) : Math.abs(amount);
@@ -203,7 +206,18 @@ function calcByFifo(entries: FundPositionEntryLike[], fundUnitsDecimals: number,
     if (subtype === "buy") {
       const costBasis = buyEntryCostBasis(e, amount);
       const u = e.units ?? 0;
-      if (u === 0) { rec.pendingCost += pendingBuyAmount(e, amount); }
+      if (u < 0) {
+        // 负收益结转：按先进先出扣减批次数量，成本不动（否则会出现成本单价为负的批次）。
+        let remaining = -u;
+        for (const lot of codeLots) {
+          if (remaining <= 0) break;
+          const take = Math.min(lot.units, remaining);
+          lot.units = Math.max(0, roundFundUnits(lot.units - take, fundUnitsDecimals));
+          remaining -= take;
+        }
+        lots.set(code, codeLots.filter((lot) => lot.units > 0));
+        rec.units = roundFundUnits(rec.units + u, fundUnitsDecimals);
+      } else if (u === 0) { rec.pendingCost += pendingBuyAmount(e, amount); }
       else { codeLots.push({ units: u, costPerUnit: costBasis / u }); rec.units = roundFundUnits(rec.units + u, fundUnitsDecimals); rec.cost += costBasis; }
     } else if (subtype === "dividend_cash") {
       rec.historicalProfit += e.realizedProfit != null ? toNum(e.realizedProfit) : Math.abs(amount);
@@ -420,6 +434,10 @@ export async function recalcFundPositions(
     if (code && name && name !== code && !entryNameMap.has(code)) entryNameMap.set(code, name);
   }
 
+  // 货基按面值 1 元/份核算：净值缓存里该代码下的数字是「每万份收益」，不能写进持仓，
+  // 否则下游用 units × nav 估值会把货基市值算成份额的十分之一。
+  const isMoneyFundAccount = account.investProductType === "money";
+
   for (const code of codesToCalc) {
     const rec = symbolMap.get(code);
     if (!rec) { await client.fundHolding.deleteMany({ where: { accountId, fundCode: code } }); continue; }
@@ -433,7 +451,7 @@ export async function recalcFundPositions(
     });
     const navFromCache = navCacheMap.get(code);
     const navFromHolding = latestNavFromHolding?.nav != null ? toNum(latestNavFromHolding.nav) : null;
-    const navToUse = navFromCache ?? navFromHolding;
+    const navToUse = isMoneyFundAccount ? MONEY_FUND_NAV : navFromCache ?? navFromHolding;
 
     const existing = await client.fundHolding.findUnique({
       where: { accountId_fundCode: { accountId, fundCode: code } },

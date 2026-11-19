@@ -44,6 +44,7 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { parseStatementCsv } from "@/lib/statement/statement-sheet-reader";
 import { readAccountDisplaySettings } from "@/lib/client/account-display-settings";
+import { getAccountDropdownGroupByPreference } from "@/lib/client/appPreferences";
 import { restrictAccountsByType } from "@/lib/client/account-dropdown-filter";
 
 export type FundImportDialogContext = {
@@ -783,8 +784,8 @@ export function FundImportPreviewDialog({ open, file, context, tabs = null, sour
   );
   const cashAccountDisplayById = useMemo(() => new Map(cashAccountDisplayOptions.map((account) => [account.id, account])), [cashAccountDisplayOptions]);
   const fundAccountDisplayById = useMemo(() => new Map(fundAccountDisplayOptions.map((account) => [account.id, account])), [fundAccountDisplayOptions]);
-  const cashAccountOptions = useMemo(() => buildGroupedAccountOptions(cashAccountDisplayOptions), [cashAccountDisplayOptions]);
-  const fundAccountOptions = useMemo(() => buildGroupedAccountOptions(fundAccountDisplayOptions), [fundAccountDisplayOptions]);
+  const cashAccountOptions = useMemo(() => buildGroupedAccountOptions(cashAccountDisplayOptions, getAccountDropdownGroupByPreference()), [cashAccountDisplayOptions]);
+  const fundAccountOptions = useMemo(() => buildGroupedAccountOptions(fundAccountDisplayOptions, getAccountDropdownGroupByPreference()), [fundAccountDisplayOptions]);
   const selectedKeys = useMemo(() => new Set(Array.from(selected).map((idx) => String(idx))), [selected]);
   const importReadySelectedCount = useMemo(
     () => Array.from(selected).filter((idx) => previewItems[idx] && !hasBlockingIssue(previewItems[idx])).length,
@@ -1794,7 +1795,6 @@ export function FundImportPreviewDialog({ open, file, context, tabs = null, sour
           description={uploading ? t("batchImport.previewParsing") : formatText(t, "batchImport.previewFundHint", { count: previewItems.length })}
           onClose={onClose}
           closeDisabled={importing}
-          closeLabel={t("table.close")}
         />
         {/* FT 卡片：页签条是流内元素，卡片顶边由它撑出来，活动页签的 -mb-px
             正好压在卡片 1px 上边框上（几何同 FolderTabsCard，容器是固定高度所以用

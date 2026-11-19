@@ -1,9 +1,18 @@
+import { todayDateBusinessYmd } from "@/lib/date-utils";
 import {
   defaultStockCurrencyForMarket,
   inferStockExchangeFromCode,
   normalizeStockCode,
   normalizeStockMarket,
 } from "@/lib/stock/market";
+import {
+  parserCodeOf,
+  pickCloseOnOrBefore,
+  pickCloseRange,
+  shiftYmd,
+  toYmd,
+} from "@/lib/stock/quoteSource";
+import { fetchQuoteRows, getActiveStockQuoteApis } from "@/lib/stock/quoteSourceRepo";
 
 type StockIdentityResult = {
   market: string;
@@ -354,6 +363,38 @@ async function queryEastmoneyCnCloseByDate(stockCode: string, dateRaw: unknown, 
   return queryEastmoneyCnClose(stockCode, exchange, normalizeEastmoneyKlineEndDate(dateRaw), "eastmoney-kline-date");
 }
 
+/**
+ * 港股 / 美股的名称查询：东财 push2 的 f57/f58 与 A 股同一套报文，
+ * 只是 secid 前缀不同（港股 116，美股 105/106/107 只能逐个试）。
+ */
+async function queryEastmoneyGlobalIdentity(market: string, stockCode: string): Promise<StockIdentityResult> {
+  const secids = market === "HK"
+    ? [`116.${stockCode}`]
+    : ["105", "106", "107"].map((prefix) => `${prefix}.${stockCode}`);
+
+  for (const secid of secids) {
+    try {
+      const data: any = await fetchJson(`https://push2.eastmoney.com/api/qt/stock/get?secid=${encodeURIComponent(secid)}&fields=f57,f58`)
+        ?? await fetchJson(`http://push2.eastmoney.com/api/qt/stock/get?secid=${encodeURIComponent(secid)}&fields=f57,f58`);
+      const item = data?.data;
+      if (normalizeStockCode(item?.f57) !== stockCode) continue;
+      const stockName = normalizeStockName(item?.f58);
+      if (!stockName) continue;
+      return {
+        market,
+        stockCode,
+        stockName,
+        currency: defaultStockCurrencyForMarket(market),
+        exchange: null,
+        source: "eastmoney-push2",
+      };
+    } catch {
+      // Try the next secid candidate.
+    }
+  }
+  return null;
+}
+
 export async function queryStockIdentity(marketRaw: unknown, stockCodeRaw: unknown): Promise<StockIdentityResult> {
   const market = normalizeStockMarket(marketRaw);
   const stockCode = normalizeStockCode(stockCodeRaw);
@@ -363,7 +404,7 @@ export async function queryStockIdentity(marketRaw: unknown, stockCodeRaw: unkno
     return queryEastmoneyCnIdentity(stockCode, inferStockExchangeFromCode(market, stockCode));
   }
 
-  return {
+  return (await queryEastmoneyGlobalIdentity(market, stockCode)) ?? {
     market,
     stockCode,
     stockName: stockCode,
@@ -373,17 +414,84 @@ export async function queryStockIdentity(marketRaw: unknown, stockCodeRaw: unkno
   };
 }
 
+/** 单日查询往前看的窗口：覆盖周末 + 长假，保证非交易日也能取到最近一个收盘价。 */
+const QUOTE_SINGLE_DAY_LOOKBACK_DAYS = 10;
+
+/** 按 priority 依次尝试用户配置的源，第一个给出有效收盘价的胜出。 */
+async function queryConfiguredClosePrice(
+  market: string,
+  stockCode: string,
+  exchange: string | null,
+  targetDate: string,
+): Promise<StockClosePriceResult> {
+  const apis = await getActiveStockQuoteApis(market);
+  const dateStart = shiftYmd(targetDate, -QUOTE_SINGLE_DAY_LOOKBACK_DAYS);
+  const currency = defaultStockCurrencyForMarket(market);
+
+  for (const api of apis) {
+    const result = await fetchQuoteRows(api, { stockCode, market, exchange, dateStart, date: targetDate });
+    if (!result.ok) continue;
+    const picked = pickCloseOnOrBefore(result.rows, targetDate);
+    if (!picked) continue;
+    return {
+      market,
+      stockCode,
+      closePrice: picked.closePrice,
+      priceDate: picked.priceDate,
+      currency,
+      exchange,
+      source: parserCodeOf(api),
+    };
+  }
+  return null;
+}
+
+async function queryConfiguredCloseRange(
+  market: string,
+  stockCode: string,
+  exchange: string | null,
+  startDate: string,
+  endDate: string,
+): Promise<StockClosePriceListResult> {
+  const apis = await getActiveStockQuoteApis(market);
+  const currency = defaultStockCurrencyForMarket(market);
+
+  for (const api of apis) {
+    const result = await fetchQuoteRows(api, {
+      stockCode,
+      market,
+      exchange,
+      dateStart: startDate,
+      date: endDate,
+    });
+    if (!result.ok) continue;
+    const items = pickCloseRange(result.rows, startDate, endDate);
+    if (items.length === 0) continue;
+    return {
+      market,
+      stockCode,
+      currency,
+      exchange,
+      source: parserCodeOf(api),
+      items,
+    };
+  }
+  return null;
+}
+
 export async function queryStockLatestClosePrice(marketRaw: unknown, stockCodeRaw: unknown, exchangeRaw?: unknown): Promise<StockClosePriceResult> {
   const market = normalizeStockMarket(marketRaw);
   const stockCode = normalizeStockCode(stockCodeRaw);
   const exchange = String(exchangeRaw ?? "").trim() || inferStockExchangeFromCode(market, stockCode);
   if (!stockCode) return null;
 
-  if (market === "CN") {
-    return queryEastmoneyCnLatestClose(stockCode, exchange);
-  }
-
-  return null;
+  // 配置源优先（内置的东财/腾讯源本身就在配置表里，market="*" 时三个市场共用）。
+  const today = todayDateBusinessYmd();
+  const configured = await queryConfiguredClosePrice(market, stockCode, exchange, today);
+  if (configured) return configured;
+  // A 股保留写死在代码里的兜底链路，防止配置表为空时升级后行为倒退；
+  // 港股/美股没有第二条内置链路，配置源即全部通道。
+  return market === "CN" ? queryEastmoneyCnLatestClose(stockCode, exchange) : null;
 }
 
 export async function queryStockClosePriceByDate(marketRaw: unknown, stockCodeRaw: unknown, dateRaw: unknown, exchangeRaw?: unknown): Promise<StockClosePriceResult> {
@@ -392,11 +500,12 @@ export async function queryStockClosePriceByDate(marketRaw: unknown, stockCodeRa
   const exchange = String(exchangeRaw ?? "").trim() || inferStockExchangeFromCode(market, stockCode);
   if (!stockCode) return null;
 
-  if (market === "CN") {
-    return queryEastmoneyCnCloseByDate(stockCode, dateRaw, exchange);
+  const targetDate = toYmd(dateRaw);
+  if (targetDate) {
+    const configured = await queryConfiguredClosePrice(market, stockCode, exchange, targetDate);
+    if (configured) return configured;
   }
-
-  return null;
+  return market === "CN" ? queryEastmoneyCnCloseByDate(stockCode, dateRaw, exchange) : null;
 }
 
 type StockClosePriceListResult = {
@@ -461,12 +570,16 @@ export async function queryStockClosePriceList(
   const exchange = String(exchangeRaw ?? "").trim() || inferStockExchangeFromCode(market, stockCode);
   if (!stockCode) return null;
 
-  if (market === "CN") {
-    const startDate = normalizeEastmoneyKlineEndDate(startDateRaw);
-    const endDate = normalizeEastmoneyKlineEndDate(endDateRaw);
-    return await queryEastmoneyCnCloseList(stockCode, exchange, startDate, endDate, "eastmoney-kline-list")
-      ?? await queryTencentCnCloseList(stockCode, exchange, startDate, endDate);
+  const startYmd = toYmd(startDateRaw);
+  const endYmd = toYmd(endDateRaw);
+  if (startYmd && endYmd) {
+    const configured = await queryConfiguredCloseRange(market, stockCode, exchange, startYmd, endYmd);
+    if (configured) return configured;
   }
+  if (market !== "CN") return null;
 
-  return null;
+  const startDate = normalizeEastmoneyKlineEndDate(startDateRaw);
+  const endDate = normalizeEastmoneyKlineEndDate(endDateRaw);
+  return await queryEastmoneyCnCloseList(stockCode, exchange, startDate, endDate, "eastmoney-kline-list")
+    ?? await queryTencentCnCloseList(stockCode, exchange, startDate, endDate);
 }

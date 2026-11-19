@@ -14,11 +14,13 @@ import { kindLabel } from "@/lib/account-kinds";
 import { recordRecentAccounts, sortByAccountUsage, useAccountUsage } from "@/lib/client/recentAccounts";
 import { useCloseOnNavigation } from "@/lib/client/useCloseOnNavigation";
 /** 记账弹窗整窗外壳：宽度/标题栏/表单/FT 页签卡片/固定页脚/高度锁定统一由它负责。 */
+import { EntryConvertHeaderAction } from "@/components/EntryConvertHeaderAction";
 import { EntryModalShell } from "@/components/EntryModalShell";
 import { dispatchFinanceDataChanged } from "@/lib/client/refresh";
+import { isEntryConversionRequest } from "@/lib/client/entry-conversion";
 import { useI18n } from "@/lib/i18n";
 import { APP_PREFS_EVENT, getSidebarHideInitialDataPreference } from "@/lib/client/appPreferences";
-import { Repeat } from "lucide-react";
+import { Repeat, X } from "lucide-react";
 import { depositTermMaturityUtc } from "@/lib/deposit-term";
 import { calculateDepositAccruedInterest, depositRenewalStartUtc } from "@/lib/deposit-maturity";
 import {
@@ -292,6 +294,8 @@ export function DepositFormModal({
   const [memo, setMemo] = useState(initMemo);
   const [submitting, setSubmitting] = useState(false);
   const [requestId, setRequestId] = useState<string | null>(null);
+  /** 本次新建来自「转换交易」：保存后要删原记录，因此不提供「保存并再记一笔」。 */
+  const [conversionEntry, setConversionEntry] = useState(false);
   const [editEntryId, setEditEntryId] = useState<string | null>(null);
   const [editingRedeemSource, setEditingRedeemSource] = useState<EditingRedeemSource | null>(null);
   // 续存来源存单：非空时本弹窗处于「续存建新存单」模式，提交走 renewAction。
@@ -1066,6 +1070,7 @@ export function DepositFormModal({
     setSelectedRedeemLotId("");
     setMemo("");
     setRequestId(null);
+    setConversionEntry(false);
     setEditEntryId(null);
     setEditingRedeemSource(null);
     setLockedSubtype(null);
@@ -1319,6 +1324,7 @@ export function DepositFormModal({
       const nextSubtype = isRenew ? "buy" : detail?.defaultSubtype === "redeem" ? "redeem" : "buy";
       setRequestId(detail?.requestId ?? null);
       reset();
+      setConversionEntry(isEntryConversionRequest(detail?.requestId));
       setSubtype(nextSubtype);
       setCashAccountId(detail?.defaultCashAccountId ?? "");
       setDate(detail?.defaultDate || today);
@@ -1616,6 +1622,8 @@ export function DepositFormModal({
       } else {
         const res = await createAction(fd);
         if (!res.ok) throw new Error(res.error ?? t("txForm.alert.saveFailed"));
+        // 「转换交易」靠 requestId 把这次新建和原记录串起来（见 lib/client/entry-conversion.ts）。
+        if (requestId) window.dispatchEvent(new CustomEvent("mmh:deposit:create:success", { detail: { requestId } }));
       }
 
       if (keepAdding && mode === "create") {
@@ -1727,7 +1735,26 @@ export function DepositFormModal({
           setOpen(false);
           if (mode === "create") reset();
         }}
-        closeLabel={t("investForm.close")}
+        headerExtra={(
+          <EntryConvertHeaderAction
+            source={mode === "edit" ? {
+              entryId: editEntryId,
+              type: "deposit",
+              date,
+              amount,
+              note: memo,
+              accountId: depositAccountId,
+              cashAccountId,
+              fundName,
+              // 取出是钱进来，存入是钱出去：转换菜单只列同向目标。
+              inflow: subtype === "redeem",
+            } : null}
+            onBeforeConvert={() => {
+              setOpen(false);
+              reset();
+            }}
+          />
+        )}
         onSubmit={onSubmit}
         tabs={[
           { id: "buy", label: t("deposit.subtype.buy"), disabled: !!lockedSubtype },
@@ -1741,7 +1768,7 @@ export function DepositFormModal({
         }}
         footer={(
           <>
-            {mode === "create" && !isRenew ? (
+            {mode === "create" && !isRenew && !conversionEntry ? (
               <button
                 type="button"
                 disabled={submitting}
@@ -1826,12 +1853,12 @@ export function DepositFormModal({
                     <div>
                       <div className="text-sm font-semibold text-slate-800">{t("depositForm.addProduct")}</div>
                     </div>
-                    <button
+                    <button title={t("table.close")} aria-label={t("table.close")}
                       type="button"
                       onClick={() => setProductModalOpen(false)}
-                      className="secondary-button h-8 px-2"
+                      className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
                     >
-                      {t("table.close")}
+                      <X className="h-4 w-4" />
                     </button>
                   </div>
                   <div className="space-y-3 p-3 sm:p-4">
@@ -1891,14 +1918,6 @@ export function DepositFormModal({
                       />
                     </div>
                     <div className="flex justify-end gap-2 pt-1">
-                      <button
-                        type="button"
-                        onClick={() => setProductModalOpen(false)}
-                        className="secondary-button h-9 px-4 text-sm"
-                        disabled={productSaving}
-                      >
-                        {t("common.cancel")}
-                      </button>
                       <button
                         type="button"
                         onClick={() => { void saveDepositProduct(); }}

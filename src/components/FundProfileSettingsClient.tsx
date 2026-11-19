@@ -33,6 +33,8 @@ type FundProfileSettingsClientProps = {
     id: string;
     name: string;
     institutionName: string | null;
+    /** money 时净值恒为 1，资料页改为维护每万份收益、隐藏净值偏移与费率。 */
+    investProductType?: string | null;
   };
   profile: FundProfileSettingsData;
   backHref?: string;
@@ -137,6 +139,7 @@ function planToEditData(plan: RelatedScheduledTask) {
 
 export function FundProfileSettingsClient({ account, profile, backHref, onClose, modal = false, fundCompanyOptions = [], onDirtyChange, confirmDayRows, feeRateRows, onProfileSaved, onConfirmDaysSaved, onFeeRatesSaved, preloadedPlans, investmentAccounts, cashAccounts, investmentAccountSSOptions, cashAccountSSOptions, onEditPlanOpenChange }: FundProfileSettingsClientProps) {
   const { t } = useI18n();
+  const isMoneyFund = account.investProductType === "money";
   const [form, setForm] = useState<ProfileForm>(() => toForm(profile));
   const [dirtyFields, setDirtyFields] = useState<Set<keyof ProfileForm>>(() => new Set());
   const [saving, setSaving] = useState(false);
@@ -326,6 +329,7 @@ export function FundProfileSettingsClient({ account, profile, backHref, onClose,
                 behavior={{ search: true, clearable: true, density: "compact" }}
               />
             </label>
+            {isMoneyFund ? null : (
             <label className="space-y-1">
               <span className="block text-xs font-medium text-slate-600">{t("fundSettings.navDateOffset")}</span>
               <select
@@ -337,6 +341,7 @@ export function FundProfileSettingsClient({ account, profile, backHref, onClose,
                 <option value={1}>{t("fundSettings.navDateOffsetPrevious")}</option>
               </select>
             </label>
+            )}
           </div>
           <div className="border-t border-slate-100 p-2.5 pt-2">
             <div className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-slate-700">
@@ -358,30 +363,36 @@ export function FundProfileSettingsClient({ account, profile, backHref, onClose,
           </div>
         </section>
 
+        {/* 货基的每万份收益是「统计口径」而不是资料字段：数据由后台自动拉取、收益结转也按它计算，
+            资料页不再展示这张表（费率表对货基同样无意义），只保留定投计划。 */}
         <section className={sectionClass}>
-          <div className={sectionHeaderClass}>
-            <div className="flex min-w-0 items-center gap-2">
-              <CircleDollarSign className="h-4 w-4 shrink-0 text-emerald-600" />
-              <h2 className="text-sm font-semibold text-slate-900">{t("fundSettings.institutionSection")}</h2>
-            </div>
-            <span className="rounded bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-              {account.institutionName || t("fundSettings.noInstitution")}
-            </span>
-          </div>
-          <div className="p-2.5">
-            <FundFeeRatePanel
-              accountId={account.id}
-              initialFundCode={profile.fundCode}
-              compact
-              preloadedRows={feeRateRows}
-              onSaved={(result) => {
-                onFeeRatesSaved?.(result);
-                dispatchFinanceDataChanged({ reason: "fund-fee-rate:save", accountIds: [account.id] });
-              }}
-              hideFundColumn
-            />
-          </div>
-          <div className="border-t border-slate-100 p-2.5 pt-2">
+          {isMoneyFund ? null : (
+            <>
+              <div className={sectionHeaderClass}>
+                <div className="flex min-w-0 items-center gap-2">
+                  <CircleDollarSign className="h-4 w-4 shrink-0 text-emerald-600" />
+                  <h2 className="text-sm font-semibold text-slate-900">{t("fundSettings.institutionSection")}</h2>
+                </div>
+                <span className="rounded bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                  {account.institutionName || t("fundSettings.noInstitution")}
+                </span>
+              </div>
+              <div className="p-2.5">
+                <FundFeeRatePanel
+                  accountId={account.id}
+                  initialFundCode={profile.fundCode}
+                  compact
+                  preloadedRows={feeRateRows}
+                  onSaved={(result) => {
+                    onFeeRatesSaved?.(result);
+                    dispatchFinanceDataChanged({ reason: "fund-fee-rate:save", accountIds: [account.id] });
+                  }}
+                  hideFundColumn
+                />
+              </div>
+            </>
+          )}
+          <div className={isMoneyFund ? "p-2.5" : "border-t border-slate-100 p-2.5 pt-2"}>
             <div className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-slate-700">
               <CalendarClock className="h-3.5 w-3.5 text-indigo-600" />
               {t("fundSettings.scheduledTaskSection")}
@@ -404,6 +415,7 @@ export function FundProfileSettingsClient({ account, profile, backHref, onClose,
           editData={planToEditData(editPlan)}
           accountId={editPlan.accountId || account.id || ""}
           investmentAccounts={investmentAccounts}
+          defaultInvestProductType={account.investProductType ?? null}
           cashAccounts={cashAccounts}
           investmentAccountSSOptions={investmentAccountSSOptions}
           cashAccountSSOptions={cashAccountSSOptions}

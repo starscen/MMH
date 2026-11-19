@@ -39,10 +39,47 @@ function sanitizeCalcInputValue(raw: string, allowAmountFieldReferences = false)
     : normalized.replace(/[^\d+\-*/().\s]/g, "");
 }
 
+/** `text` 是否整段被一对括号包住（允许内部再嵌套括号）。 */
+function isSingleParenthesizedGroup(text: string) {
+  if (!text.startsWith("(") || !text.endsWith(")")) return false;
+  let depth = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === "(") depth += 1;
+    else if (ch === ")") {
+      depth -= 1;
+      if (depth < 0) return false;
+      if (depth === 0 && i !== text.length - 1) return false;
+    }
+  }
+  return depth === 0;
+}
+
+/**
+ * 首字符是运算符的「相对简写」——在当前值上做一次运算，例如 `*2`、`/4`、
+ * `-20`、`+.01`、`-(30+5)`。
+ *
+ * **不能只看首字符**：用户把整笔算式写全时（原值 -3800.00，光标在末尾再敲
+ * `-20`，得到 `-3800.00-20`），首字符只是这个数字自己的负号。无脑拼当前值
+ * 会把原值算两遍（-3800 - 3800 - 20 = -7620），正是「计算框算出看不懂的数」。
+ */
+function isOperatorLedShorthand(raw: string) {
+  const lead = raw[0];
+  if (!/[+\-*/]/.test(lead)) return false;
+  // 完整表达式不可能以乘除开头，一定是简写。
+  if (lead === "*" || lead === "/") return true;
+  const rest = raw.slice(1);
+  if (!rest) return true;
+  // `-20` / `+.01`：运算符后面只有一个操作数。
+  if (/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(rest)) return true;
+  // `-(30+5)`：括号组整体作为一个操作数。
+  return isSingleParenthesizedGroup(rest) && /^[\d+\-*/().\s]+$/.test(rest);
+}
+
 export function evaluateCalcInputExpression(expression: string, currentValue = 0) {
   let full = sanitizeCalcInputValue(expression).trim();
   if (!full) return null;
-  if (/^[+\-*/]/.test(full)) full = `${Number(currentValue) || 0}${full}`;
+  if (isOperatorLedShorthand(full)) full = `${Number(currentValue) || 0}${full}`;
   if (!/^[\d+\-*/().\s]+$/.test(full)) return null;
   const computed = evaluateArithmeticExpression(full);
   return typeof computed === "number" && Number.isFinite(computed) ? computed : null;
@@ -69,6 +106,12 @@ type CalcInputProps = {
   label?: string;
   precision?: number;
   disabled?: boolean;
+  /**
+   * 只读汇总框：值由别的字段算出来，用户不能改，但仍要长得像计算框
+   * （同一套 form-input 边框 / 等宽数字），所以不走 `disabled`——禁用态无法选中复制数值。
+   * 只读时自动隐藏计算器按钮：算出来的结果写不回去，弹出来只会误导。
+   */
+  readOnly?: boolean;
   hideCalculator?: boolean;
   inputClassName?: string;
   ariaLabel?: string;
@@ -96,6 +139,7 @@ export const CalcInput = forwardRef<HTMLInputElement, CalcInputProps>(function C
   label,
   precision = 2,
   disabled = false,
+  readOnly = false,
   hideCalculator = false,
   inputClassName,
   ariaLabel,
@@ -109,6 +153,14 @@ export const CalcInput = forwardRef<HTMLInputElement, CalcInputProps>(function C
   const [open, setOpen] = useState(false);
   const [dialogPos, setDialogPos] = useState<{ top: number; left: number } | null>(null);
   const [expr, setExpr] = useState("");
+  /**
+   * 汇总框还没算出数值时，调用方会把「-」当值传进来占位。用户点进来是要填数，
+   * 这个「-」不能变成值得删半天的字符（跟着输入还会变成「-5」这种负数）。
+   * 聚焦时让位成空串，失焦且仍为空就恢复显示那个占位。
+   */
+  const [dashPlaceholderCleared, setDashPlaceholderCleared] = useState(false);
+  const isDashOnly = value.trim() === "-";
+  const visibleValue = isDashOnly && dashPlaceholderCleared ? "" : value;
   const triggerRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const numVal = parseFloat(value) || 0;
@@ -203,7 +255,7 @@ export const CalcInput = forwardRef<HTMLInputElement, CalcInputProps>(function C
 
   function handleInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key !== "Enter") return;
-    const raw = sanitizeCalcInputValue(value, allowAmountFieldReferences).trim();
+    const raw = sanitizeCalcInputValue(visibleValue, allowAmountFieldReferences).trim();
     if (allowAmountFieldReferences && hasAmountFieldReference(raw)) return;
     // Plain signed numbers (including negatives) are values, not expressions:
     // let Enter submit the form instead of swallowing it and mutating the value.
@@ -214,7 +266,8 @@ export const CalcInput = forwardRef<HTMLInputElement, CalcInputProps>(function C
   }
 
   function handleInputBlur() {
-    const raw = sanitizeCalcInputValue(value, allowAmountFieldReferences).trim();
+    setDashPlaceholderCleared(false);
+    const raw = sanitizeCalcInputValue(visibleValue, allowAmountFieldReferences).trim();
     if (isPlainSignedNumber(raw)) {
       const parsed = Number(raw);
       if (Number.isFinite(parsed)) {
@@ -242,17 +295,19 @@ export const CalcInput = forwardRef<HTMLInputElement, CalcInputProps>(function C
       <input
         ref={ref}
         inputMode={allowAmountFieldReferences ? "text" : "decimal"}
-        value={value}
+        value={visibleValue}
         disabled={disabled}
+        readOnly={readOnly}
         onChange={(e) => onChange(sanitizeCalcInputValue(e.target.value, allowAmountFieldReferences))}
-        onKeyDown={handleInputKeyDown}
-        onBlur={handleInputBlur}
+        onFocus={() => setDashPlaceholderCleared(true)}
+        onKeyDown={readOnly ? undefined : handleInputKeyDown}
+        onBlur={readOnly ? () => setDashPlaceholderCleared(false) : handleInputBlur}
         placeholder={placeholder}
         autoFocus={autoFocus}
         aria-label={ariaLabel}
         style={{
           caretColor: "var(--foreground)",
-          ...(bare || hideCalculator
+          ...(bare || hideCalculator || readOnly
             ? {}
             : { paddingRight: compact ? TRIGGER_RESERVED_COMPACT_PX : TRIGGER_RESERVED_PX }),
         }}
@@ -263,7 +318,7 @@ export const CalcInput = forwardRef<HTMLInputElement, CalcInputProps>(function C
               // 紧凑模式：视觉完全由调用方（表格单元格样式）决定，这里只留
               // 计算器按钮的右侧留白（`style.paddingRight`）与禁用态。
               ? `placeholder:text-slate-300 caret-slate-800 disabled:cursor-not-allowed disabled:text-slate-400 ${inputClassName ?? ""}`
-              : `form-input font-mono placeholder:text-slate-300 caret-slate-800 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-500 ${inputClassName ?? ""}`
+              : `form-input font-mono placeholder:text-slate-300 caret-slate-800 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-500 ${readOnly ? "bg-slate-50 text-slate-900" : ""} ${inputClassName ?? ""}`
         }
       />
 
@@ -273,7 +328,7 @@ export const CalcInput = forwardRef<HTMLInputElement, CalcInputProps>(function C
           按钮**不带任何边框**（包括左侧分隔线）：内缩后这些边框会与输入框自身的边框平行贴在一起
           （右侧能看到两层描边 + 抗锯齿造成的“模糊重影”），而左侧一条竖线与整体外框不搭。
           外框（描边 + 红/蓝环）统一由输入框负责，图标本身就够区分按钮。 */}
-      {compact && !hideCalculator && (
+      {compact && !hideCalculator && !readOnly && (
         <div className="absolute right-0 top-1/2 -translate-y-1/2">
           <button
             ref={triggerRef}
@@ -288,7 +343,7 @@ export const CalcInput = forwardRef<HTMLInputElement, CalcInputProps>(function C
         </div>
       )}
 
-      {!bare && !compact && !hideCalculator && <div className="absolute right-px top-px">
+      {!bare && !compact && !hideCalculator && !readOnly && <div className="absolute right-px top-px">
         <button
           ref={triggerRef}
           type="button"

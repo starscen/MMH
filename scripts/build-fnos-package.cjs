@@ -46,7 +46,15 @@ const externalNode = process.env.FNOS_EXTERNAL_NODE === "1";
 // 覆盖升级链路和 @appcenter/mmh 数据目录都会断。
 // 2026-11-02 用户定名：显示名从「MMH」改为「MMH 记账」（MMH 与「记账」之间留一个空格），
 // 飞牛的包标记（appname=mmh）保持不变。
-const displayName = externalNode ? "MMH 记账（外部 Node.js）" : "MMH 记账";
+// 2026-11-14 用户明确：显示名不得按变体加后缀（「（外部 Node.js）」这类）——bundled
+// 与 external-node 是同一个应用的两个包，不是两个软件，装哪个都应该只显示「MMH 记账」。
+// 变体信息只出现在 fpk 文件名与 desc 里。
+const displayName = "MMH 记账";
+// fnOS 包的默认服务端口。2026-11-14 用户裁定：默认沿用历史值 7777，与本产品其它
+// 渠道（Docker / 群晖 SPK / 桌面）一致，不为了某台机器上的一次端口占用就整体改默认值。
+// 冲突靠探测解决：全新安装从这个值开始找第一个空闲端口（被占则 +1，最多 20 次），
+// 升级/重装沿用已保存的 .port，向导里也随时可以改。
+const fnosDefaultPort = 7777;
 // 应用介绍：全渠道同一份通用简介（群晖套件中心、软仓、FnDepot 用的都是它）。
 // 飞牛官方 2026-11-02 确认：应用商店详情页的简介就封装在 fpk 的 manifest（desc=）
 // 里，商店后台与飞书申请表都改不动它——只有重新打包、重新提交才会变。此前这里是
@@ -78,16 +86,58 @@ function resolveStoreIntro() {
 
 const storeIntro = resolveStoreIntro();
 const externalNodeStartup = externalNode ? [
-  "  NODE_MAJOR=\"$($NODE_BIN -p 'process.versions.node.split(\\\".\\\")[0]' 2>/dev/null || true)\"",
-  "  if [ \"$NODE_MAJOR\" != \"22\" ]; then",
-  "    echo \"MMH requires Node.js 22.x for the external-node package; detected ${NODE_MAJOR:-unknown}.\" >&2",
+  "  NODE_MAJOR=\"$($NODE_BIN -p 'process.versions.node.split(\".\")[0]' 2>/dev/null || true)\"",
+  "  if [ -z \"$NODE_MAJOR\" ] || ! [ \"$NODE_MAJOR\" -ge 22 ] 2>/dev/null; then",
+  "    echo \"MMH needs Node.js 22 or newer for the external-node package; detected ${NODE_MAJOR:-unknown} (selected ${NODE_BIN}).\" >&2",
   "    exit 1",
   "  fi",
   "  if ! (cd \"$SERVER_DIR\" && \"$NODE_BIN\" -e 'const Database=require(\"better-sqlite3\"); const db=new Database(\":memory:\"); if (db.prepare(\"select 1 as ok\").get().ok !== 1) process.exit(1); db.close();') >/dev/null 2>&1; then",
-  "    echo \"MMH external Node.js cannot load better-sqlite3. Install the matching Node.js v22 runtime.\" >&2",
+  "    echo \"MMH cannot load better-sqlite3 with the detected Node.js. Reinstall the App Center 'Node.js 22' dependency from MMH's install_dep_apps, or point MMH_NODE_BIN at a Node.js 22 binary.\" >&2",
   "    exit 1",
   "  fi",
 ].join("\n") : "";
+// 载荷就绪判定。bundled 变体要求「内置 node + server.js」两项都在，因为它自己
+// 带运行时；external-node 变体打包时把 app/bin 整个删掉了（见文件末尾的
+// `hasNode && externalNode` 分支），继续用同一条判定就永远不可能就绪 ——
+// 0.1.85 的 x86_64-external-node.fpk 真机安装正是死在这里：tar 解包明明成功，
+// app_payload_is_ready 却一直返回 1，最后报 "did not produce a runnable app"。
+// 所以 external-node 只认 server.js，运行时交给 select_node_bin 去发现。
+// 判定顺序：先认标准的 \$dest/app 布局，再认历史遗留的「载荷铺在应用根」布局。
+// 反过来写会让根下残留的 server/ 永远短路掉 app/ 的解包，导致新包装完仍是
+// 老结构（5.149 的残局就是这么来的）。
+const payloadReadyFn = externalNode
+  ? `app_payload_is_ready() {
+    local dest="$1"
+    if [ -f "\${dest}/app/server/server.js" ]; then
+        APP_ROOT="\${dest}/app"
+        APP_BIN=""
+        APP_SERVER="\${dest}/app/server/server.js"
+        return 0
+    fi
+    if [ -f "\${dest}/server/server.js" ]; then
+        APP_ROOT="\${dest}"
+        APP_BIN=""
+        APP_SERVER="\${dest}/server/server.js"
+        return 0
+    fi
+    return 1
+}`
+  : `app_payload_is_ready() {
+    local dest="$1"
+    if [ -x "\${dest}/app/bin/node" ] && [ -f "\${dest}/app/server/server.js" ]; then
+        APP_ROOT="\${dest}/app"
+        APP_BIN="\${dest}/app/bin/node"
+        APP_SERVER="\${dest}/app/server/server.js"
+        return 0
+    fi
+    if [ -x "\${dest}/bin/node" ] && [ -f "\${dest}/server/server.js" ]; then
+        APP_ROOT="\${dest}"
+        APP_BIN="\${dest}/bin/node"
+        APP_SERVER="\${dest}/server/server.js"
+        return 0
+    fi
+    return 1
+}`;
 const stageDir = path.join(outDir, `${target.stageDirName}${externalNode ? "-external-node" : ""}`);
 const nodeTarball = process.env.FNOS_NODE_TARBALL || "";
 const isLinux = process.platform === "linux";
@@ -509,6 +559,45 @@ function trimForeignPrebuilds(serverDir, nodeArch) {
   }
 }
 
+// Next's standalone tracing keeps the packages whole, so `pdf-parse` and
+// `pdfjs-dist` arrive with their own source maps: pdf.worker.mjs.map alone is
+// 5 MB and the two packages together ship ~19 MB of them. Nothing at runtime
+// reads a .map (it only decorates stack traces), and the Docker image already
+// strips them from .next, so drop every one under the staged server before
+// app.tgz is built. The fnOS package was ~14 MB larger than 0.1.86 purely
+// because of this dependency, and these maps were a third of that growth.
+function pruneSourceMaps(serverDir) {
+  if (!fs.existsSync(serverDir)) return 0;
+  let count = 0;
+  let bytes = 0;
+  const stack = [serverDir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const item = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(item);
+        continue;
+      }
+      if (!entry.name.endsWith(".map")) continue;
+      const size = fs.statSync(item).size;
+      fs.rmSync(item, { force: true });
+      count += 1;
+      bytes += size;
+    }
+  }
+  if (count > 0) {
+    console.log(`Pruned ${count} source maps (${(bytes / (1024 * 1024)).toFixed(1)} MB) from the fnOS payload.`);
+  }
+  return count;
+}
+
 // better-sqlite3 declares an engines range; a bundled runtime below it compiles
 // but fails at load time with no useful output. Check the range up front so a
 // Node major mismatch names itself instead of showing up as a bare exit code.
@@ -745,7 +834,7 @@ if (generatedSchema.status !== 0) process.exit(generatedSchema.status || 1);
 write(path.join(stageDir, "manifest"), `
 appname=${appName}
 version=${version}
-desc=${externalNode ? "一套本地部署、依赖外部 Node.js 运行时的家庭账务管理系统。" : storeIntro}
+desc=${externalNode ? storeIntro + "（本安装包不内置运行时，安装时自动安装应用中心的「Node.js 22」依赖。）" : storeIntro}
 display_name=${displayName}
 arch=${target.manifestArch}
 platform=${target.manifestPlatform}
@@ -758,7 +847,7 @@ distributor_url=https://github.com/frankluise5220/MMH
 helpurl=https://github.com/frankluise5220/MMH
 desktop_uidir=ui
 desktop_applaunchname=mmh.Application
-service_port=7777
+${externalNode ? "install_dep_apps=nodejs_v22\n" : ""}service_port=${fnosDefaultPort}
 checkport=true
 changelog=${manifestChangelog}
 `);
@@ -801,7 +890,7 @@ write(path.join(stageDir, "wizard", "config"), JSON.stringify([
         type: "text",
         field: "wizard_port",
         label: "服务端口",
-        initValue: "7777",
+        initValue: String(fnosDefaultPort),
         rules: [
           { required: true, message: "请输入服务端口" },
           {
@@ -809,14 +898,14 @@ write(path.join(stageDir, "wizard", "config"), JSON.stringify([
             message: "请输入 1000-65535 之间的端口",
           },
         ],
-        helpText: "保存后会重启 MMH 服务。端口会写入应用数据目录，后续更新会继续沿用，不会被包内默认值覆盖。默认值固定为 7777，不一定是当前在用的端口。",
+        helpText: "保存后会重启 MMH 服务。端口会写入应用数据目录，后续更新会继续沿用，不会被包内默认值覆盖。默认值是 7777（与 Docker、Windows 桌面版一致）；若该端口已被占用，启动时会自动改用附近可用的端口，所以这里显示的不一定是当前在用的端口。",
       },
       ...(externalNode ? [{
         type: "text",
         field: "wizard_node_bin",
         label: "Node.js 可执行文件",
-        initValue: "node",
-        helpText: "需要 Node.js 22.x。可填写 node、绝对路径，或 FN Depot Node.js v22 的实际路径。保存后会重启 MMH 服务。",
+        initValue: "",
+        helpText: "留空即可：安装时会自动拉取应用中心的「Node.js 22」依赖（install_dep_apps=nodejs_v22），启动时自动使用它。只有想改用别的 Node.js 22 时才需要填（node、绝对路径或 FN Depot 里的路径）。保存后会重启 MMH 服务。",
       }] : []),
     ],
   },
@@ -945,22 +1034,7 @@ EOF
     echo "/var/apps/$TRIM_APPNAME"
 }
 
-app_payload_is_ready() {
-    local dest="$1"
-    if [ -x "\${dest}/bin/node" ] && [ -f "\${dest}/server/server.js" ]; then
-        APP_ROOT="\${dest}"
-        APP_BIN="\${dest}/bin/node"
-        APP_SERVER="\${dest}/server/server.js"
-        return 0
-    fi
-    if [ -x "\${dest}/app/bin/node" ] && [ -f "\${dest}/app/server/server.js" ]; then
-        APP_ROOT="\${dest}/app"
-        APP_BIN="\${dest}/app/bin/node"
-        APP_SERVER="\${dest}/app/server/server.js"
-        return 0
-    fi
-    return 1
-}
+${payloadReadyFn}
 
 find_download_app_tgz() {
     local candidate newest="" newest_mtime=0 mtime
@@ -1000,24 +1074,130 @@ ensure_cmd_scripts() {
     fi
 }
 
+# 安装包里声明的版本（构建时注入）。解出来的 payload 必须和它一致：5.149 那次
+# 真机事故就是应用目录里躺着 0.1.77 的旧 payload、而用户以为装的是新包，界面
+# 什么都看不出来，只能看到一个起不来的应用。现在先重解包自愈，仍不一致就当面
+# 报错，而不是让用户对着一个打不开的图标猜。
+EXPECTED_PAYLOAD_VERSION="${version}"
+
+payload_version_of() {
+    local dest candidate actual
+    dest="\${1:-$(resolve_app_dest)}"
+    for candidate in "\${dest}/app/server/.mmh-version" "\${dest}/server/.mmh-version"; do
+        [ -f "$candidate" ] || continue
+        actual="$(tr -d '[:space:]' < "$candidate" 2>/dev/null || true)"
+        [ -n "$actual" ] || continue
+        printf '%s\\n' "$actual"
+        return 0
+    done
+    return 1
+}
+
+verify_payload_version() {
+    local dest actual
+    dest="\${1:-$(resolve_app_dest)}"
+    actual="$(payload_version_of "$dest" 2>/dev/null || true)"
+    # 老包没有版本文件时不做判断（不能因为缺少标记就把能跑的程序判成坏的）。
+    [ -n "$actual" ] || return 0
+    if [ "$actual" != "$EXPECTED_PAYLOAD_VERSION" ]; then
+        echo "MMH 安装内容与安装包不一致：安装包是 \${EXPECTED_PAYLOAD_VERSION}，解包出来的程序是 \${actual}。" >&2
+        echo "这通常是安装包被旧内容覆盖、或下载/解包损坏：应用目录里残留着更早版本的载荷。请重新从应用中心安装；本次已中止，账本数据没有被改动。" >&2
+        return 1
+    fi
+    return 0
+}
+
+# 安装/升级/启动前先问一句「这个 payload 认识账本里的迁移吗」。不认识就直接
+# 失败并说清楚要升级到哪个版本，而不是先谎报安装成功、再让用户对着打不开的
+# 图标猜。没有 Node 时（依赖还没装好）跳过，交给启动时的守卫兜底。
+verify_database_schema() {
+    local dest server_dir data_dir node_bin status had_errexit=0
+    dest="\${1:-$(resolve_app_dest)}"
+    if [ -f "\${dest}/app/server/scripts/init-sqlite.cjs" ]; then
+        server_dir="\${dest}/app/server"
+    elif [ -f "\${dest}/server/scripts/init-sqlite.cjs" ]; then
+        server_dir="\${dest}/server"
+    else
+        return 0
+    fi
+    data_dir="\${TRIM_DATADEST:-}"
+    if [ -z "$data_dir" ]; then
+        data_dir="$(resolve_pkgvar 2>/dev/null || true)"
+        [ -n "$data_dir" ] && data_dir="\${data_dir}/data"
+    fi
+    [ -n "$data_dir" ] || return 0
+    [ -f "\${data_dir}/mmh.db" ] || return 0
+    if command -v select_node_bin >/dev/null 2>&1; then
+        node_bin="$(select_node_bin 2>/dev/null || true)"
+    fi
+    [ -n "$node_bin" ] && [ -x "$node_bin" ] || return 0
+    case "$-" in
+        *e*) had_errexit=1 ;;
+    esac
+    set +e
+    ( cd "$server_dir" && MMH_DATA_DIR="$data_dir" DATABASE_URL="file:\${data_dir}/mmh.db" "$node_bin" "\${server_dir}/scripts/init-sqlite.cjs" --verify-schema ) >/dev/null 2>&1
+    status=$?
+    [ "$had_errexit" -eq 1 ] && set -e
+    if [ "$status" -eq 78 ]; then
+        echo "MMH 安装中止：这个账本是由更新版本的 MMH 写入的，当前安装包装上去也启动不了（旧程序不认识新版数据库结构）。" >&2
+        echo "请安装与账本匹配或更新的版本；账本数据没有被改动，原因已写入 \${data_dir}/STARTUP-ERROR.txt。" >&2
+        return 1
+    fi
+    return 0
+}
+
+payload_ready_and_verified() {
+    local dest="$1"
+    if ! verify_payload_version "$dest"; then
+        return 1
+    fi
+    if ! verify_database_schema "$dest"; then
+        return 1
+    fi
+    ensure_cmd_scripts
+    return 0
+}
+
 ensure_app_ready() {
-    local dest tgz
+    local dest tgz attempt=0 stale=0
     dest="$(resolve_app_dest)"
     tgz="\${dest}/app.tgz"
 
     mkdir -p "$dest" 2>/dev/null || true
-    if app_payload_is_ready "$dest"; then
-        ensure_cmd_scripts
-        return 0
-    fi
-
-    if [ ! -f "$tgz" ]; then
-        tgz="$(find_download_app_tgz 2>/dev/null || true)"
-    fi
-    if [ ! -f "$tgz" ]; then
-        echo "MMH payload is missing: no extracted app and no app.tgz under $dest or appcenter-downloads" >&2
-        return 1
-    fi
+    # fnOS 把 .fpk 解到 appcenter-downloads 与调用 install_callback / start 之间存在
+    # 竞态：app.tgz 有二十多 MB，脚本先跑起来时它可能还没落盘，旧实现当场报
+    # "MMH payload is missing" 让安装直接失败（0.1.85 external-node 真机就是这样
+    # 挂掉的：用户日志里卸载备份刚写完，紧接着就是 payload is missing）。
+    # 这里最多等 20 秒，拿到 app.tgz 再走解包。
+    while :; do
+        if app_payload_is_ready "$dest"; then
+            if verify_payload_version "$dest" >/dev/null 2>&1; then
+                payload_ready_and_verified "$dest" || return 1
+                return 0
+            fi
+            # 应用目录里趴着旧版本的载荷（5.149 真机：装的是新包，跑的是 0.1.77）。
+            # 这里不能直接当作就绪返回，否则旁边的 app.tgz 永远没机会铺上去，
+            # 用户看到的就是「装完打不开」，而账本早已被新版迁移过。
+            stale=1
+        fi
+        tgz="\${dest}/app.tgz"
+        if [ ! -f "$tgz" ]; then
+            tgz="$(find_download_app_tgz 2>/dev/null || true)"
+        fi
+        if [ -f "$tgz" ]; then
+            break
+        fi
+        if [ "$stale" -eq 1 ]; then
+            echo "MMH 应用目录里的程序版本与安装包不一致（安装包 \${EXPECTED_PAYLOAD_VERSION}），且找不到可用来覆盖的 app.tgz；请从应用中心重新安装。" >&2
+            return 1
+        fi
+        if [ "$attempt" -ge 20 ]; then
+            echo "MMH payload is missing: no extracted app and no app.tgz under $dest or appcenter-downloads" >&2
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
 
     mkdir -p "\${dest}/app"
     if ! tar -xzf "$tgz" -C "\${dest}/app"; then
@@ -1025,20 +1205,15 @@ ensure_app_ready() {
         return 1
     fi
     if app_payload_is_ready "$dest"; then
-        ensure_cmd_scripts
+        payload_ready_and_verified "$dest" || return 1
         return 0
     fi
 
-    if ! tar -xzf "$tgz" -C "$dest"; then
-        echo "MMH payload extract failed: $tgz -> $dest" >&2
-        return 1
-    fi
-    if app_payload_is_ready "$dest"; then
-        ensure_cmd_scripts
-        return 0
-    fi
-
-    echo "MMH payload extract did not produce a runnable app in $dest" >&2
+    # 不再回退成「把 app.tgz 铺到 $dest 根」：那条路径会把 server/、.next/ 直接
+    # 摊在应用目录里，与 fpk 自带的 cmd/、manifest、ui/ 混在一起，之后
+    # app_payload_is_ready 又会因为根下存在 server/server.js 而直接短路，
+    # 再也不解 app/ —— 5.149 就是这样装成「根目录 + 没有 cmd」的残局。
+    echo "MMH payload extract failed: $tgz did not produce $dest/app/server/server.js" >&2
     return 1
 }
 
@@ -1188,7 +1363,7 @@ probe_free_port() {
     local start="$1"
     local p i
     case "$start" in
-        ''|*[!0-9]*) start=7777 ;;
+        ''|*[!0-9]*) start=${fnosDefaultPort} ;;
     esac
     p="$start"
     i=0
@@ -1218,10 +1393,68 @@ resolve_port() {
         return 0
     fi
     # No install wizard ships with this package: fresh installs never ask for a
-    # port, so probe for a free one instead of deadlocking on a taken 7777.
-    # Reinstalls and updates reuse .port above and never reach this probe.
-    start_port="\${TRIM_SERVICE_PORT:-7777}"
+    # port, so start from the historical default and probe forward instead of
+    # deadlocking on a host that already uses it. Reinstalls and updates reuse
+    # .port above and never reach this probe, so an existing install keeps
+    # whatever port it was given.
+    start_port="\${TRIM_SERVICE_PORT:-${fnosDefaultPort}}"
     probe_free_port "$start_port"
+}
+
+# 谁在监听这个端口 —— 写进安装日志，用户能看懂到底撞了哪个程序
+port_owner_desc() {
+    local p="$1" line pid cmd
+    if command -v ss >/dev/null 2>&1; then
+        line="$(ss -ltnp 2>/dev/null | grep -F ":$p " | head -1 || true)"
+        pid="$(printf '%s' "$line" | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | head -1)"
+        if [ -n "$pid" ]; then
+            cmd="$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\\0' ' ' || true)"
+            printf 'pid=%s %s' "$pid" "$cmd"
+            return 0
+        fi
+    fi
+    printf 'unknown process'
+}
+
+# 本应用自己的残留实例（PID 文件丢失后变孤儿）会被应用中心的端口检查拦住，
+# 所以安装/升级阶段先按 cmdline 把它们清掉，而不是让启动直接失败。
+stop_own_payload_processes() {
+    local dest entry pid cmd
+    dest="$(resolve_app_dest)"
+    for entry in /proc/[0-9]*; do
+        pid="\${entry#/proc/}"
+        cmd="$(cat "$entry/cmdline" 2>/dev/null | tr '\\0' ' ' || true)"
+        [ -n "$cmd" ] || continue
+        case "$cmd" in
+            *"$dest/app/server/mmh-unix-server.cjs"*|*"$dest/app/server/server.js"*|*"$dest/server/mmh-unix-server.cjs"*|*"$dest/server/server.js"*)
+                kill -9 "$pid" 2>/dev/null || true
+                ;;
+        esac
+    done
+}
+
+# 安装/升级时确定端口：先让本应用残留实例让位；仍是别人的程序占着，
+# 就顺延到下一个空闲端口并落盘（write_env_file 会同步 ui/config 与 manifest），
+# 同时把「谁占着、改用了哪个」打到安装日志里。
+prepare_install_port() {
+    local pkgvar port_file port probe
+    pkgvar="$(resolve_pkgvar)"
+    port_file="$pkgvar/.port"
+    port="$(resolve_port)"
+    if port_in_use "$port"; then
+        stop_own_payload_processes
+        sleep 1
+    fi
+    if port_in_use "$port"; then
+        probe="$(probe_free_port "$((port + 1))")"
+        echo "MMH: port $port is already used by $(port_owner_desc "$port")" >&2
+        if [ -n "$probe" ] && [ "$probe" != "$port" ]; then
+            port="$probe"
+            printf '%s\\n' "$port" > "$port_file"
+            echo "MMH: this install will use port $port instead (change it in App Center > MMH 记账 > Settings)" >&2
+        fi
+    fi
+    printf '%s\\n' "$port"
 }
 
 write_env_file() {
@@ -1271,13 +1504,22 @@ EOF
     printf '%s\\n' "$session_secret" > "$session_secret_file"
     chmod 600 "$session_secret_file" 2>/dev/null || true
 
-    if [ -n "\${APP_ROOT:-}" ] && [ -f "\${APP_ROOT}/ui/config" ]; then
-        sed -i 's/"port": "[0-9]*"/"port": "'"\${port}"'"/' "\${APP_ROOT}/ui/config"
+    # 端口落在三个地方：mmh.env 同目录下的 .port、ui/config（应用中心入口）、manifest
+    # 的 service_port。后两者不一定在 $APP_ROOT 下（manifest 在应用根，
+    # 载荷在 app/），所以两条路径都要试，否则改了 .port 但应用中心仍按旧端口
+    # 做启动前检查，用户看到的就是「端口被占用」而实际服务已经换了端口。
+    local ui_cfg manifest_file app_dest_root
+    ui_cfg="$(app_ui_config 2>/dev/null || true)"
+    if [ -n "$ui_cfg" ] && [ -f "$ui_cfg" ]; then
+        sed -i 's/"port": "[0-9]*"/"port": "'"\${port}"'"/' "$ui_cfg"
     fi
-
-    if [ -n "\${APP_ROOT:-}" ] && [ -f "\${APP_ROOT}/manifest" ]; then
-        sed -i "s/^service_port[[:space:]]*=.*/service_port          = \${port}/" "\${APP_ROOT}/manifest"
-    fi
+    app_dest_root="$(resolve_app_dest 2>/dev/null || true)"
+    for manifest_file in "\${app_dest_root}/manifest" "\${APP_ROOT:-}/manifest"; do
+        [ -n "$manifest_file" ] || continue
+        if [ -f "$manifest_file" ]; then
+            sed -i "s/^service_port[[:space:]]*=.*/service_port          = \${port}/" "$manifest_file"
+        fi
+    done
 
     if id mmh >/dev/null 2>&1; then
         chown -R mmh:mmh "$pkgvar" 2>/dev/null || true
@@ -1412,15 +1654,18 @@ resolve_node_bin () {
         ;;
     esac
   fi
+  # 应用中心「Node.js 22」依赖优先于 /usr/local/bin/node：后者是用户自己装的
+  # Node（可能就是 24），把它排在前面会让 external-node 变体挑到一个非 22 的
+  # 运行时；依赖装上了就先用依赖，用户想覆盖就显式写 MMH_NODE_BIN。
   for candidate in \
     /var/apps/nodejs_v22/bin/node \
     /var/apps/nodejs_v22/app/bin/node \
-    /usr/local/bin/node \
     /vol*/@appcenter/nodejs_v22/bin/node \
     /vol*/@appcenter/nodejs_v22/app/bin/node \
     /vol*/@appcenter/nodejs_v22/*/bin/node \
     /vol*/@appcenter/nodejs_v22/*/app/bin/node \
-    /vol*/@appcenter/nodejs_v22/*/node; do
+    /vol*/@appcenter/nodejs_v22/*/node \
+    /usr/local/bin/node; do
     [ -x "$candidate" ] && { printf '%s' "$candidate"; return 0; }
   done
   candidate="$(command -v node 2>/dev/null || true)"
@@ -1495,7 +1740,7 @@ ensure_runtime_settings () {
   mkdir -p "$DATA_DEST" "$DATA_ROOT"
 
   env_port="$(read_env_value PORT 2>/dev/null || true)"
-  export PORT="\${PORT:-\${env_port:-7777}}"
+  export PORT="\${PORT:-\${env_port:-${fnosDefaultPort}}}"
 
   env_password="$(read_env_value MMH_SYSTEM_PASSWORD 2>/dev/null || true)"
   system_password="\${MMH_SYSTEM_PASSWORD:-$env_password}"
@@ -1727,6 +1972,22 @@ ensure_runtime_owner () {
   chmod 700 "$sibling_backup" 2>/dev/null || true
 }
 
+# 账本比程序新时，进程根本起不来，用户点开应用只有一片空白/网关错误。这里在
+# 原访问入口（网关 socket + 本地端口）顶一个只读说明页，把 STARTUP-ERROR.txt
+# 的中文原因直接摊在用户眼前；status_app 仍读 mmh.pid，所以应用中心照旧显示
+# 「未启动」，不会把错误页误报成运行中。
+start_startup_error_page () {
+  local entry="$SERVER_DIR/scripts/startup-error-page.cjs"
+  if [ ! -f "$entry" ]; then
+    echo "MMH 未能启动：账本是由更新版本的 MMH 写入的，当前程序太旧；原因见 $DATA_DEST/STARTUP-ERROR.txt。" >&2
+    return 1
+  fi
+  nohup "$NODE_BIN" "$entry" >>"$LOG_FILE" 2>&1 &
+  echo "$!" > "$DATA_DEST/startup-error-page.pid"
+  echo "MMH 未能启动：账本是由更新版本的 MMH 写入的。已在原访问入口返回中文说明页，原因见 $DATA_DEST/STARTUP-ERROR.txt。" >&2
+  return 0
+}
+
 start_app () {
   mkdir -p "$DATA_DEST"
   if command -v ensure_app_ready >/dev/null 2>&1; then
@@ -1744,7 +2005,7 @@ start_app () {
     if [ -n "\${BUNDLED_NODE_BIN:-}" ]; then
       echo "MMH bundled Node runtime is missing: $BUNDLED_NODE_BIN" >&2
     else
-      echo "MMH requires external Node.js 22. Install Node.js v22, then set MMH_NODE_BIN in the MMH application settings." >&2
+      echo "MMH needs Node.js 22: install/repair the App Center 'Node.js 22' dependency (the package declares install_dep_apps=nodejs_v22), or set MMH_NODE_BIN in the MMH application settings." >&2
     fi
     exit 1
   fi
@@ -1766,7 +2027,16 @@ ${externalNodeStartup}
   export MMH_DATA_DIR="$DATA_DEST"
   export DATABASE_URL="file:$DATA_DEST/mmh.db"
   export PRISMA_SCHEMA_PATH="$SERVER_DIR/prisma/schema.native.prisma"
-  (cd "$SERVER_DIR" && "$NODE_BIN" "$SERVER_DIR/scripts/init-sqlite.cjs") >>"$LOG_FILE" 2>&1 || exit 1
+  # 78 是 init-sqlite 专用的「账本比程序新，拒绝降级」退出码：这种情况不是
+  # 坏包也不是坏库，必须把中文原因交给用户，所以单独记下来，走说明页分支；
+  # 其它失败码按原样把日志尾巴打给安装/启动界面。
+  init_status=0
+  (cd "$SERVER_DIR" && "$NODE_BIN" "$SERVER_DIR/scripts/init-sqlite.cjs") >>"$LOG_FILE" 2>&1 || init_status=$?
+  if [ "$init_status" -ne 0 ] && [ "$init_status" -ne 78 ]; then
+    echo "MMH 数据库初始化失败（退出码 $init_status），账本未被改动。日志：$LOG_FILE" >&2
+    tail -n 5 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' >&2
+    exit 1
+  fi
   existing_pid=""
   existing_cwd=""
   if [ -f "$PID_FILE" ]; then
@@ -1788,14 +2058,25 @@ ${externalNodeStartup}
   local mmh_gateway_entry="$SERVER_DIR/mmh-unix-server.cjs"
   if [ -f "$mmh_gateway_entry" ] && { [ -n "\${MMH_GATEWAY_SOCKET_PATH:-}" ] || [ -n "\${TRIM_APPDEST:-}" ]; }; then
     export MMH_GATEWAY_SOCKET_PATH="\${MMH_GATEWAY_SOCKET_PATH:-$TRIM_APPDEST/app.sock}"
-    export MMH_LOCAL_TCP_PORT="\${MMH_LOCAL_TCP_PORT:-7777}"
+    # Must follow PORT. Keeping a hardcoded 7777 here means changing the service
+    # port never frees 7777: the gateway would still listen on it and collide
+    # with whatever the host already runs there.
+    export MMH_LOCAL_TCP_PORT="\${MMH_LOCAL_TCP_PORT:-\${PORT:-${fnosDefaultPort}}}"
     export MMH_LOCAL_TCP_HOST="\${MMH_LOCAL_TCP_HOST:-0.0.0.0}"
     # The fnOS build bakes Next's basePath to /app/mmh; the launcher reads this
     # to inject the prefix on the local TCP compatibility port (LAN/Android
     # clients hit "/" without it) while leaving the gateway socket untouched.
     export MMH_BASE_PATH="\${MMH_BASE_PATH:-/app/mmh}"
+    if [ "$init_status" -eq 78 ]; then
+      start_startup_error_page
+      exit 1
+    fi
     nohup "$NODE_BIN" "$mmh_gateway_entry" >>"$LOG_FILE" 2>&1 &
   else
+    if [ "$init_status" -eq 78 ]; then
+      start_startup_error_page
+      exit 1
+    fi
     nohup "$NODE_BIN" "$SERVER_DIR/server.js" >>"$LOG_FILE" 2>&1 &
   fi
   echo "$!" > "$PID_FILE"
@@ -1812,7 +2093,7 @@ stop_leftover_mmh_server () {
   for pid in /proc/[0-9]*; do
     [ -d "$pid" ] || continue
     pid="\${pid#/proc/}"
-    cmd="$(tr '\\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    cmd="$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\\0' ' ' || true)"
     [ -n "$cmd" ] || continue
     case "$cmd" in
       *next-server*|*server/server.js*|*mmh-unix-server.cjs*)
@@ -1836,7 +2117,7 @@ wait_listen_port_free () {
   if [ -z "$port" ]; then
     port="$(read_env_value PORT 2>/dev/null || true)"
   fi
-  port="\${port:-7777}"
+  port="\${port:-${fnosDefaultPort}}"
   i=0
   while [ "$i" -lt 20 ]; do
     if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -E ":\${port}([[:space:]]|$)" >/dev/null; then
@@ -1871,6 +2152,16 @@ stop_app () {
       kill -9 "$pid" >/dev/null 2>&1 || true
     fi
     rm -f "$PID_FILE"
+  fi
+  # 启动失败时留下的说明页也占着网关 socket / 本地端口，必须先收掉，否则下一次
+  # 启动会卡在 wait_listen_port_free 或者干脆被旧页面的 socket 顶住。
+  local error_pid
+  if [ -f "$DATA_DEST/startup-error-page.pid" ]; then
+    error_pid="$(cat "$DATA_DEST/startup-error-page.pid" 2>/dev/null || true)"
+    if [ -n "$error_pid" ] && kill -0 "$error_pid" >/dev/null 2>&1; then
+      kill "$error_pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$DATA_DEST/startup-error-page.pid"
   fi
   stop_leftover_mmh_server
   wait_listen_port_free || true
@@ -1932,7 +2223,7 @@ if [ -f "$SCRIPT_DIR/app-layout" ]; then
 fi
 if [ -f "$SCRIPT_DIR/apply-settings" ]; then
     . "$SCRIPT_DIR/apply-settings"
-    write_env_file "" "\${wizard_node_bin:-}" >/dev/null
+    write_env_file "$(prepare_install_port)" "\${wizard_node_bin:-}" >/dev/null
 fi
 
 exit 0
@@ -2198,6 +2489,77 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 
 const MIGRATIONS = [
+  {
+    // 固定资产扩展属性与折旧（2026-11-15 用户裁定）：生产日期 / 重量（含单位）、
+    // 折旧方式 / 折旧年限（月）/ 残值 / 累计折旧（折损）。口径实现在
+    // src/lib/fixed-asset-depreciation.ts（none = 手填，straight_line = 按年限直线推算）。
+    // 漏掉这段：升级后的库打开固定资产编辑/处置会报 "no such column: accumulatedDepreciation"。
+    // 新增列都有默认值，存量资产不回填。
+    version: "20261115_add_fixed_asset_depreciation",
+    // introducedIn 只给「旧程序必须被挡住」的判断用：账本里出现这条迁移、而当前
+    // payload 不认识它时，中文提示就能直接说"请升级到 0.1.86 或更新"，而不是让
+    // 用户对着 20261115_xxx 猜。0.1.86 是第一个带这组迁移的发布包（0.1.85 不含）。
+    introducedIn: "0.1.86",
+    description: "Add productionDate / weight / depreciation columns to PropertyAsset",
+    apply(db) {
+      for (const table of ["PropertyAsset", "property_assets"]) {
+        if (!tableExists(db, table)) continue;
+        addColumnIfMissing(db, table, "productionDate", "DATETIME");
+        addColumnIfMissing(db, table, "weight", "DECIMAL(18,3)");
+        addColumnIfMissing(db, table, "weightUnit", "TEXT");
+        addColumnIfMissing(db, table, "depreciationMethod", "TEXT NOT NULL DEFAULT 'none'");
+        addColumnIfMissing(db, table, "usefulLifeMonths", "INTEGER");
+        addColumnIfMissing(db, table, "salvageValue", "DECIMAL(18,2) NOT NULL DEFAULT 0");
+        addColumnIfMissing(db, table, "accumulatedDepreciation", "DECIMAL(18,2) NOT NULL DEFAULT 0");
+      }
+    },
+  },
+  {
+    // 信用卡分期「期供行落库水位」（2026-11-15）：计划记住已经落地到第几期，
+    // materialize 只落 installmentNo > 水位的期，用户删掉的期（软删 / 回收站彻底删除）
+    // 都不会被补回来。存量不回填：水位 0 时历史期仍会被逐期判重跳过，第一次运行
+    // 就把水位推到最大到期期号（自愈），与 PG 迁移 20261115 同义。
+    // 漏掉这段：升级后的库跑分期落地会报 "no such column: materializedThroughNo"
+    // （materialize 查计划整行，缺列直接抛错）。
+    version: "20261115_add_installment_materialized_watermark",
+    introducedIn: "0.1.86",
+    description: "Add CreditCardInstallmentPlan.materializedThroughNo",
+    apply(db) {
+      if (!tableExists(db, "CreditCardInstallmentPlan")) return;
+      addColumnIfMissing(db, "CreditCardInstallmentPlan", "materializedThroughNo", "INTEGER NOT NULL DEFAULT 0");
+    },
+  },
+  {
+    // 贵金属行情（2026-11-13）：持仓新增 latestPrice / latestPriceDate / priceSource。
+    // 三列可空，存量持仓没有行情时读取侧回退 unitPrice（最后一笔成交价）。
+    // 漏掉这段：升级后的库读贵金属持仓会报 "no such column: latestPrice"。
+    version: "20261113_add_metal_latest_price",
+    description: "Add latestPrice / latestPriceDate / priceSource to PreciousMetalHolding",
+    apply(db) {
+      if (tableExists(db, "PreciousMetalHolding")) {
+        addColumnIfMissing(db, "PreciousMetalHolding", "latestPrice", "DECIMAL(20,6)");
+        addColumnIfMissing(db, "PreciousMetalHolding", "latestPriceDate", "DATETIME");
+        addColumnIfMissing(db, "PreciousMetalHolding", "priceSource", "TEXT");
+      }
+    },
+  },
+  {
+    // 账户自定义分组标签（2026-11-13 用户裁定）：用户自己起的分类名，
+    // 侧边栏 / 账户下拉可以按它分组；与 groupId → AccountGroup（所有人分组）无关。
+    // 可空自由文本，存量账户一律走「未分组」，不需要回填。
+    version: "20261113_add_account_group_label",
+    description: "Add Account.accountGroup + HouseholdPreference.accountDropdownGroupBy for account grouping",
+    apply(db) {
+      if (tableExists(db, "Account")) {
+        addColumnIfMissing(db, "Account", "accountGroup", "TEXT");
+      }
+      // 账户下拉分组维度（owner / accountGroup / institution）。household-preferences
+      // 是全列 findUnique，缺这一列会让首屏与侧边栏抛 "no such column"。
+      if (tableExists(db, "HouseholdPreference")) {
+        addColumnIfMissing(db, "HouseholdPreference", "accountDropdownGroupBy", "TEXT NOT NULL DEFAULT 'owner'");
+      }
+    },
+  },
   {
     // 基金资金腿「出处 + 去处」统一（2026-10-17 用户裁定）：买入记 现金账户 → 基金账户，
     // 退款记 基金账户 → 现金账户，两侧账户都落库；历史单腿数据在此补齐。
@@ -3237,6 +3599,19 @@ const MIGRATIONS = [
       db.exec("CREATE UNIQUE INDEX IF NOT EXISTS Category_householdId_type_name_key ON Category(householdId, type, name)");
     },
   },
+  {
+    // 电子钱包 → 货币基金支付关联（2026-11-18）：钱包可指定一个货基账户 + 具体基金代码。
+    // 支出弹窗勾选「从关联货基支付」时，服务端生成赎回（份额减、资金腿回钱包）。
+    // 可空列，存量钱包未绑定，行为不变。
+    version: "20261118_wallet_linked_money_fund",
+    description: "Add Account.linkedFundAccountId + linkedFundCode for wallet→money-fund payment link",
+    apply(db) {
+      if (!tableExists(db, "Account")) return;
+      addColumnIfMissing(db, "Account", "linkedFundAccountId", "TEXT");
+      addColumnIfMissing(db, "Account", "linkedFundCode", "TEXT");
+      db.exec('CREATE INDEX IF NOT EXISTS "Account_linkedFundAccountId_idx" ON "Account"("linkedFundAccountId")');
+    },
+  },
 ];
 
 // 到期日「周年 − 1 天」→ 周年；返回 null 表示不是旧口径。
@@ -3957,6 +4332,34 @@ function ensureMigrationTable(db) {
   db.exec("CREATE TABLE IF NOT EXISTS _mmh_native_schema (version TEXT NOT NULL PRIMARY KEY, appliedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)");
 }
 
+// 谁最后一次写过这个账本。旧版程序读到不认识的迁移时，靠它就能直接说出
+// 「账本由 0.1.86 写入，请升级到 >= 0.1.86」，而不是让用户对着迁移名猜版本。
+// 老账本没有这张表，守卫那边会退回到按迁移批次日期给提示。
+function ensureSchemaMetaTable(db) {
+  db.exec("CREATE TABLE IF NOT EXISTS _mmh_schema_meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL, updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+}
+
+function recordWriterVersion(db) {
+  const version = currentProgramVersion();
+  if (!version) return;
+  try {
+    ensureSchemaMetaTable(db);
+    db.prepare("INSERT INTO _mmh_schema_meta (key, value, updatedAt) VALUES ('writerVersion', ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = CURRENT_TIMESTAMP").run(version);
+  } catch (error) {
+    console.error("MMH 记录写入版本失败（不影响本次启动）：" + (error && error.message ? error.message : String(error)));
+  }
+}
+
+function readWriterVersion(db) {
+  try {
+    const row = db.prepare("SELECT value FROM _mmh_schema_meta WHERE key = 'writerVersion'").get();
+    if (row && row.value) return String(row.value).trim();
+  } catch (error) {
+    // 老账本没有 _mmh_schema_meta，属于正常情况。
+  }
+  return "";
+}
+
 function migrationApplied(db, version) {
   return Boolean(db.prepare("SELECT version FROM _mmh_native_schema WHERE version = ?").get(version));
 }
@@ -3965,17 +4368,112 @@ function markMigrationApplied(db, version) {
   db.prepare("INSERT OR IGNORE INTO _mmh_native_schema (version) VALUES (?)").run(version);
 }
 
+const MIGRATION_INTRODUCED_IN = MIGRATIONS.reduce((map, migration) => {
+  if (migration.introducedIn) map[migration.version] = migration.introducedIn;
+  return map;
+}, {});
+
+function startupDataDir() {
+  const explicit = (process.env.MMH_DATA_DIR || "").trim();
+  if (explicit) return explicit;
+  return path.dirname(databasePathFromUrl(process.env.DATABASE_URL));
+}
+
+function currentProgramVersion() {
+  const fromEnv = (process.env.MMH_APP_VERSION || "").trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const fromFile = fs.readFileSync(path.join(__dirname, "..", ".mmh-version"), "utf8").trim();
+    if (fromFile) return fromFile;
+  } catch (error) {
+    // 没有版本文件不影响提示内容，后面退化成"未知"。
+  }
+  return "";
+}
+
+function describeMigration(version) {
+  const introducedIn = MIGRATION_INTRODUCED_IN[version] || "";
+  const dateMatch = /^(\\d{4})(\\d{2})(\\d{2})_/.exec(version);
+  const dateText = dateMatch ? dateMatch[1] + "-" + dateMatch[2] + "-" + dateMatch[3] : "";
+  if (introducedIn && dateText) return version + "（" + introducedIn + " 引入，批次 " + dateText + "）";
+  if (introducedIn) return version + "（" + introducedIn + " 引入）";
+  if (dateText) return version + "（批次 " + dateText + "）";
+  return version;
+}
+
+function minimumRequiredVersion(unknownVersions) {
+  const parsed = [];
+  for (const version of unknownVersions) {
+    const introducedIn = MIGRATION_INTRODUCED_IN[version];
+    if (!introducedIn) continue;
+    const parts = introducedIn.split(".").map((part) => Number.parseInt(part, 10) || 0);
+    while (parts.length < 3) parts.push(0);
+    parsed.push(parts);
+  }
+  if (!parsed.length) return "";
+  parsed.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
+  return parsed[parsed.length - 1].join(".");
+}
+
+function compareVersions(left, right) {
+  const parse = (value) => String(value || "").split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const a = parse(left);
+  const b = parse(right);
+  const length = Math.max(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const diff = (a[index] || 0) - (b[index] || 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function writeStartupErrorFile(text) {
+  const target = path.join(startupDataDir(), "STARTUP-ERROR.txt");
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, text, "utf8");
+    return target;
+  } catch (error) {
+    return "";
+  }
+}
+
 function assertSchemaNotNewerThanBinary(db) {
   ensureMigrationTable(db);
   const known = new Set(MIGRATIONS.map((migration) => migration.version));
   known.add("0.1.0");
   const recorded = db.prepare("SELECT version FROM _mmh_native_schema").all().map((row) => String(row.version));
   const unknown = recorded.filter((version) => !known.has(version));
-  if (unknown.length > 0) {
-    console.error("MMH refused to start: the SQLite database was migrated by a newer MMH package and contains schema changes this binary does not know (" + unknown.join(", ") + ").");
-    console.error("Refusing to start prevents a downgrade from misreading or overwriting newer data. Install a package of version >= the one that wrote these changes, or restore the database from a backup.");
-    process.exit(78);
+  if (unknown.length === 0) return;
+  const currentVersion = currentProgramVersion();
+  const writerVersion = readWriterVersion(db);
+  const fromMigrations = minimumRequiredVersion(unknown);
+  const required = compareVersions(writerVersion, fromMigrations) >= 0 ? writerVersion : fromMigrations;
+  const upgradeHint = required ? required + " 或更新版本" : "最新版本";
+  const lines = [];
+  lines.push("MMH 未能启动：账本数据库是由更新版本的 MMH 写入的，当前安装的程序版本太旧。");
+  lines.push("");
+  lines.push("当前程序版本：" + (currentVersion || "未知"));
+  lines.push("账本最近写入方：" + (writerVersion || "未记录（老账本）"));
+  lines.push("账本要求版本：" + (required ? required + " 或更新" : "不低于写入该账本的版本"));
+  lines.push("账本里当前程序不认识的数据库变更：");
+  for (const version of unknown) lines.push("  - " + describeMigration(version));
+  lines.push("");
+  lines.push("为什么拒绝启动：旧程序读不懂新结构，继续运行可能误读或覆盖新版写入的数据，所以这里直接停下。账本数据没有被改动。");
+  lines.push("");
+  lines.push("怎么处理：");
+  lines.push("  1. 打开飞牛应用中心，把 MMH 升级到 " + upgradeHint + "，然后点启动；");
+  lines.push("  2. 暂时无法升级时，可从 /vol1/@appdata/mmh-upgrade-backups 里挑一份升级前的 mmh.db，替换 data/mmh.db 后重启应用。");
+  lines.push("");
+  lines.push("查看启动日志：/vol1/@appcenter/mmh/cmd/main log 50");
+  lines.push("生成时间：" + new Date().toISOString());
+  const target = writeStartupErrorFile(lines.join("\\n") + "\\n");
+  console.error("MMH 拒绝启动：账本数据库由更新版本的 MMH 写入（" + unknown.join(", ") + "），当前程序 " + (currentVersion || "未知版本") + " 不认识这些变更。");
+  console.error("拒绝启动是为了避免旧程序误读或覆盖新版数据，账本数据未被改动。请在飞牛应用中心把 MMH 升级到 " + upgradeHint + " 后重试。");
+  if (target) {
+    console.error("原因已写入 " + target + "（中文说明，可直接打开查看）。");
   }
+  process.exit(78);
 }
 
 function applyRuntimeMigrations(db) {
@@ -3996,11 +4494,18 @@ function applyRuntimeMigrations(db) {
 
 const dbPath = databasePathFromUrl(process.env.DATABASE_URL);
 const sqlPath = path.join(__dirname, "..", "prisma", "native-init.sql");
+const verifyOnly = process.argv.includes("--verify-schema");
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
 const db = new Database(dbPath);
 try {
   db.pragma("busy_timeout = 10000");
+  if (verifyOnly) {
+    const anyTable = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get();
+    if (anyTable) assertSchemaNotNewerThanBinary(db);
+    console.log("MMH schema check passed: the payload understands every migration recorded in " + dbPath);
+    process.exit(0);
+  }
   const existing = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get();
   if (!existing) {
     db.exec(fs.readFileSync(sqlPath, "utf8"));
@@ -4008,17 +4513,25 @@ try {
     db.prepare("INSERT OR IGNORE INTO _mmh_native_schema (version) VALUES (?)").run("0.1.0");
     applyRuntimeMigrations(db);
     applyMissingSchemaObjectsFromInitSql(db, sqlPath);
+    recordWriterVersion(db);
     console.log(\`SQLite database initialized at \${dbPath}\`);
   } else {
     assertSchemaNotNewerThanBinary(db);
     applyRuntimeMigrations(db);
     applyMissingSchemaObjectsFromInitSql(db, sqlPath);
+    recordWriterVersion(db);
     console.log(\`SQLite database already initialized and migrated at \${dbPath}\`);
   }
 } finally {
   db.close();
 }
 `);
+  // 启动失败说明页：账本比程序新时它顶在网关 socket / 本地端口上，把中文原因
+  // 直接摊给用户（脚本本身见 scripts/fnos/startup-error-page.cjs）。
+  fs.copyFileSync(
+    path.join(root, "scripts", "fnos", "startup-error-page.cjs"),
+    path.join(stageDir, "app", "server", "scripts", "startup-error-page.cjs"),
+  );
   for (const dependency of [
     "@prisma/client",
     "@prisma/adapter-better-sqlite3",
@@ -4127,6 +4640,7 @@ if (verifyNative.status !== 0) {
 // for the four database dialects this package never uses.
 pruneRuntimeToStandalone(path.join(stageDir, "app", "server"));
 trimForeignPrebuilds(path.join(stageDir, "app", "server"), target.nodeArch);
+pruneSourceMaps(path.join(stageDir, "app", "server"));
 
 // The native smoke test above runs before the prune, so prove the pruned tree
 // still loads the SQLite binding. Cheap (in-memory) and catches a future

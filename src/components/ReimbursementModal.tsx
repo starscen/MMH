@@ -2,7 +2,8 @@
 import { ModalLayer } from "@/components/ModalLayer";
 
 import { useEffect, useMemo, useState } from "react";
-import { Banknote, Check, Link2, Pencil, Plus, Printer, ReceiptText, Trash2 } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { ArrowLeft, Banknote, Check, Link2, Pencil, Plus, Printer, ReceiptText, Trash2, X } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 import { formatAmountDraft, formatMoney, formatMoneyYuan } from "@/lib/format";
 import { todayDateLocalYmd } from "@/lib/date-utils";
@@ -11,6 +12,8 @@ import { DateStepper } from "./DateStepper";
 import { AdvancedDataTable, ROW_ACTION_BUTTON_BOX_CLASS, type AdvancedDataTableColumn } from "@/components/AdvancedDataTable";
 import { reimbursementErrorMessage } from "@/lib/reimbursement-error";
 import { filterReimbursementCandidates } from "@/lib/reimbursement-candidates";
+import { buildAccountDisplayOption } from "@/lib/account-display";
+import { useAccountDisplaySettings } from "@/lib/client/account-display-settings";
 import { ReimbursementDocumentModal } from "@/components/ReimbursementDocumentModal";
 import type { ReimbursementFormEntry, ReimbursementObjectOption } from "@/components/ReimbursementFormModal";
 import { ReimbursementPreview, ReimbursementBatchPrintPortal } from "@/components/ReimbursementPreview";
@@ -89,6 +92,7 @@ export function ReimbursementWorkspace({
 }) {
   const globalMode = !objectId;
   const { t } = useI18n();
+  const router = useRouter();
   const [data, setData] = useState<ReimbursementOverviewData | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -129,6 +133,21 @@ export function ReimbursementWorkspace({
   const [batchApproveDate, setBatchApproveDate] = useState(todayDateLocalYmd());
   const [batchApproveNote, setBatchApproveNote] = useState("");
   const [batchApproveAmounts, setBatchApproveAmounts] = useState<Record<string, string>>({});
+
+  /**
+   * 返回 = 回到这笔报销所属的往来款视图，而不是浏览器后退、也不是关掉工作区。
+   * history.back() 依赖历史栈：新标签页/直接输入地址进入时会把用户退出应用，
+   * 页内换过对象时也只是退回上一个报销 URL。
+   */
+  const backToSettlements = () => {
+    if (busy) return;
+    // 从往来款行的「报销」进入：带 accountId，回到这只往来款账户的页面。
+    const target = advanceAccountId
+      ? `/?view=liability&liabilityPerson=${encodeURIComponent(`account:${advanceAccountId}`)}`
+      : // 侧边栏「费用报销」汇总视角：没有单一关联账户，回到往来款总览。
+        "/?view=liability";
+    router.replace(target);
+  };
 
   const load = async () => {
     setLoading(true);
@@ -806,24 +825,54 @@ export function ReimbursementWorkspace({
     }
   };
 
+  const accountDisplaySettings = useAccountDisplaySettings();
+  const advanceAccountOption = cashAccountOptions.find((option) => option.id === advanceAccountId);
+  const accountHoverTitle = advanceAccountOption
+    ? buildAccountDisplayOption(
+        {
+          id: advanceAccountOption.id,
+          name: accountName,
+          kind: advanceAccountOption.kind ?? "cash",
+          currency: advanceAccountOption.currency ?? null,
+          numberMasked: advanceAccountOption.numberMasked ?? null,
+          Institution: advanceAccountOption.institutionName
+            ? { name: advanceAccountOption.institutionName }
+            : null,
+        },
+        undefined,
+        accountDisplaySettings,
+      ).tableHoverTitle
+    : accountName;
+
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background p-4 md:p-5">
-      <div className="panel-surface flex h-full min-h-0 flex-col overflow-hidden">
-        <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3">
-          <div>
-            <div className="text-sm font-semibold text-slate-800">{t("reimburse.workspaceTitle")}</div>
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent">
+      {/* 与其它视图同一套页面表头（page-header）：标题在左，右上角是「返回至往来款」，
+          不再用工作区自带的标题栏 + 关闭按钮 —— 其它视图都没有「关闭」这种说法。 */}
+      <header className="page-header">
+        <div className="flex min-h-14 flex-wrap items-center justify-between gap-2 px-4 py-2 md:px-5">
+          <div className="flex min-w-0 flex-wrap items-center gap-3 text-sm">
+            <span className="page-title">{t("reimburse.workspaceTitle")}</span>
             {accountName ? (
-              <div className="mt-0.5 flex items-center gap-1 text-xs text-slate-500">
-                <ReceiptText className="h-3.5 w-3.5" />
-                {accountName}
-              </div>
+              <span className="inline-flex min-w-0 items-center gap-1 text-xs text-slate-500">
+                <ReceiptText className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate" title={accountHoverTitle}>{accountName}</span>
+              </span>
             ) : null}
           </div>
-          <button type="button" onClick={() => window.history.back()} className="secondary-button h-8 px-2" disabled={busy}>
-            {t("table.close")}
+          <button
+            type="button"
+            onClick={backToSettlements}
+            className="secondary-button flex h-8 shrink-0 items-center gap-1.5 px-3 text-xs"
+            disabled={busy}
+            title={t("reimburse.backToLiability")}
+          >
+            <ArrowLeft className="h-3.5 w-3.5" />
+            {t("reimburse.backToLiability")}
           </button>
         </div>
+      </header>
 
+      <div className="panel-surface m-4 flex min-h-0 flex-1 flex-col overflow-hidden md:m-5">
         <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden p-4">
           {loadError ? (
             <div className="flex shrink-0 items-center justify-between gap-3 rounded border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs text-rose-700">
@@ -1114,7 +1163,16 @@ export function ReimbursementWorkspace({
           <div className="app-modal-panel max-w-lg">
             <div className="modal-header shrink-0">
               <div className="text-sm font-semibold text-slate-800">{t(editingBatchId ? "reimburse.batch.edit" : "reimburse.batchCreate")}</div>
-              <button type="button" onClick={() => { setShowCreateBatch(false); setEditingBatchId(null); setBatchTitle(""); setBatchNote(""); setBatchStartDate(""); setBatchEndDate(""); }} className="secondary-button h-8 px-2" disabled={busy}>{t("table.close")}</button>
+              <button
+                type="button"
+                onClick={() => { setShowCreateBatch(false); setEditingBatchId(null); setBatchTitle(""); setBatchNote(""); setBatchStartDate(""); setBatchEndDate(""); }}
+                className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
+                disabled={busy}
+                title={t("table.close")}
+                aria-label={t("table.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <div className="space-y-3 p-4">
               {globalMode && !editingBatchId ? (
@@ -1168,8 +1226,8 @@ export function ReimbursementWorkspace({
                 <div className="text-sm font-semibold text-slate-800">{t("reimburse.batch.reimburse")}</div>
                 <div className="mt-0.5 text-xs text-slate-500">{paymentBatch.title}</div>
               </div>
-              <button type="button" onClick={() => setPaymentBatch(null)} className="secondary-button h-8 px-2" disabled={busy}>
-                {t("table.close")}
+              <button title={t("table.close")} aria-label={t("table.close")} type="button" onClick={() => setPaymentBatch(null)} className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0" disabled={busy}>
+                <X className="h-4 w-4" />
               </button>
             </div>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
@@ -1295,7 +1353,16 @@ export function ReimbursementWorkspace({
                 <div className="text-sm font-semibold text-slate-800">{t("reimburse.source.add")}</div>
                 <div className="mt-0.5 text-xs text-slate-500">{linkingReimbursement.title}</div>
               </div>
-              <button type="button" onClick={() => { setLinkingReimbursementId(null); setLinkTransactionIds([]); }} className="secondary-button h-8 px-2" disabled={busy}>{t("table.close")}</button>
+              <button
+                type="button"
+                onClick={() => { setLinkingReimbursementId(null); setLinkTransactionIds([]); }}
+                className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
+                disabled={busy}
+                title={t("table.close")}
+                aria-label={t("table.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
               <section>
@@ -1413,7 +1480,16 @@ export function ReimbursementWorkspace({
                 <div className="text-sm font-semibold text-slate-800">{t("reimburse.document.batchApprove")}</div>
                 <div className="mt-0.5 text-xs text-slate-500">{t("reimburse.table.batchTitle", { title: selectedBatch?.title ?? "" })}</div>
               </div>
-              <button type="button" onClick={() => setBatchApproveOpen(false)} className="secondary-button h-8 px-2" disabled={busy}>{t("table.close")}</button>
+              <button
+                type="button"
+                onClick={() => setBatchApproveOpen(false)}
+                className="secondary-button inline-flex h-8 w-8 shrink-0 items-center justify-center px-0"
+                disabled={busy}
+                title={t("table.close")}
+                aria-label={t("table.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

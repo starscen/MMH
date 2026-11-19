@@ -63,6 +63,10 @@ model Account {
   numberMasked                                               String?
   routeKey                                                   String?                     @unique
   note                                                       String?
+  // 自定义分组标签（2026-11-13 用户裁定）：用户自己起的分类名（如「日常现金」「孩子教育」），
+  // 侧边栏与账户下拉可以按它分组。与 `groupId` → `AccountGroup`（所有人/归属人分组）
+  // 是两个完全不同的概念，不要混用。自由文本、可空；空 = 「未分组」。
+  accountGroup                                               String?
   usageCount                                                 Int                         @default(0)
   lastUsedAt                                                 DateTime?
   householdId                                                String
@@ -78,9 +82,16 @@ model Account {
   tradingCalendar                                            TradingCalendar?
   defaultFundQueryApiId                                      String?
   fundUnitsDecimals                                          Int                         @default(2)
+  // 电子钱包 → 货币基金的支付关联：选中该钱包记账时，可以声明「这笔钱实际来自
+  // 关联的货基份额」，服务端据此生成一笔赎回（份额减、资金腿回钱包）。
+  // 一个钱包只绑一个货基账户；一个货基账户可以被多个钱包绑定。
+  linkedFundAccountId                                        String?
+  linkedFundCode                                             String?
   FundQueryApi                                               FundQueryApi?               @relation(fields: [defaultFundQueryApiId], references: [id], onDelete: SetNull)
   Parent                                                     Account?                    @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
   Children                                                   Account[]                   @relation("AccountHierarchy")
+  LinkedFundAccount                                          Account?                    @relation("AccountLinkedFund", fields: [linkedFundAccountId], references: [id], onDelete: SetNull)
+  LinkedWallets                                              Account[]                   @relation("AccountLinkedFund")
   AccountGroup                                               AccountGroup                @relation(fields: [groupId], references: [id])
   Household                                                  Household                   @relation(fields: [householdId], references: [id])
   Institution                                                Institution?                @relation(fields: [institutionId], references: [id])
@@ -133,6 +144,7 @@ model Account {
   @@index([householdId, loanCategoryId])
   @@index([counterpartyId])
   @@index([parentId])
+  @@index([linkedFundAccountId])
   // 同一父账户下每个币种只能有一个子户（PG/SQLite 都允许多个 NULL，根账户互不冲突）。
   @@unique([parentId, currency])
 }
@@ -360,6 +372,10 @@ model CreditCardInstallmentPlan {
   // fall back to the account billing day / firstStatementMonth.
   billingDay           Int?
   firstPaymentDate     DateTime?
+  // 期供行落库水位：已经落地到第几期。期供行是「到期才落库」的，判重不能只看
+  // 期供行是否还存在（用户能把某一期彻底删除，行没了就会被当成缺失又补一条），
+  // 所以由计划自己记住推进到第几期：materialize 只落 installmentNo > 水位的期。
+  materializedThroughNo Int                            @default(0)
   tagIds               String?
   categoryId           String?
   categoryName         String?
@@ -368,7 +384,9 @@ model CreditCardInstallmentPlan {
   updatedAt            DateTime                        @default(now()) @updatedAt
   Account              Account                         @relation(fields: [accountId], references: [id], onDelete: Cascade)
   Household            Household                       @relation(fields: [householdId], references: [id], onDelete: Cascade)
-  SourceEntry          TxRecord?                       @relation("CreditCardInstallmentSource", fields: [sourceEntryId], references: [id], onDelete: Cascade)
+  // 来源记录被「彻底删除」时只断链，不连坐删计划：期供行是真实已发生的支出，
+  // 不能因为清空回收站里的一条原消费记录就整条计划连同历史各期一起物理消失。
+  SourceEntry          TxRecord?                       @relation("CreditCardInstallmentSource", fields: [sourceEntryId], references: [id], onDelete: SetNull)
   Entries              TxRecord[]                      @relation("CreditCardInstallmentEntries")
 
   @@index([householdId, accountId, status])
@@ -482,6 +500,23 @@ model FundNavCache {
   @@index([navDate])
 }
 
+/// 货币基金「每万份收益」，单位：元/万份。
+/// 货基按面值 1 元/份核算，净值不是变量；真正的收益数据是每日万份收益，必须与
+/// FundNavCache 分开存放——同一列既当净值又当万份收益，会把买入份额放大几千倍。
+model MoneyFundYield {
+  id            String   @id @default(cuid())
+  fundCode      String
+  yieldDate     DateTime
+  incomePer10k  Decimal  @db.Decimal(20, 6) // 每万份收益（元），可为负
+  sevenDayYield Decimal? @db.Decimal(10, 4) // 7 日年化（%），数据源不提供则留空
+  source        String? // eastmoney_history / manual
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @default(now()) @updatedAt
+
+  @@unique([fundCode, yieldDate])
+  @@index([fundCode, yieldDate])
+}
+
 model FundProfile {
   fundCode        String           @id // 6 位基金代码，全局唯一（跨账户、跨账本共享的基金维度）
   fundName        String? // 基金简称
@@ -498,18 +533,23 @@ model FundProfile {
 }
 
 model FundQueryApi {
-  id          String     @id @default(cuid())
-  name        String
-  code        String     @unique
-  baseUrl     String
-  apiKey      String?
-  priority    Int        @default(0)
-  isActive    Boolean    @default(true)
-  householdId String?
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @default(now()) @updatedAt
-  Account     Account[]
-  Household   Household? @relation(fields: [householdId], references: [id])
+  id           String     @id @default(cuid())
+  name         String
+  code         String     @unique
+  baseUrl      String
+  apiKey       String?
+  /// 解析器标识（eastmoney / eastmoney_history / danjuan / alipay / json）。
+  /// 为空时沿用 `code`：2026-11 之前 `code` 本身就是解析器。
+  parser       String?
+  /// 自定义 JSON 源（parser = "json"）的取值配置：字段路径 + 鉴权方式。
+  parserConfig Json?
+  priority     Int        @default(0)
+  isActive     Boolean    @default(true)
+  householdId  String?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @default(now()) @updatedAt
+  Account      Account[]
+  Household    Household? @relation(fields: [householdId], references: [id])
 }
 
 model FundSnapshot {
@@ -990,6 +1030,34 @@ model StockPriceCache {
   @@map("stock_price_cache")
 }
 
+/// 股票收盘价查询源。与 FundQueryApi 同构，但独立成表：基金源被 Account 外键引用，
+/// 混用会让「这条源是给基金还是股票」变成隐含语义，且两边的 parser 完全不同。
+/// 内置的东财 / 腾讯两条以 builtin=true 落库，可调优先级、可停用，不可删除。
+model StockQuoteApi {
+  id           String     @id @default(cuid())
+  name         String
+  code         String     @unique
+  /// 适用市场。当前只有 CN 的实现，其余值留给港股 / 美股接入。
+  market       String     @default("CN")
+  /// 请求地址模板，支持 {code} {exchange} {exchangeLower} {secid} {date} {dateCompact}
+  baseUrl      String
+  apiKey       String?
+  /// 解析器标识（eastmoney_kline / tencent_kline / json）。为空时沿用 code。
+  parser       String?
+  /// 自定义 JSON 源（parser = "json"）的取值配置：字段路径 + 鉴权方式。
+  parserConfig Json?
+  priority     Int        @default(0)
+  isActive     Boolean    @default(true)
+  /// 代码内置的默认源：可停用、可调序，不可删除；整表为空时由查询侧自愈补齐。
+  builtin      Boolean    @default(false)
+  householdId  String?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @default(now()) @updatedAt
+
+  @@index([market, isActive, priority])
+  @@map("stock_quote_apis")
+}
+
 model StockFeeRule {
   id            String              @id @default(cuid())
   accountId     String
@@ -1075,9 +1143,19 @@ model PropertyAsset {
   attributes            Json?
   currency              String                @default("CNY")
   purchaseDate          DateTime?
+  productionDate        DateTime?
+  weight                Decimal?              @db.Decimal(18, 3)
+  weightUnit            String?
   purchasePrice         Decimal?              @db.Decimal(18, 2)
   cost                  Decimal               @default(0) @db.Decimal(18, 2)
   marketValue           Decimal               @default(0) @db.Decimal(18, 2)
+  // 折旧（2026-11-15）：none = 累计折旧/折损由用户手填；straight_line = 按 purchaseDate
+  // 到当前日期的整月数直线推算，accumulatedDepreciation 这时只表示「额外折损/减值」。
+  // 口径实现在 src/lib/fixed-asset-depreciation.ts，别在别处另算。
+  depreciationMethod    String                @default("none")
+  usefulLifeMonths      Int?
+  salvageValue          Decimal               @default(0) @db.Decimal(18, 2)
+  accumulatedDepreciation Decimal             @default(0) @db.Decimal(18, 2)
   latestValuationDate   DateTime?
   status                String                @default("active")
   note                  String?
@@ -1089,6 +1167,7 @@ model PropertyAsset {
   MortgageLoanAccount   Account?              @relation("MortgageLoanAccountToPropertyAsset", fields: [mortgageLoanAccountId], references: [id], onDelete: SetNull)
   Valuations            PropertyValuation[]
   Transactions          PropertyTransaction[]
+  Depreciations         PropertyAssetDepreciation[]
 
   @@index([householdId, accountId])
   @@index([householdId, mortgageLoanAccountId])
@@ -1114,6 +1193,49 @@ model PropertyValuation {
   @@index([householdId, valuationDate])
   @@index([propertyAssetId, valuationDate])
   @@map("property_valuations")
+}
+
+/// 固定资产折旧台账（2026-11-18 用户裁定）。
+///
+/// 两种来源共用一张表，靠 `method` 区分：
+/// - `straight_line`：设定直线法后系统按**月**自动生成：金额恒定 =
+///   （成本 − 残值）÷ 折旧月数，从购入月起补记到当前月；年折旧率 = 1/年限
+///   （10 年报废 = 每年 10%）。
+/// - `manual`：用户手工登记的折损 / 减值（一次性折完也走这里：登记一笔全额）。
+///   手工记录的 `periodMonth` 存**所属月最后一天**，这样同一月既有自动计提又有
+///   手工登记时不会撞 @@unique(propertyAssetId, periodMonth)；展示仍按 YYYY-MM。
+///   手工合计同步到 PropertyAsset.accumulatedDepreciation（none 模式它就是累计折旧，
+///   straight_line 模式下它就是「额外折损」）。
+///
+/// 处置/售出时以台账定格：自动部分取 straight_line 累计，手工部分取资产字段。
+///
+/// 折旧是**账面价值减少**，不是现金支出：本表不产生 TxRecord、不改账户余额、
+/// 不进收支报表。口径实现见 src/lib/fixed-asset-depreciation.ts 与
+/// src/lib/server/property-depreciation.ts。
+model PropertyAssetDepreciation {
+  id                String        @id @default(cuid())
+  householdId       String
+  propertyAssetId   String
+  /// 计提所属月：自动记录 = 该月 1 日、手工记录 = 该月最后一天（均 UTC 零点，date-only 契约）。
+  periodMonth       DateTime
+  /// 本期折旧额。
+  amount            Decimal       @db.Decimal(18, 2)
+  /// 计提后的累计折旧（自动部分封顶可折旧基数；手工部分封顶成本）。
+  accumulatedAfter  Decimal       @db.Decimal(18, 2)
+  /// 计提时冻结的口径快照，便于审计（成本 / 残值 / 折旧月数）。
+  basisCost         Decimal       @db.Decimal(18, 2)
+  basisSalvage      Decimal       @db.Decimal(18, 2)
+  basisMonths       Int
+  method            String        @default("straight_line")
+  /// 手工登记时的说明（自动计提为空）。
+  note              String?
+  createdAt         DateTime      @default(now())
+  Household         Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  PropertyAsset     PropertyAsset @relation(fields: [propertyAssetId], references: [id], onDelete: Cascade)
+
+  @@unique([propertyAssetId, periodMonth])
+  @@index([householdId, periodMonth])
+  @@map("property_asset_depreciations")
 }
 
 model PropertyTransaction {
@@ -1225,6 +1347,7 @@ model Household {
   StockTransaction          StockTransaction[]
   StockMarketFeeRule        StockMarketFeeRule[]
   PropertyAsset             PropertyAsset[]
+  PropertyAssetDepreciation PropertyAssetDepreciation[]
   PropertyValuation         PropertyValuation[]
   PropertyTransaction       PropertyTransaction[]
   EntryBusinessLink         EntryBusinessLink[]
@@ -1278,6 +1401,10 @@ model HouseholdPreference {
   displayLanguage                   String          @default("zh-CN")
   dateDisplayFormat                 String          @default("yyyy-mm-dd")
   sidebarGroupBy                    String          @default("kind")
+  // 账户下拉的分组维度（2026-11-13）：owner（按所有人，默认 / 历史行为）|
+  // accountGroup（按账户自定义分组标签）| institution（按机构）。
+  // 与 sidebarGroupBy 是两套独立设置：下拉表头原本固定按所有人，侧边栏则是 类型/机构。
+  accountDropdownGroupBy            String          @default("owner")
   sidebarHideZero                   Boolean         @default(false)
   sidebarHideInitialData            Boolean         @default(false)
   sidebarShowFixedAssets            Boolean         @default(true)
@@ -1292,6 +1419,11 @@ model HouseholdPreference {
   accountDropdownRestrictType       Boolean         @default(true)
   /// 侧边栏 / 账户下拉是否按最近一个月的记账频率排序；关闭后保持账户原始顺序。
   accountUsageSortEnabled           Boolean         @default(true)
+  /// 逆回购占款天数口径（决定预计利息怎么算）：
+  /// actual      = 成交日 → 回款日的自然日差，与券商实付一致（周五做 1 天期 = 3 天）；
+  /// term        = 只按品种期限，顺延回款不加天（1 天期永远 1 天）；
+  /// arrival_gap = 品种期限 + 回款日之后到下个交易日的休市天数（回款日落在周五则 +2）。
+  repoOccupiedDaysMode              String          @default("actual")
   createdAt                         DateTime        @default(now())
   updatedAt                         DateTime        @default(now()) @updatedAt
 
@@ -1492,7 +1624,12 @@ model PreciousMetalHolding {
   quantity          Decimal           @default(0) @db.Decimal(20, 6)
   avgCost           Decimal           @default(0) @db.Decimal(20, 6)
   cost              Decimal           @default(0) @db.Decimal(18, 2)
+  /// 最后一笔成交单价（recalc 时按交易回放写入，不是行情）。
   unitPrice         Decimal?          @db.Decimal(20, 6)
+  /// 行情最新单价（按 metalUnitId 计价）+ 行情日期 + 数据源，手动/自动刷新写入。
+  latestPrice       Decimal?          @db.Decimal(20, 6)
+  latestPriceDate   DateTime?
+  priceSource       String?
   marketValue       Decimal           @default(0) @db.Decimal(18, 2)
   historicalProfit  Decimal           @default(0) @db.Decimal(18, 2)
   householdId       String
@@ -2355,6 +2492,7 @@ enum StockTransactionAction {
   merge_share
   fee_adjustment
   tax_adjustment
+  tax_refund
 }
 
 enum StockFeeType {

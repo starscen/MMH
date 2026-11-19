@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { ChevronDown, ChevronRight } from "lucide-react";
 
 import { renderAccountLabel } from "@/lib/account-display";
@@ -47,6 +48,9 @@ type HoldingRow = GroupedRow & {
   label: string;
   subLabel: string;
   title: string;
+  /** 明细行的基金身份，用于跳到该基金的持仓/交易明细；分组行没有。 */
+  accountId?: string;
+  fundCode?: string;
   accountLabel: string;
   accountTitle: string;
   units: number;
@@ -66,6 +70,8 @@ type ClearedRow = GroupedRow & {
   label: string;
   subLabel: string;
   title: string;
+  accountId?: string;
+  fundCode?: string;
   accountLabel: string;
   accountTitle: string;
   firstBuyDate: string;
@@ -221,6 +227,7 @@ function useExpandableGroups<T extends GroupedRow>(groups: RowGroup<T>[]) {
 export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMode }: Props) {
   const currency = rows[0]?.currency || clearedRows[0]?.currency || "CNY";
   const { t } = useI18n();
+  const router = useRouter();
 
   const groupByCompany = groupMode === "company";
   const unclassified = t("fundHoldingReport.unclassifiedCompany");
@@ -280,6 +287,8 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
         label: row.fundName,
         subLabel: row.fundCode && row.fundCode !== row.fundName ? row.fundCode : "",
         title: `${row.fundName}${row.fundCode ? ` ${row.fundCode}` : ""}`,
+        accountId: row.accountId,
+        fundCode: row.fundCode,
         accountLabel: groupByCompany ? accountText(row) : "",
         accountTitle: groupByCompany ? accountHover(row) : "",
         units: row.units,
@@ -341,6 +350,8 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
         label: row.fundName,
         subLabel: row.fundCode && row.fundCode !== row.fundName ? row.fundCode : "",
         title: `${row.fundName}${row.fundCode ? ` ${row.fundCode}` : ""}`,
+        accountId: row.accountId,
+        fundCode: row.fundCode,
         accountLabel: groupByCompany ? accountText(row) : "",
         accountTitle: groupByCompany ? accountHover(row) : "",
         firstBuyDate: row.firstBuyDate,
@@ -358,6 +369,18 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
 
   const holdings = useExpandableGroups(holdingGroups);
   const cleared = useExpandableGroups(clearedGroups);
+
+  // 基金统计表的明细行 = 某个账户里的某一只基金，点行直接进入该基金的持仓/交易明细。
+  // 分组行（按账户或按基金公司汇总）没有单一基金身份，保持不可点。
+  const detailHref = useCallback((row: HoldingRow | ClearedRow) => (
+    row.accountId && row.fundCode
+      ? `/funds/${encodeURIComponent(row.accountId)}/${encodeURIComponent(row.fundCode)}`
+      : null
+  ), []);
+  const openFundDetail = useCallback((row: HoldingRow | ClearedRow) => {
+    const href = detailHref(row);
+    if (href) router.push(href);
+  }, [detailHref, router]);
 
   const expandToggle = (isOpen: boolean, groupId: string, onToggle: (groupId: string) => void) => (
     <button
@@ -677,6 +700,31 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
         ))}
       </div>
 
+      {/* 货基与开放式基金口径不同：前者市值 = 份额 × 1、收益靠份额结转，后者靠净值。 */}
+      <div className="grid shrink-0 grid-cols-1 gap-3 md:grid-cols-2">
+        {[
+          { key: "open", labelKey: "fundHoldingReport.bucket.openFund", bucket: totals.openFund },
+          { key: "money", labelKey: "fundHoldingReport.bucket.moneyFund", bucket: totals.moneyFund },
+        ].map((item) => (
+          <div key={item.key} className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-medium text-slate-600">{t(item.labelKey)}</span>
+              <span className="text-[10px] text-slate-400">
+                {item.bucket.holdingCount} {t("fundHoldingReport.bucket.countUnit")}
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between gap-3 text-xs tabular-nums">
+              <span className="text-slate-500">
+                {t("fundHoldingReport.bucket.marketValue")} {formatCurrencyMoney(item.bucket.marketValue, currency)}
+              </span>
+              <span className={valueClass(item.bucket.totalProfit, isRedUp)}>
+                {t("fundHoldingReport.bucket.profit")} {signedMoney(item.bucket.totalProfit, currency)}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-slate-200 bg-white">
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-slate-100 px-3 py-2">
           <div className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-800">{t("fundHoldingReport.holdingsTitle")}</div>
@@ -730,7 +778,11 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
                   </span>
                 </button>
                 {open ? group.details.map((row) => (
-                  <div key={row.id} className="bg-slate-50/60 px-3 pb-2.5 pl-9 pt-1">
+                  <a
+                    key={row.id}
+                    href={detailHref(row) ?? undefined}
+                    className="block bg-slate-50/60 px-3 pb-2.5 pl-9 pt-1 active:bg-blue-50/60"
+                  >
                     <div className="flex items-center justify-between gap-2">
                       <span className="min-w-0 truncate text-sm text-slate-800" title={row.title}>
                         {row.label}
@@ -749,7 +801,7 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
                       <MobileMetric label={t("fundHoldingReport.colRealized")} value={signedMoney(row.historicalProfit, row.currency)} className={valueClass(row.historicalProfit, isRedUp)} />
                       <MobileMetric label={t("fundHoldingReport.colTotalPnL")} value={signedMoney(row.totalProfit, row.currency)} className={valueClass(row.totalProfit, isRedUp)} />
                     </div>
-                  </div>
+                  </a>
                 )) : null}
               </div>
             );
@@ -770,7 +822,8 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
             columns={holdingColumns}
             rows={holdings.flatRows}
             rowKey={(row) => row.id}
-            rowClassName={(row) => (row.isGroup ? "" : "bg-slate-50/60")}
+            rowClassName={(row) => (row.isGroup ? "" : detailHref(row) ? "bg-slate-50/60 cursor-pointer hover:bg-blue-50/60" : "bg-slate-50/60")}
+            onRowClick={(row) => { if (!row.isGroup) openFundDetail(row); }}
             emptyText={t("fundHoldingReport.empty")}
             minTableWidth={1280}
             showFilters={false}
@@ -826,7 +879,11 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
                   </span>
                 </button>
                 {open ? group.details.map((row) => (
-                  <div key={row.id} className="bg-slate-50/60 px-3 pb-2.5 pl-9 pt-1">
+                  <a
+                    key={row.id}
+                    href={detailHref(row) ?? undefined}
+                    className="block bg-slate-50/60 px-3 pb-2.5 pl-9 pt-1 active:bg-blue-50/60"
+                  >
                     <div className="flex items-center justify-between gap-2">
                       <span className="min-w-0 truncate text-sm text-slate-800" title={row.title}>
                         {row.label}
@@ -846,7 +903,7 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
                       <MobileMetric label={t("fundHoldingReport.colRedeemAmount")} value={formatCurrencyMoney(row.totalRedeemAmount, row.currency)} />
                       <MobileMetric label={t("fundHoldingReport.colReturnRate")} value={formatPercent(row.returnRate)} className={valueClass(row.returnRate, isRedUp)} />
                     </div>
-                  </div>
+                  </a>
                 )) : null}
               </div>
             );
@@ -864,7 +921,8 @@ export function FundHoldingReport({ rows, clearedRows, totals, isRedUp, groupMod
             columns={clearedColumns}
             rows={cleared.flatRows}
             rowKey={(row) => row.id}
-            rowClassName={(row) => (row.isGroup ? "" : "bg-slate-50/60")}
+            rowClassName={(row) => (row.isGroup ? "" : detailHref(row) ? "bg-slate-50/60 cursor-pointer hover:bg-blue-50/60" : "bg-slate-50/60")}
+            onRowClick={(row) => { if (!row.isGroup) openFundDetail(row); }}
             emptyText={t("fundHoldingReport.noCleared")}
             minTableWidth={1080}
             showFilters={false}

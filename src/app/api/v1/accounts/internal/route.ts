@@ -6,8 +6,11 @@ import { computeInvestBalances } from "@/lib/invest-balance";
 import { computeInsuranceAccountDisplayBalances } from "@/lib/insurance/balance";
 import { getMaintainedAccountBalances } from "@/lib/server/account-balance";
 import { computeLiabilityDisplaySummary } from "@/lib/server/liability-display-summary";
-import { isDepositAccount, isPureInvestmentAccount } from "@/lib/account-kind-utils";
-import { creditCardDisplayBalanceFromCurrentCycle } from "@/lib/credit/billing";
+import { isDepositAccount, isLinkedFundWalletAccount, isPureInvestmentAccount } from "@/lib/account-kind-utils";
+import {
+  loadCreditCardBillGroupBalances,
+  sumCreditBalancesByBillGroup,
+} from "@/lib/server/credit-card-display-balance";
 import { buildAccountDisplayOption, type AccountLabelField, type AccountRenderSettings, accountRenderSettings } from "@/lib/account-display";
 import { getServerAccountLabelFields } from "@/lib/server/account-label-fields";
 import { convertCurrencyAmounts, getHouseholdBaseCurrency } from "@/lib/server/fx-rates";
@@ -134,19 +137,9 @@ export async function GET(request: Request) {
     const creditIds = accounts
       .filter((account) => account.kind === AccountKind.bank_credit)
       .map((account) => account.id);
-    const currentCreditCycles =
-      creditIds.length > 0
-        ? await prisma.creditCardCycle.findMany({
-            where: { accountId: { in: creditIds }, isCurrentCycle: true },
-            select: { accountId: true, effectiveBill: true, cumulativeRemain: true, cumulativeOverpaid: true },
-          })
-        : [];
-    const currentCreditBalanceByAccountId = new Map(
-      currentCreditCycles.map((cycle) => [
-        cycle.accountId,
-        creditCardDisplayBalanceFromCurrentCycle(cycle),
-      ]),
-    );
+    const creditBillGroup = await loadCreditCardBillGroupBalances(creditIds);
+    const currentCreditBalanceByAccountId = creditBillGroup.balanceByAccountId;
+    const creditBillStorageIdByAccountId = creditBillGroup.billStorageIdByAccountId;
     const insuranceAccountIds = accounts
       .filter((account) => account.kind === AccountKind.insurance)
       .map((account) => account.id);
@@ -156,6 +149,9 @@ export async function GET(request: Request) {
     );
     const liabilityDisplaySummary = await computeLiabilityDisplaySummary(ctx);
     const enrichedAccounts = accounts.map((a) => {
+      // 关联了货币基金的电子钱包不统计余额（2026-11-18 用户裁定）：钱以货基份额持有，
+      // 再叠一次钱包余额就是双计。父户也一并归零，免得按存储的旧折叠值露出来。
+      if (isLinkedFundWalletAccount(a)) return { ...a, balance: 0 };
       // 聚合账户（父账户）没有明细，按明细折叠会被算成 0；它的 `balance`
       // 已经是子户折本位币之和，直接用列值。
       if (a.isAggregate) return a;
@@ -171,8 +167,14 @@ export async function GET(request: Request) {
         return displayBalance == null ? a : { ...a, balance: displayBalance };
       }
       if (a.kind === AccountKind.bank_credit) {
+        // 合并账单组内每张卡都返回同一份账单余额；`creditBillStorageId` 让客户端
+        // 汇总时按账单组去重（组内 N 张卡只算一次）。
         const creditDisplayBalance = currentCreditBalanceByAccountId.get(a.id);
-        if (creditDisplayBalance != null) return { ...a, balance: creditDisplayBalance };
+        return {
+          ...a,
+          balance: creditDisplayBalance ?? a.balance,
+          creditBillStorageId: creditBillStorageIdByAccountId.get(a.id) ?? a.id,
+        };
       }
       if (a.kind === AccountKind.loan || a.kind === AccountKind.settlement) {
         const liabilityDisplayBalance = liabilityDisplaySummary.balanceByAccountId.get(a.id);
@@ -207,9 +209,12 @@ export async function GET(request: Request) {
 
     // 总额只统计根账户：多币种子账户已被父账户折算代表，再计入就是双计
     // （2026-10-18 用户裁定）。父账户余额本身是「子户折本位币之和」。
-    const totalConvertedBalance = convertedAccounts.reduce(
-      (sum, account) => (account.parentId || account.convertedBalance == null ? sum : sum + account.convertedBalance),
-      0,
+    // 合并账单组内每张卡余额相同，只计一次，否则负债会算成「卡张数 × 账单」。
+    const totalConvertedBalance = sumCreditBalancesByBillGroup(
+      convertedAccounts
+        .filter((account) => !account.parentId && account.convertedBalance != null)
+        .map((account) => ({ accountId: account.id, amount: account.convertedBalance as number })),
+      creditBillStorageIdByAccountId,
     );
 
     return NextResponse.json({

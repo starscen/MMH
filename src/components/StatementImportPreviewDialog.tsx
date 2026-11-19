@@ -48,9 +48,12 @@ import { statementPreviewCategorySyncKey } from "@/lib/statement/preview-categor
 import { resolveWechatTransferGuard, wechatTransferBlockMessage } from "@/lib/statement/wechat-transfer-guard";
 import { suggestTransferCounterAccountName } from "@/lib/statement/transfer-counter-account";
 import { uniqueStatementInfoTexts } from "@/lib/statement/preview-meta";
+import { compareCreditCardProfile, type CreditCardProfileMismatch } from "@/lib/statement/credit-card-summary";
 import { systemCategoryLabel } from "@/lib/system-category-labels";
 import { useI18n } from "@/lib/i18n";
 import { readAccountDisplaySettings, useAccountDisplaySettings } from "@/lib/client/account-display-settings";
+import { guardStatementDuplicateImport } from "@/lib/client/statement-import-duplicates";
+import { getAccountDropdownGroupByPreference } from "@/lib/client/appPreferences";
 
 type BookAccount = {
   id: string;
@@ -76,6 +79,10 @@ type BookAccount = {
   AccountAlias?: Array<{ alias: string }> | null;
   /** 结算/贷款账户挂的往来对象：泛名「往来款」账户靠它区分「X的往来款」属于谁。 */
   Counterparty?: { id?: string | null; name?: string | null; shortName?: string | null } | null;
+  /** 信用卡档案：账单里识别出的账单日/还款日/额度与它不一致时给用户提示。 */
+  billingDay?: number | null;
+  repaymentDay?: number | null;
+  creditLimit?: number | null;
 };
 
 type BookCategory = SettingsCategory;
@@ -456,6 +463,11 @@ function findPreviewAccount(
   return null;
 }
 
+/** 账单日/还款日按「日」显示，额度按金额显示，避免同一句里出现 76000 这种裸数字。 */
+function creditProfileValueText(field: CreditCardProfileMismatch["field"], value: number) {
+  return field === "creditLimit" ? value.toFixed(2) : String(Math.round(value));
+}
+
 function canonicalizePreviewAccountValue(
   value: string | undefined | null,
   lookup: PreviewAccountLookup | null,
@@ -641,17 +653,19 @@ export function StatementImportPreviewDialog({
     [],
   );
 
-  // 匹配与选择只针对启用账户：停用账户不该进入导入候选（与 batch-import 页口径一致），
-  // 否则会虚增"账户中有N个"的 ambiguous 数量。
-  const activeBookAccounts = useMemo(
-    () => bookAccounts.filter((account) => account.isActive !== false),
-    [bookAccounts],
-  );
+  // 停用账户也要能匹配（2026-11-18 用户裁定「停用不要阻止匹配」）：历史账单里的老卡
+  // 大多已经停用，挡掉它们只会让这些行落到「新建账户」，凭空多出一张同名卡。
+  // matcher 里用「启用优先」兜住歧义（有启用候选时只在启用账户里定案），
+  // 所以这里可以放心把全部账户交给它；下拉同样列全，排序把启用账户放前面。
   const accountDisplayOptions = useMemo(
-    () => activeBookAccounts
-      .map((account) => buildBookAccountDisplayOption(account, accountDisplaySettings))
-      .sort((a, b) => a.selectorLabel.localeCompare(b.selectorLabel, "zh-Hans-CN")),
-    [accountDisplaySettings, activeBookAccounts],
+    () => bookAccounts
+      .map((account) => ({ account, option: buildBookAccountDisplayOption(account, accountDisplaySettings) }))
+      .sort((a, b) => {
+        const activeDiff = Number(b.account.isActive !== false) - Number(a.account.isActive !== false);
+        return activeDiff !== 0 ? activeDiff : a.option.selectorLabel.localeCompare(b.option.selectorLabel, "zh-Hans-CN");
+      })
+      .map((entry) => entry.option),
+    [accountDisplaySettings, bookAccounts],
   );
   const accountDisplayById = useMemo(
     () => new Map(accountDisplayOptions.map((account) => [account.id, account])),
@@ -674,7 +688,7 @@ export function StatementImportPreviewDialog({
     const owners = Array.from(
       new Set([
         ...bookAccountGroups.map((group) => group.name?.trim() ?? ""),
-        ...activeBookAccounts.flatMap((account) => ownerNamesFromAccountGroup(account.AccountGroup)),
+        ...bookAccounts.flatMap((account) => ownerNamesFromAccountGroup(account.AccountGroup)),
       ]),
     )
       .filter((name) => Boolean(name) && !PLACEHOLDER_OWNER_NAMES.has(name))
@@ -684,7 +698,7 @@ export function StatementImportPreviewDialog({
     // 文件名只写了账户名（「朝朝宝交易流水.xlsx」）时，用账户反推所有人；
     // 只有该账户名在账本里唯一属于一个人时才采信，否则仍是歧义。
     const ownersByAccountName = new Map<string, Set<string>>();
-    for (const account of activeBookAccounts) {
+    for (const account of bookAccounts) {
       const name = account.name?.trim() ?? "";
       const owner = account.AccountGroup?.name?.trim() ?? "";
       if (!name || !owner || PLACEHOLDER_OWNER_NAMES.has(owner)) continue;
@@ -696,21 +710,21 @@ export function StatementImportPreviewDialog({
     const hit = byAccountName.find(([name]) => fileName.includes(name));
     if (hit && hit[1].size === 1) return [...hit[1]][0];
     return "";
-  }, [activeBookAccounts, bookAccountGroups, bookAccounts, sourceAccountId, sourceFileName, sourceOwnerName]);
+  }, [bookAccountGroups, bookAccounts, sourceAccountId, sourceFileName, sourceOwnerName]);
   const accountLookup = useMemo<PreviewAccountLookup | null>(
     () => {
       if (!settingsBootstrapLoaded) return null;
-      const matchAccount = createImportAccountMatcher(activeBookAccounts, { ownerName: contextOwnerName });
+      const matchAccount = createImportAccountMatcher(bookAccounts, { ownerName: contextOwnerName });
       // 「所有人」的写法 = 分组名 + 配对家庭成员的姓名与简称（2026-11-05 用户口径）。
       // 「墨的零钱」要和「墨斗鱼的零钱」解析出同一个所有人，否则会被当成新账户。
       const ownerNames = Array.from(
         new Set([
           ...bookAccountGroups.map((group) => group.name).filter(Boolean),
-          ...activeBookAccounts.flatMap((account) => ownerNamesFromAccountGroup(account.AccountGroup)),
+          ...bookAccounts.flatMap((account) => ownerNamesFromAccountGroup(account.AccountGroup)),
         ]),
       );
       return {
-        accountById: new Map(activeBookAccounts.map((account) => [account.id, account])),
+        accountById: new Map(bookAccounts.map((account) => [account.id, account])),
         resolveAccount: (accountName) => matchAccount(accountName).account,
         matchAccount,
         ownerNames,
@@ -724,7 +738,7 @@ export function StatementImportPreviewDialog({
         },
       };
     },
-    [bookAccountGroups, activeBookAccounts, bookCounterparties, contextOwnerName, settingsBootstrapLoaded],
+    [bookAccountGroups, bookAccounts, bookCounterparties, contextOwnerName, settingsBootstrapLoaded],
   );
   const accountResolveCacheRef = useRef(new Map<string, string>());
   useEffect(() => {
@@ -735,7 +749,7 @@ export function StatementImportPreviewDialog({
     [createLiabilityAccounts, forceCreateOwnedMoneyAccounts],
   );
   const accountSmartSelectOptions = useMemo(
-    () => buildGroupedAccountOptions(accountDisplayOptions),
+    () => buildGroupedAccountOptions(accountDisplayOptions, getAccountDropdownGroupByPreference()),
     [accountDisplayOptions],
   );
   const {
@@ -776,6 +790,33 @@ export function StatementImportPreviewDialog({
       : ""),
     [statementInfoTexts, t],
   );
+  // 账单里的账单日/还款日/额度与账本账户档案不一致时提醒（账本没配的字段不算误差：
+  // 导入时会按账单补上；真正对不上说明要么账户挑错了，要么账户档案过时了）。
+  const statementProfileNotice = useMemo(() => {
+    if (!accountLookup) return "";
+    const meta = rows.find(({ item }) => {
+      const value = item._meta;
+      return Boolean(
+        value
+        && (value.billingDay !== undefined || value.repaymentDay !== undefined || value.creditLimit !== undefined),
+      );
+    })?.item._meta;
+    if (!meta) return "";
+    const accounts = rows
+      .flatMap(({ item }) => [item.account, item.fromAccount, item.toAccount])
+      .map((value) => findPreviewAccount(value, accountLookup, meta))
+      .filter((account): account is BookAccount => Boolean(account));
+    const account = accounts.find((entry) => entry.kind === "bank_credit") ?? accounts[0];
+    const mismatches = compareCreditCardProfile(meta, account);
+    if (mismatches.length === 0) return "";
+    const details = mismatches
+      .map((mismatch) => t(`statementImportPreview.profileMismatch.${mismatch.field}`, {
+        statement: creditProfileValueText(mismatch.field, mismatch.statementValue),
+        account: creditProfileValueText(mismatch.field, mismatch.accountValue),
+      }))
+      .join(" / ");
+    return t("statementImportPreview.profileMismatch", { details });
+  }, [accountLookup, rows, t]);
 
   useEffect(() => {
     if (!open) return;
@@ -1298,8 +1339,19 @@ export function StatementImportPreviewDialog({
 
   function recomputeState(nextRows: ImportPreviewRow[]) {
     const rowKeys = new Set(nextRows.map((row) => row.key));
+    // 用户改动资料（补账户 / 分类 / 改金额类型等）让某行从「不可导入」变成「可导入」时，
+    // 自动勾上这一行：用户已经把缺的东西补齐了，还要再手动点一次勾选没有道理。
+    // 只增不减：本来就缺资料的行、被用户手动取消勾选的好行都不在这里动。
+    const readyBefore = new Set(rowsRef.current.filter((row) => row.ready).map((row) => row.key));
+    const newlyReadyKeys = nextRows
+      .filter((row) => row.ready && !readyBefore.has(row.key))
+      .map((row) => row.key);
     setRows(nextRows);
-    setSelectedKeys((current) => new Set(Array.from(current).filter((key) => rowKeys.has(key))));
+    setSelectedKeys((current) => {
+      const next = new Set(Array.from(current).filter((key) => rowKeys.has(key)));
+      for (const key of newlyReadyKeys) next.add(key);
+      return next;
+    });
   }
 
   function updatePreviewRow(rowKey: string, patch: Partial<StatementImportPreviewItem>) {
@@ -1412,6 +1464,14 @@ export function StatementImportPreviewDialog({
     if (selectedRows.length === 0) return;
     const selectedItems = selectedRows.map((row) => previewItemForImport(row.item));
     if (selectedItems.length === 0) return;
+    // 唯一判重出口：所有入口（明细页 Excel、设置页邮件、邮件自动导入、AI 助手、批量导入页）
+    // 都在这里，按「日期 + 交易身份」整组比对笔数与金额；必须在宿主分批提交**之前**问，
+    // 否则每批只有一部分行，笔数永远对不上。
+    const duplicateChoice = await guardStatementDuplicateImport(
+      selectedItems as unknown as Array<Record<string, unknown>>,
+      t,
+    );
+    if (duplicateChoice === "cancel") return;
     await onConfirm(selectedItems, {
       createLiabilityAccounts,
       forceCreateOwnedMoneyAccounts,
@@ -1907,7 +1967,6 @@ export function StatementImportPreviewDialog({
           description={description}
           onClose={closeDialog}
           closeDisabled={busy}
-          closeLabel={t("table.close")}
         />
         {/* FT 卡片：页签条流内撑出卡片顶边，活动页签的 -mb-px 压在卡片 1px 上边框上
             （几何同 FolderTabsCard；弹窗是固定高度，故用 ft-card-surface-fill）。 */}
@@ -1921,6 +1980,17 @@ export function StatementImportPreviewDialog({
                 {statementInfoText ? (
                   <div className="shrink-0 truncate border-b border-slate-100 px-4 py-2 text-xs leading-4 text-slate-500" title={statementInfoText}>
                     {statementInfoText}
+                  </div>
+                ) : null}
+                {/* 账单与账户档案不一致（账单日/还款日/额度）：单独一行提醒，不挡住上面的账单信息。 */}
+                {statementProfileNotice ? (
+                  <div
+                    className="shrink-0 truncate border-b border-amber-100 bg-amber-50 px-4 py-2 text-xs leading-4 text-amber-700"
+                    title={statementProfileNotice}
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {statementProfileNotice}
                   </div>
                 ) : null}
 
