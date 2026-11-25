@@ -16,6 +16,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -33,14 +35,12 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -48,6 +48,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -61,9 +62,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.mmh.app.data.remote.dto.AccountListRowDto
+import com.mmh.app.data.remote.dto.CreditAccountRowDto
 import com.mmh.app.ui.util.formatAccountDisplayName
 import com.mmh.app.ui.util.formatAmount
 import kotlin.math.abs
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -74,6 +77,77 @@ fun AccountsScreen(
     val uiState by viewModel.uiState.collectAsState()
     val expandedMap = remember { mutableStateMapOf<String, Boolean>() }
     var hideZeroBalance by rememberSaveable { mutableStateOf(true) }
+
+    val titles = listOf("资金账户", "信用卡账户")
+    val pagerState = rememberPagerState(pageCount = { titles.size })
+    val scope = rememberCoroutineScope()
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        TabRow(
+            selectedTabIndex = pagerState.currentPage,
+            containerColor = MaterialTheme.colorScheme.background,
+            contentColor = MaterialTheme.colorScheme.primary
+        ) {
+            titles.forEachIndexed { index, title ->
+                Tab(
+                    selected = pagerState.currentPage == index,
+                    onClick = { scope.launch { pagerState.animateScrollToPage(index) } },
+                    text = {
+                        Text(
+                            text = title,
+                            fontSize = 14.sp,
+                            fontWeight = if (pagerState.currentPage == index) FontWeight.SemiBold else FontWeight.Medium,
+                            color = if (pagerState.currentPage == index) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                        )
+                    }
+                )
+            }
+        }
+
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+        ) { page ->
+            when (page) {
+                0 -> FundAccountsPage(
+                    uiState = uiState,
+                    expandedMap = expandedMap,
+                    hideZeroBalance = hideZeroBalance,
+                    onToggleHideZero = { hideZeroBalance = it },
+                    onAccountClick = onAccountClick,
+                    onRetry = { viewModel.loadAccounts() }
+                )
+
+                1 -> CreditAccountsPage(
+                    uiState = uiState,
+                    onAccountClick = onAccountClick,
+                    onRetry = { viewModel.loadAccounts() }
+                )
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 资金账户页
+// ─────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FundAccountsPage(
+    uiState: AccountsUiState,
+    expandedMap: MutableMap<String, Boolean>,
+    hideZeroBalance: Boolean,
+    onToggleHideZero: (Boolean) -> Unit,
+    onAccountClick: (accountId: String, accountName: String) -> Unit,
+    onRetry: () -> Unit
+) {
     val visibleGroups = uiState.groups
         .map { group ->
             if (hideZeroBalance) {
@@ -84,50 +158,25 @@ fun AccountsScreen(
         }
         .filter { it.accounts.isNotEmpty() }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("\u8d44\u91d1\u8d26\u6237", style = MaterialTheme.typography.titleMedium) },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background
-                )
-            )
-        }
-    ) { padding ->
-        PullToRefreshBox(
-            isRefreshing = uiState.isRefreshing,
-            onRefresh = { viewModel.refresh() },
-            modifier = Modifier.fillMaxSize()
-        ) {
+    PullToRefreshBox(
+        isRefreshing = uiState.isRefreshing,
+        onRefresh = onRetry,
+        modifier = Modifier.fillMaxSize()
+    ) {
         when {
             uiState.isLoading && uiState.groups.isEmpty() -> {
-                Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
             }
 
             uiState.error != null && uiState.groups.isEmpty() -> {
-                Column(
-                    Modifier.fillMaxSize().padding(padding).padding(32.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Icon(
-                        Icons.Default.CloudOff,
-                        contentDescription = null,
-                        modifier = Modifier.size(64.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(0.5f)
-                    )
-                    Spacer(Modifier.height(16.dp))
-                    Text(uiState.error.orEmpty(), color = MaterialTheme.colorScheme.error)
-                    Spacer(Modifier.height(16.dp))
-                    OutlinedButton(onClick = { viewModel.loadAccounts() }) { Text("\u91cd\u8bd5") }
-                }
+                ErrorState(message = uiState.error.orEmpty(), onRetry = onRetry)
             }
 
             else -> {
                 LazyColumn(
-                    modifier = Modifier.fillMaxSize().padding(padding),
+                    modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -142,7 +191,7 @@ fun AccountsScreen(
                     item {
                         ZeroBalanceToggleCard(
                             checked = hideZeroBalance,
-                            onCheckedChange = { hideZeroBalance = it }
+                            onCheckedChange = onToggleHideZero
                         )
                     }
 
@@ -150,7 +199,7 @@ fun AccountsScreen(
                         item {
                             EmptyAccountsCard(
                                 hideZeroBalance = hideZeroBalance,
-                                onShowZeroBalance = { hideZeroBalance = false }
+                                onShowZeroBalance = { onToggleHideZero(false) }
                             )
                         }
                     }
@@ -175,9 +224,226 @@ fun AccountsScreen(
                 }
             }
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 信用卡账户页
+// ─────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CreditAccountsPage(
+    uiState: AccountsUiState,
+    onAccountClick: (accountId: String, accountName: String) -> Unit,
+    onRetry: () -> Unit
+) {
+    PullToRefreshBox(
+        isRefreshing = uiState.isRefreshing,
+        onRefresh = onRetry,
+        modifier = Modifier.fillMaxSize()
+    ) {
+        when {
+            uiState.isLoading && uiState.creditAccounts.isEmpty() -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            }
+
+            uiState.error != null && uiState.creditAccounts.isEmpty() -> {
+                ErrorState(message = uiState.error.orEmpty(), onRetry = onRetry)
+            }
+
+            else -> {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    item {
+                        CreditSummaryCard(
+                            used = uiState.creditUsedTotal,
+                            limit = uiState.creditLimitTotal,
+                            currentBill = uiState.creditBillTotal
+                        )
+                    }
+
+                    if (uiState.creditAccounts.isEmpty()) {
+                        item {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(16.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(18.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Text(
+                                        "暂无信用卡账户",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    items(uiState.creditAccounts, key = { it.id }) { credit ->
+                        CreditAccountCard(credit) {
+                            onAccountClick(credit.id, credit.displayName())
+                        }
+                    }
+
+                    item { Spacer(Modifier.height(16.dp)) }
+                }
+            }
         }
     }
 }
+
+@Composable
+private fun CreditSummaryCard(used: Double, limit: Double, currentBill: Double) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                "信用卡合计",
+                color = MaterialTheme.colorScheme.onPrimary.copy(0.85f),
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                SummaryMetric("已用", formatAmount(used))
+                SummaryMetric("总额度", formatAmount(limit))
+                SummaryMetric("本期账单", formatAmount(currentBill))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SummaryMetric(label: String, value: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.7f)
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelMedium.copy(fontSize = 13.sp),
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onPrimary
+        )
+    }
+}
+
+@Composable
+private fun CreditAccountCard(credit: CreditAccountRowDto, onClick: () -> Unit) {
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(kindColor("bank_credit").copy(alpha = 0.1f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.CreditCard,
+                        contentDescription = null,
+                        tint = kindColor("bank_credit"),
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        credit.displayName(),
+                        style = MaterialTheme.typography.bodyMedium.copy(fontSize = 15.sp),
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        creditSubtitle(credit),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        "本期账单",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        formatAmount(credit.currentBill),
+                        style = MaterialTheme.typography.titleSmall.copy(fontSize = 15.sp),
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                CreditMetric("已用", formatAmount(credit.balance))
+                CreditMetric("额度", formatAmount(credit.creditLimit))
+                CreditMetric("可用", formatAmount(credit.availableLimit))
+            }
+        }
+    }
+}
+
+@Composable
+private fun CreditMetric(label: String, value: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+private fun creditSubtitle(credit: CreditAccountRowDto): String {
+    val parts = mutableListOf<String>()
+    if (!credit.institutionName.isNullOrBlank()) parts.add(credit.institutionName!!)
+    val due = credit.dueDate?.trim().orEmpty()
+    if (due.isNotBlank()) parts.add("还款日 $due")
+    return parts.joinToString(" · ")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 资金账户卡片（原有）
+// ─────────────────────────────────────────────────────────────────
 
 @Composable
 private fun GrandTotalCard(grandTotal: Double, groupCount: Int, accountCount: Int) {
@@ -373,9 +639,31 @@ private fun AccountCard(account: AccountListRowDto, onClick: () -> Unit) {
     }
 }
 
+@Composable
+private fun ErrorState(message: String, onRetry: () -> Unit) {
+    Column(
+        Modifier.fillMaxSize().padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            Icons.Default.CloudOff,
+            contentDescription = null,
+            modifier = Modifier.size(64.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(0.5f)
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(message, color = MaterialTheme.colorScheme.error)
+        Spacer(Modifier.height(16.dp))
+        OutlinedButton(onClick = onRetry) { Text("\u91cd\u8bd5") }
+    }
+}
+
 private fun AccountListRowDto.isZeroBalance(): Boolean = abs(balance) < 0.005
 
 private fun AccountListRowDto.displayName(): String = formatAccountDisplayName(name, institutionName)
+
+private fun CreditAccountRowDto.displayName(): String = formatAccountDisplayName(name, institutionName)
 
 @Composable
 private fun balanceColor(kind: String, amount: Double): Color = when {

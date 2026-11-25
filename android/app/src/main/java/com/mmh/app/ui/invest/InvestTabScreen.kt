@@ -20,6 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.mmh.app.ui.funds.FundsScreen
 import com.mmh.app.ui.regularinvest.RegularInvestListScreen
+import com.mmh.app.ui.stocks.StockHoldingsScreen
 import kotlinx.coroutines.launch
 
 @Composable
@@ -29,7 +30,7 @@ fun InvestTabScreen(
     onNavigateToStockHoldings: (accountId: String) -> Unit = {},
     onNavigateToPropertyAssets: (accountId: String) -> Unit = {}
 ) {
-    val titles = listOf("投资总览", "基金持仓", "定投计划")
+    val titles = listOf("投资总览", "基金持仓", "股票持仓", "定投计划")
     val pagerState = rememberPagerState(pageCount = { titles.size })
     val scope = rememberCoroutineScope()
     var selectedHoldingAccountId by remember { mutableStateOf("") }
@@ -89,7 +90,13 @@ fun InvestTabScreen(
                     onEntryClick = onNavigateToEntryEdit
                 )
 
-                2 -> RegularInvestListScreen(showTopBar = false, onBack = null)
+                2 -> StockHoldingsScreen(
+                    accountId = "",
+                    showTopBar = false,
+                    onBack = null
+                )
+
+                3 -> RegularInvestListScreen(showTopBar = false, onBack = null)
             }
         }
     }

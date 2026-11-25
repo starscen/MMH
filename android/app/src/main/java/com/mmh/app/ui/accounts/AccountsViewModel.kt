@@ -3,6 +3,7 @@ package com.mmh.app.ui.accounts
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.mmh.app.data.remote.dto.AccountListRowDto
+import com.mmh.app.data.remote.dto.CreditAccountRowDto
 import com.mmh.app.data.repository.OverviewRepository
 import com.mmh.app.domain.model.Resource
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -24,6 +25,10 @@ data class AccountsUiState(
     val isRefreshing: Boolean = false,
     val groups: List<AccountGroup> = emptyList(),
     val grandTotal: Double = 0.0,
+    val creditAccounts: List<CreditAccountRowDto> = emptyList(),
+    val creditUsedTotal: Double = 0.0,
+    val creditLimitTotal: Double = 0.0,
+    val creditBillTotal: Double = 0.0,
     val error: String? = null
 )
 
@@ -41,40 +46,42 @@ class AccountsViewModel @Inject constructor(
 
     fun loadAccounts() {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true, error = null)
-            when (val result = overviewRepository.getSummary()) {
-                is Resource.Success -> {
-                    val groups = buildGroups(result.data.accountList.filterNot { it.kind == "investment" })
-                    _uiState.value = AccountsUiState(
-                        isLoading = false,
-                        groups = groups,
-                        grandTotal = groups.sumOf { it.groupTotal }
-                    )
-                }
-
-                is Resource.Error -> {
-                    _uiState.value = _uiState.value.copy(isLoading = false, error = result.message)
-                }
-            }
+            _uiState.value = buildState(loading = true, refreshing = false)
         }
     }
 
     fun refresh() {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isRefreshing = true, error = null)
-            when (val result = overviewRepository.getSummary()) {
-                is Resource.Success -> {
-                    val groups = buildGroups(result.data.accountList.filterNot { it.kind == "investment" })
-                    _uiState.value = AccountsUiState(
-                        isRefreshing = false,
-                        groups = groups,
-                        grandTotal = groups.sumOf { it.groupTotal }
-                    )
-                }
+            _uiState.value = buildState(loading = false, refreshing = true)
+        }
+    }
 
-                is Resource.Error -> {
-                    _uiState.value = _uiState.value.copy(isRefreshing = false, error = result.message)
-                }
+    private suspend fun buildState(loading: Boolean, refreshing: Boolean): AccountsUiState {
+        return when (val result = overviewRepository.getSummary()) {
+            is Resource.Success -> {
+                val data = result.data
+                val fundAccounts = data.accountList
+                    .filterNot { it.kind == "investment" || it.kind == "bank_credit" }
+                val groups = buildGroups(fundAccounts)
+                val credits = data.creditAccountList
+                AccountsUiState(
+                    isLoading = loading,
+                    isRefreshing = refreshing,
+                    groups = groups,
+                    grandTotal = groups.sumOf { it.groupTotal },
+                    creditAccounts = credits,
+                    creditUsedTotal = credits.sumOf { it.balance },
+                    creditLimitTotal = credits.sumOf { it.creditLimit },
+                    creditBillTotal = credits.sumOf { it.currentBill }
+                )
+            }
+
+            is Resource.Error -> {
+                _uiState.value.copy(
+                    isLoading = false,
+                    isRefreshing = false,
+                    error = result.message
+                )
             }
         }
     }

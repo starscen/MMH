@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -120,6 +121,7 @@ fun FundDetailScreen(
     }
 
     Scaffold(
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
             if (uiState.position != null) {
                 FundActionBar(
@@ -374,7 +376,10 @@ private fun AssetDetailCard(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                modifier = Modifier.padding(start = 40.dp, end = 40.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         fundName,

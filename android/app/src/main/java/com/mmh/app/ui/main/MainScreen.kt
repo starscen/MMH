@@ -2,16 +2,9 @@ package com.mmh.app.ui.main
 
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
 import androidx.compose.material.icons.filled.AccountBalanceWallet
@@ -19,24 +12,20 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.TableChart
-import androidx.compose.material3.FloatingActionButton
-import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -407,54 +396,28 @@ private fun MainBottomBar(
     onRecordClick: () -> Unit,
     onTabClick: (String) -> Unit
 ) {
-    BoxWithConstraints(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(92.dp)
+    NavigationBar(
+        modifier = Modifier.fillMaxWidth(),
+        containerColor = MaterialTheme.colorScheme.surface
     ) {
-        // 底栏 6 格权重 1 + 1 + 0.72 + 1 + 1 + 1 = 5.72，中间占位格的格心在 2.36 / 5.72 处。
-        // 多了「报表」tab 后左右不再对称，悬浮按钮必须跟着占位格走，否则会压在「投资」tab 上。
-        val fabCenterX = maxWidth * (2.36f / 5.72f)
-        NavigationBar(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .height(72.dp),
-            containerColor = MaterialTheme.colorScheme.surface
-        ) {
-            TAB_ITEMS.take(2).forEach { item ->
-                MainNavigationItem(item = item, selected = currentRoute == item.route, onClick = onTabClick)
-            }
+        MainNavigationItem(TAB_ITEMS[0], currentRoute == TAB_ITEMS[0].route, onTabClick)
+        MainNavigationItem(TAB_ITEMS[1], currentRoute == TAB_ITEMS[1].route, onTabClick)
 
-            Spacer(Modifier.weight(0.72f))
-
-            TAB_ITEMS.drop(2).forEach { item ->
-                MainNavigationItem(item = item, selected = currentRoute == item.route, onClick = onTabClick)
-            }
-        }
-
-        Surface(
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .offset(x = fabCenterX - 38.dp)
-                .size(76.dp),
-            shape = CircleShape,
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 3.dp,
-            shadowElevation = 6.dp
-        ) {}
-
-        FloatingActionButton(
+        // 中间「记一笔」：与其他 tab 同款布局，不再使用悬浮圆形按钮
+        NavigationBarItem(
+            icon = { Icon(Icons.Default.Add, contentDescription = "记一笔") },
+            label = { Text("记一笔") },
+            selected = false,
             onClick = onRecordClick,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .offset(x = fabCenterX - 30.dp, y = 3.dp)
-                .size(60.dp),
-            shape = CircleShape,
-            containerColor = MaterialTheme.colorScheme.primary,
-            elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 8.dp)
-        ) {
-            Icon(Icons.Default.Add, contentDescription = "\u8bb0\u4e00\u7b14", tint = MaterialTheme.colorScheme.onPrimary)
-        }
+            colors = NavigationBarItemDefaults.colors(
+                selectedIconColor = MaterialTheme.colorScheme.primary,
+                selectedTextColor = MaterialTheme.colorScheme.primary
+            )
+        )
+
+        MainNavigationItem(TAB_ITEMS[2], currentRoute == TAB_ITEMS[2].route, onTabClick)
+        MainNavigationItem(TAB_ITEMS[3], currentRoute == TAB_ITEMS[3].route, onTabClick)
+        MainNavigationItem(TAB_ITEMS[4], currentRoute == TAB_ITEMS[4].route, onTabClick)
     }
 }
 

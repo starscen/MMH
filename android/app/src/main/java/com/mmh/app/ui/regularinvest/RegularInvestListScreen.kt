@@ -63,6 +63,7 @@ fun RegularInvestListScreen(
 
     if (showTopBar) {
         Scaffold(
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
                 TopAppBar(
                     title = { Text("定投计划") },
@@ -73,6 +74,7 @@ fun RegularInvestListScreen(
                             }
                         }
                     },
+                    windowInsets = WindowInsets(0, 0, 0, 0),
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = MaterialTheme.colorScheme.background
                     )
